@@ -7,6 +7,7 @@
 
 use crate::editor::EditorState;
 use crate::model::{backlinks, parse_wikilinks, Page};
+use crate::search::{search, Hit};
 use crate::storage::{today_title, Storage};
 use crate::ui::{block_row, Theme};
 use gpui::{
@@ -22,7 +23,20 @@ use std::ops::Range;
 actions!(
     notesec,
     [
-        Enter, Tab, ShiftTab, Backspace, Delete, Left, Right, Up, Down, Home, End, Escape, Paste,
+        Enter,
+        Tab,
+        ShiftTab,
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        Up,
+        Down,
+        Home,
+        End,
+        Escape,
+        Paste,
+        ToggleSearch,
         Quit,
     ]
 );
@@ -46,9 +60,23 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, ctx),
         KeyBinding::new("escape", Escape, ctx),
         KeyBinding::new("ctrl-v", Paste, ctx),
+        // Global (no context): works whether or not a block is being edited.
+        KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
+}
+
+/// How many results the search overlay shows.
+const MAX_RESULTS: usize = 12;
+
+/// State of the Ctrl-K overlay while it is open.
+struct SearchState {
+    /// The query box. It reuses `EditorState`, so typing, IME, paste and cursor
+    /// movement work exactly as in a block.
+    query: EditorState,
+    /// Highlighted result (index into the current results).
+    selected: usize,
 }
 
 pub struct NoteSec {
@@ -65,6 +93,8 @@ pub struct NoteSec {
     editing: Option<usize>,
     /// The shared text editor for the block being edited.
     editor: EditorState,
+    /// `Some` while the Ctrl-K search overlay is open.
+    search: Option<SearchState>,
     /// Shaped text + bounds from the last paint; needed to answer the OS
     /// input-method's questions about where characters are on screen.
     last_layout: Option<ShapedLine>,
@@ -72,7 +102,10 @@ pub struct NoteSec {
 }
 
 impl NoteSec {
-    pub fn new(storage: Storage, cx: &mut Context<Self>) -> Self {
+    /// Build the root view. The view takes keyboard focus straight away:
+    /// GPUI only delivers key events (and so global shortcuts like Ctrl-K) to
+    /// views on the focused path, and nothing is focused in a new window.
+    pub fn new(storage: Storage, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut pages = storage.load_all();
 
         // Auto-create today's journal if it doesn't exist yet.
@@ -109,16 +142,108 @@ impl NoteSec {
             .position(|p| p.is_journal && p.title == today)
             .unwrap_or(0);
 
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle, cx);
+
         NoteSec {
             storage,
             pages,
             selected,
             theme: Theme::dark(),
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             editing: None,
             editor: EditorState::default(),
+            search: None,
             last_layout: None,
             last_bounds: None,
+        }
+    }
+
+    // --- which editor is active ----------------------------------------------
+
+    /// The text editor currently receiving input: the search box while the
+    /// overlay is open, otherwise the block editor.
+    fn active_editor(&self) -> &EditorState {
+        match &self.search {
+            Some(s) => &s.query,
+            None => &self.editor,
+        }
+    }
+
+    fn active_editor_mut(&mut self) -> &mut EditorState {
+        match &mut self.search {
+            Some(s) => &mut s.query,
+            None => &mut self.editor,
+        }
+    }
+
+    // --- search overlay --------------------------------------------------------
+
+    fn search_results(&self) -> Vec<Hit> {
+        match &self.search {
+            Some(s) => search(&self.pages, &s.query.text, MAX_RESULTS),
+            None => Vec::new(),
+        }
+    }
+
+    /// Call after the active editor's text changed: the old highlighted row no
+    /// longer means anything, so go back to the top result.
+    fn text_changed(&mut self) {
+        if let Some(s) = &mut self.search {
+            s.selected = 0;
+        }
+    }
+
+    fn toggle_search(&mut self, _: &ToggleSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            self.close_search(cx);
+            return;
+        }
+        // Save whatever block is being edited before covering it.
+        self.stop_edit(cx);
+        self.search = Some(SearchState {
+            query: EditorState::default(),
+            selected: 0,
+        });
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn close_search(&mut self, cx: &mut Context<Self>) {
+        self.search = None;
+        self.last_layout = None;
+        self.last_bounds = None;
+        cx.notify();
+    }
+
+    fn move_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.search_results().len();
+        if let Some(s) = &mut self.search {
+            if count > 0 {
+                s.selected = (s.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+            }
+        }
+        cx.notify();
+    }
+
+    fn confirm_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected) = self.search.as_ref().map(|s| s.selected) else {
+            return;
+        };
+        if let Some(hit) = self.search_results().get(selected).cloned() {
+            self.open_hit(&hit, window, cx);
+        }
+    }
+
+    /// Go to a search result: its page, and for a block hit, into that block.
+    fn open_hit(&mut self, hit: &Hit, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.pages[hit.page].title.clone();
+        self.close_search(cx);
+        self.open_page(&title, cx);
+        if let Some(block) = hit.block {
+            if block < self.pages[self.selected].blocks.len() {
+                self.start_edit(block, window, cx);
+            }
         }
     }
 
@@ -253,7 +378,11 @@ impl NoteSec {
     // --- action handlers -----------------------------------------------------
 
     /// Enter: split the block at the cursor; the right half becomes a new block.
-    fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+    fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            self.confirm_search(window, cx);
+            return;
+        }
         let Some(ix) = self.editing else { return };
         let rest = self.editor.split_off_at_cursor();
         self.sync_content();
@@ -283,6 +412,12 @@ impl NoteSec {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            self.active_editor_mut().backspace();
+            self.text_changed();
+            cx.notify();
+            return;
+        }
         let Some(ix) = self.editing else { return };
         if !self.editor.text.is_empty() {
             self.editor.backspace();
@@ -301,39 +436,48 @@ impl NoteSec {
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        if self.editing.is_some() {
-            self.editor.delete();
+        if self.editing.is_some() || self.search.is_some() {
+            self.active_editor_mut().delete();
+            self.text_changed();
             cx.notify();
         }
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor.move_left();
+        self.active_editor_mut().move_left();
         cx.notify();
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor.move_right();
+        self.active_editor_mut().move_right();
         cx.notify();
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor.move_home();
+        self.active_editor_mut().move_home();
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor.move_end();
+        self.active_editor_mut().move_end();
         cx.notify();
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            self.move_search_selection(-1, cx);
+            return;
+        }
         if let Some(ix) = self.editing.filter(|&ix| ix > 0) {
             self.move_edit(ix - 1, cx);
         }
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            self.move_search_selection(1, cx);
+            return;
+        }
         if let Some(ix) = self.editing {
             if ix + 1 < self.pages[self.selected].blocks.len() {
                 self.move_edit(ix + 1, cx);
@@ -342,12 +486,17 @@ impl NoteSec {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        self.stop_edit(cx);
+        if self.search.is_some() {
+            self.close_search(cx);
+        } else {
+            self.stop_edit(cx);
+        }
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.editor.insert(&text);
+            self.active_editor_mut().insert(&text);
+            self.text_changed();
             cx.notify();
         }
     }
@@ -379,9 +528,9 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.editor.range_from_utf16(&range_utf16);
-        actual_range.replace(self.editor.range_to_utf16(&range));
-        Some(self.editor.text[range].to_string())
+        let range = self.active_editor().range_from_utf16(&range_utf16);
+        actual_range.replace(self.active_editor().range_to_utf16(&range));
+        Some(self.active_editor().text[range].to_string())
     }
 
     fn selected_text_range(
@@ -391,9 +540,9 @@ impl EntityInputHandler for NoteSec {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         // We have a cursor but no selection, so the range is empty.
-        let c = self.editor.cursor;
+        let c = self.active_editor().cursor;
         Some(UTF16Selection {
-            range: self.editor.range_to_utf16(&(c..c)),
+            range: self.active_editor().range_to_utf16(&(c..c)),
             reversed: false,
         })
     }
@@ -403,14 +552,14 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        self.editor
+        self.active_editor()
             .marked
             .as_ref()
-            .map(|r| self.editor.range_to_utf16(r))
+            .map(|r| self.active_editor().range_to_utf16(r))
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.editor.marked = None;
+        self.active_editor_mut().marked = None;
     }
 
     fn replace_text_in_range(
@@ -422,10 +571,11 @@ impl EntityInputHandler for NoteSec {
     ) {
         let range = range_utf16
             .as_ref()
-            .map(|r| self.editor.range_from_utf16(r))
-            .or(self.editor.marked.clone())
-            .unwrap_or(self.editor.cursor..self.editor.cursor);
-        self.editor.replace_range(range, new_text);
+            .map(|r| self.active_editor().range_from_utf16(r))
+            .or(self.active_editor().marked.clone())
+            .unwrap_or(self.active_editor().cursor..self.active_editor().cursor);
+        self.active_editor_mut().replace_range(range, new_text);
+        self.text_changed();
         cx.notify();
     }
 
@@ -439,17 +589,19 @@ impl EntityInputHandler for NoteSec {
     ) {
         let range = range_utf16
             .as_ref()
-            .map(|r| self.editor.range_from_utf16(r))
-            .or(self.editor.marked.clone())
-            .unwrap_or(self.editor.cursor..self.editor.cursor);
-        self.editor.replace_range(range.clone(), new_text);
-        let len = self.editor.cursor - range.start;
-        self.editor.marked = (len > 0).then_some(range.start..range.start + len);
+            .map(|r| self.active_editor().range_from_utf16(r))
+            .or(self.active_editor().marked.clone())
+            .unwrap_or(self.active_editor().cursor..self.active_editor().cursor);
+        self.active_editor_mut()
+            .replace_range(range.clone(), new_text);
+        let len = self.active_editor().cursor - range.start;
+        self.active_editor_mut().marked = (len > 0).then_some(range.start..range.start + len);
         if let Some(sel) = new_selected_range_utf16 {
             // The OS gives the cursor relative to the composition text.
-            let end = self.editor.offset_from_utf16(sel.end).min(len);
-            self.editor.cursor = range.start + end;
+            let end = self.active_editor().offset_from_utf16(sel.end).min(len);
+            self.active_editor_mut().cursor = range.start + end;
         }
+        self.text_changed();
         cx.notify();
     }
 
@@ -461,7 +613,7 @@ impl EntityInputHandler for NoteSec {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let layout = self.last_layout.as_ref()?;
-        let range = self.editor.range_from_utf16(&range_utf16);
+        let range = self.active_editor().range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
                 bounds.left() + layout.x_for_index(range.start),
@@ -483,7 +635,7 @@ impl EntityInputHandler for NoteSec {
         let local = self.last_bounds?.localize(&pt)?;
         let layout = self.last_layout.as_ref()?;
         let utf8 = layout.index_for_x(pt.x - local.x)?;
-        Some(self.editor.offset_to_utf16(utf8))
+        Some(self.active_editor().offset_to_utf16(utf8))
     }
 }
 
@@ -548,9 +700,9 @@ impl Element for BlockText {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let app = self.app.read(cx);
-        let text: SharedString = app.editor.text.clone().into();
-        let cursor = app.editor.cursor;
-        let marked = app.editor.marked.clone();
+        let text: SharedString = app.active_editor().text.clone().into();
+        let cursor = app.active_editor().cursor;
+        let marked = app.active_editor().marked.clone();
         let accent: Hsla = app.theme.accent.into();
         let style = window.text_style();
 
@@ -844,9 +996,109 @@ impl Render for NoteSec {
                     .on_click(cx.listener(|this, _e, _window, cx| this.stop_edit(cx))),
             );
 
-        let is_editing = self.editing.is_some();
+        // --- Search overlay (Ctrl-K) -----------------------------------------
+        let overlay = self.search.as_ref().map(|state| {
+            let hits = self.search_results();
+            let selected = state.selected;
+            let rows: Vec<AnyElement> = hits
+                .into_iter()
+                .enumerate()
+                .map(|(i, hit)| {
+                    let page = &self.pages[hit.page];
+                    // Page hit: just the title. Block hit: the text, then the
+                    // page it lives on in a muted colour.
+                    let label = match hit.block {
+                        None => div().text_color(theme.accent).child(page.title.clone()),
+                        Some(b) => div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_color(theme.text)
+                                    .child(page.blocks[b].content.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(theme.muted)
+                                    .child(page.title.clone()),
+                            ),
+                    };
+                    div()
+                        .id(("search-result", i))
+                        .debug_selector(|| format!("search-result-{i}"))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(i == selected, |d| d.bg(theme.selected_bg))
+                        .hover(|d| d.bg(theme.selected_bg))
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            this.open_hit(&hit, window, cx);
+                        }))
+                        .child(label)
+                        .into_any_element()
+                })
+                .collect();
+            let no_results = rows.is_empty();
+
+            // Backdrop: dims the app, swallows mouse events, closes on click.
+            div()
+                .id("search-backdrop")
+                .debug_selector(|| "search-backdrop".to_string())
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(gpui::black().opacity(0.45))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(90.0))
+                .on_click(cx.listener(|this, _e, _window, cx| this.close_search(cx)))
+                .child(
+                    // The palette itself. `occlude` keeps clicks inside it from
+                    // reaching the backdrop (which would close the overlay).
+                    div()
+                        .id("search-panel")
+                        .occlude()
+                        .w(px(620.0))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_2()
+                        .rounded_lg()
+                        .bg(theme.sidebar_bg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .debug_selector(|| "search-input".to_string())
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(theme.bg)
+                                .child(BlockText { app: cx.entity() }),
+                        )
+                        .children(rows)
+                        .when(no_results, |d| {
+                            d.child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .text_color(theme.muted)
+                                    .child("No results"),
+                            )
+                        }),
+                )
+        });
+
+        let is_editing = self.editing.is_some() || self.search.is_some();
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_row()
             .bg(theme.bg)
@@ -868,8 +1120,10 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::toggle_search))
             .child(sidebar)
             .child(main)
+            .children(overlay)
     }
 }
 
@@ -905,7 +1159,7 @@ mod tests {
         }
 
         cx.update(bind_keys);
-        let (view, cx) = cx.add_window_view(|_, cx| NoteSec::new(storage, cx));
+        let (view, cx) = cx.add_window_view(|window, cx| NoteSec::new(storage, window, cx));
         view.update(cx, |app, cx| {
             app.selected = app.pages.iter().position(|p| p.title == selected).unwrap();
             cx.notify();
@@ -1126,6 +1380,125 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("backlink-0").is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn search_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- hello\n"),
+            ("Alpha", "- first\n- needle in haystack\n"),
+            ("Zed", "- other\n"),
+        ]
+    }
+
+    #[gpui::test]
+    fn ctrl_k_saves_edit_and_finds_a_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "search-page", &search_pages(), "Test");
+
+        // Start editing and type, then open the palette without pressing Escape.
+        click_block(cx, 0);
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("ctrl-k");
+        view.update(cx, |app, _| {
+            assert!(app.search.is_some());
+            assert_eq!(app.editing, None, "opening search leaves block editing");
+        });
+        assert_eq!(file(&dir), "- hello!\n", "the pending edit was saved");
+        assert!(cx.debug_bounds("search-input").is_some());
+
+        // Empty query lists pages.
+        assert!(cx.debug_bounds("search-result-0").is_some());
+
+        // Typing filters; the Zed page is the only match for "zed".
+        cx.simulate_input("zed");
+        view.update(cx, |app, _| {
+            assert_eq!(app.search.as_ref().unwrap().query.text, "zed");
+            assert_eq!(app.search_results().len(), 1);
+        });
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert!(app.search.is_none(), "palette closes after choosing");
+            assert_eq!(app.pages[app.selected].title, "Zed");
+            assert_eq!(app.editing, None, "a page hit does not start editing");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn search_block_hit_opens_page_and_edits_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "search-block", &search_pages(), "Test");
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("needle");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Alpha");
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.text, "needle in haystack");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn search_keyboard_navigation_and_editing_the_query(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "search-keys", &search_pages(), "Test");
+        cx.simulate_keystrokes("ctrl-k");
+
+        // Down/up move the highlight and clamp at both ends.
+        cx.simulate_keystrokes("down down");
+        view.update(cx, |app, _| {
+            assert_eq!(app.search.as_ref().unwrap().selected, 2)
+        });
+        cx.simulate_keystrokes("down down down down down down down down down down down down");
+        view.update(cx, |app, _| {
+            let last = app.search_results().len() - 1;
+            assert_eq!(app.search.as_ref().unwrap().selected, last);
+        });
+        cx.simulate_keystrokes("up");
+
+        // Changing the query resets the highlight to the top result; backspace
+        // edits the query, not any block.
+        cx.simulate_input("zz");
+        cx.simulate_keystrokes("backspace");
+        view.update(cx, |app, _| {
+            let s = app.search.as_ref().unwrap();
+            assert_eq!(s.query.text, "z");
+            assert_eq!(s.selected, 0);
+        });
+        assert_eq!(file(&dir), "- hello\n", "search typing never touches pages");
+
+        // Escape closes; Ctrl-K toggles open and closed.
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert!(app.search.is_none()));
+        cx.simulate_keystrokes("ctrl-k ctrl-k");
+        view.update(cx, |app, _| assert!(app.search.is_none()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn search_mouse_interaction(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "search-mouse", &search_pages(), "Test");
+
+        // Clicking a result opens it. With an empty query the order is the
+        // sidebar order: today's journal, Alpha, Test, Zed.
+        cx.simulate_keystrokes("ctrl-k");
+        let target = view.update(cx, |app, _| {
+            app.pages.iter().position(|p| p.title == "Zed").unwrap()
+        });
+        let key: &'static str = Box::leak(format!("search-result-{target}").into_boxed_str());
+        let row = cx.debug_bounds(key).expect("result row rendered");
+        cx.simulate_click(row.center(), Modifiers::none());
+        view.update(cx, |app, _| {
+            assert!(app.search.is_none());
+            assert_eq!(app.pages[app.selected].title, "Zed");
+        });
+
+        // Clicking inside the panel keeps it open; clicking the backdrop closes it.
+        cx.simulate_keystrokes("ctrl-k");
+        let input = cx.debug_bounds("search-input").unwrap();
+        cx.simulate_click(input.center(), Modifiers::none());
+        view.update(cx, |app, _| assert!(app.search.is_some()));
+        cx.simulate_click(point(px(5.), px(5.)), Modifiers::none());
+        view.update(cx, |app, _| assert!(app.search.is_none()));
         let _ = std::fs::remove_dir_all(dir);
     }
 

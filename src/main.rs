@@ -1,6 +1,7 @@
 mod app;
 mod editor;
 mod model;
+mod search;
 mod storage;
 mod ui;
 
@@ -25,7 +26,7 @@ fn main() {
                 ..Default::default()
             },
             // The closure builds the root view entity.
-            |_window, cx| cx.new(|cx| NoteSec::new(storage, cx)),
+            |window, cx| cx.new(|cx| NoteSec::new(storage, window, cx)),
         )
         .unwrap();
         cx.activate(true);
