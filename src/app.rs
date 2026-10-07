@@ -1,9 +1,55 @@
 //! The root view: sidebar of pages on the left, selected page on the right.
+//!
+//! Editing model: there is ONE shared `EditorState`. Clicking a block loads that
+//! block's text into it; every other block is drawn as plain text. When editing
+//! stops (Escape, click elsewhere, switching pages) the text is written back to
+//! the block and the page is saved to disk.
 
+use crate::editor::EditorState;
 use crate::model::Page;
 use crate::storage::{today_title, Storage};
-use crate::ui::{page_blocks, Theme};
-use gpui::{div, prelude::*, px, Context, Window};
+use crate::ui::{block_row, Theme};
+use gpui::{
+    actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds, Context,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hsla,
+    KeyBinding, LayoutId, PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, UnderlineStyle, Window,
+};
+use std::ops::Range;
+
+// Actions are named, typed commands that key bindings map onto. The macro
+// declares one unit struct per name inside the `notesec` namespace.
+actions!(
+    notesec,
+    [
+        Enter, Tab, ShiftTab, Backspace, Delete, Left, Right, Up, Down, Home, End, Escape, Paste,
+        Quit,
+    ]
+);
+
+/// Register keyboard shortcuts. The `"BlockEditor"` context is only active
+/// while a block is being edited (see `render`), so these keys do nothing
+/// otherwise.
+pub fn bind_keys(cx: &mut App) {
+    let ctx = Some("BlockEditor");
+    cx.bind_keys([
+        KeyBinding::new("enter", Enter, ctx),
+        KeyBinding::new("tab", Tab, ctx),
+        KeyBinding::new("shift-tab", ShiftTab, ctx),
+        KeyBinding::new("backspace", Backspace, ctx),
+        KeyBinding::new("delete", Delete, ctx),
+        KeyBinding::new("left", Left, ctx),
+        KeyBinding::new("right", Right, ctx),
+        KeyBinding::new("up", Up, ctx),
+        KeyBinding::new("down", Down, ctx),
+        KeyBinding::new("home", Home, ctx),
+        KeyBinding::new("end", End, ctx),
+        KeyBinding::new("escape", Escape, ctx),
+        KeyBinding::new("ctrl-v", Paste, ctx),
+        KeyBinding::new("ctrl-q", Quit, None),
+    ]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+}
 
 pub struct NoteSec {
     storage: Storage,
@@ -12,10 +58,21 @@ pub struct NoteSec {
     /// Index into `pages` of the page shown in the main pane.
     selected: usize,
     theme: Theme,
+
+    /// Handle used to give this view keyboard focus while editing.
+    focus_handle: FocusHandle,
+    /// Index (into the selected page's blocks) of the block being edited.
+    editing: Option<usize>,
+    /// The shared text editor for the block being edited.
+    editor: EditorState,
+    /// Shaped text + bounds from the last paint; needed to answer the OS
+    /// input-method's questions about where characters are on screen.
+    last_layout: Option<ShapedLine>,
+    last_bounds: Option<Bounds<Pixels>>,
 }
 
 impl NoteSec {
-    pub fn new(storage: Storage) -> Self {
+    pub fn new(storage: Storage, cx: &mut Context<Self>) -> Self {
         let mut pages = storage.load_all();
 
         // Auto-create today's journal if it doesn't exist yet.
@@ -37,7 +94,7 @@ impl NoteSec {
             let welcome = Page::from_markdown(
                 "Welcome",
                 false,
-                "- Welcome to notesec\n  - Notes are plain markdown files in your graph folder\n  - Blocks can be nested\n",
+                "- Welcome to notesec\n  - Click a block to edit it\n  - Enter adds a block, Tab / Shift-Tab change nesting\n  - Backspace on an empty block deletes it\n",
             );
             if let Err(err) = storage.save(&welcome) {
                 eprintln!("notesec: could not create Welcome page: {err}");
@@ -57,6 +114,178 @@ impl NoteSec {
             pages,
             selected,
             theme: Theme::dark(),
+            focus_handle: cx.focus_handle(),
+            editing: None,
+            editor: EditorState::default(),
+            last_layout: None,
+            last_bounds: None,
+        }
+    }
+
+    // --- persistence helpers -------------------------------------------------
+
+    fn save_page(&self) {
+        let page = &self.pages[self.selected];
+        if let Err(err) = self.storage.save(page) {
+            eprintln!("notesec: failed to save {}: {err}", page.title);
+        }
+    }
+
+    /// Copy the editor's text into the block being edited. Returns true if the
+    /// block's content actually changed.
+    fn sync_content(&mut self) -> bool {
+        let Some(ix) = self.editing else { return false };
+        let block = &mut self.pages[self.selected].blocks[ix];
+        if block.content == self.editor.text {
+            return false;
+        }
+        block.content = self.editor.text.clone();
+        true
+    }
+
+    /// Write the editor text back to its block and save if anything changed.
+    fn commit(&mut self) {
+        if self.sync_content() {
+            self.save_page();
+        }
+    }
+
+    // --- editing lifecycle ---------------------------------------------------
+
+    /// Load block `ix` into the shared editor. `cursor_at_start` places the
+    /// cursor at the beginning (used for a freshly split block); otherwise at
+    /// the end.
+    fn load_editor(&mut self, ix: usize, cursor_at_start: bool) {
+        let content = self.pages[self.selected].blocks[ix].content.clone();
+        self.editor = EditorState::new(&content);
+        if cursor_at_start {
+            self.editor.cursor = 0;
+        }
+        self.editing = Some(ix);
+    }
+
+    fn start_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit();
+        self.load_editor(ix, false);
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn stop_edit(&mut self, cx: &mut Context<Self>) {
+        self.commit();
+        self.editing = None;
+        self.last_layout = None;
+        self.last_bounds = None;
+        cx.notify();
+    }
+
+    /// Commit the current block and start editing block `ix` (arrow-key
+    /// navigation between blocks).
+    fn move_edit(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.commit();
+        self.load_editor(ix, false);
+        cx.notify();
+    }
+
+    // --- action handlers -----------------------------------------------------
+
+    /// Enter: split the block at the cursor; the right half becomes a new block.
+    fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.editing else { return };
+        let rest = self.editor.split_off_at_cursor();
+        self.sync_content();
+        let new_ix = self.pages[self.selected].insert_after(ix, rest);
+        self.save_page();
+        self.load_editor(new_ix, true);
+        cx.notify();
+    }
+
+    fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        self.restructure(cx, |page, ix| page.indent(ix));
+    }
+
+    fn shift_tab(&mut self, _: &ShiftTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.restructure(cx, |page, ix| page.outdent(ix));
+    }
+
+    /// Shared body of Tab / Shift-Tab: apply `op` to the edited block, then
+    /// save. The block keeps its index (document order never changes).
+    fn restructure(&mut self, cx: &mut Context<Self>, op: impl FnOnce(&mut Page, usize) -> bool) {
+        let Some(ix) = self.editing else { return };
+        self.sync_content();
+        if op(&mut self.pages[self.selected], ix) {
+            self.save_page();
+        }
+        cx.notify();
+    }
+
+    fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.editing else { return };
+        if !self.editor.text.is_empty() {
+            self.editor.backspace();
+            cx.notify();
+            return;
+        }
+        // Empty block: delete it (never the last remaining block, and never a
+        // block that still has children).
+        let page = &mut self.pages[self.selected];
+        if page.blocks.len() > 1 && page.delete_leaf(ix) {
+            self.save_page();
+            // Move to the block above (or the new first block if we deleted #0).
+            self.load_editor(ix.saturating_sub(1), false);
+        }
+        cx.notify();
+    }
+
+    fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.editor.delete();
+            cx.notify();
+        }
+    }
+
+    fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor.move_left();
+        cx.notify();
+    }
+
+    fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor.move_right();
+        cx.notify();
+    }
+
+    fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor.move_home();
+        cx.notify();
+    }
+
+    fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor.move_end();
+        cx.notify();
+    }
+
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.editing.filter(|&ix| ix > 0) {
+            self.move_edit(ix - 1, cx);
+        }
+    }
+
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.editing {
+            if ix + 1 < self.pages[self.selected].blocks.len() {
+                self.move_edit(ix + 1, cx);
+            }
+        }
+    }
+
+    fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+    }
+
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.editor.insert(&text);
+            cx.notify();
         }
     }
 }
@@ -72,6 +301,294 @@ fn sort_pages(pages: &mut [Page]) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// OS text input (typing characters, IME composition)
+//
+// Plain key presses like "a" don't arrive as actions; GPUI routes them to the
+// element registered via `window.handle_input` (see `BlockText::paint`), which
+// calls these methods. This mirrors gpui's `examples/input.rs`.
+// ---------------------------------------------------------------------------
+impl EntityInputHandler for NoteSec {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = self.editor.range_from_utf16(&range_utf16);
+        actual_range.replace(self.editor.range_to_utf16(&range));
+        Some(self.editor.text[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        // We have a cursor but no selection, so the range is empty.
+        let c = self.editor.cursor;
+        Some(UTF16Selection {
+            range: self.editor.range_to_utf16(&(c..c)),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.editor
+            .marked
+            .as_ref()
+            .map(|r| self.editor.range_to_utf16(r))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.editor.marked = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|r| self.editor.range_from_utf16(r))
+            .or(self.editor.marked.clone())
+            .unwrap_or(self.editor.cursor..self.editor.cursor);
+        self.editor.replace_range(range, new_text);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|r| self.editor.range_from_utf16(r))
+            .or(self.editor.marked.clone())
+            .unwrap_or(self.editor.cursor..self.editor.cursor);
+        self.editor.replace_range(range.clone(), new_text);
+        let len = self.editor.cursor - range.start;
+        self.editor.marked = (len > 0).then_some(range.start..range.start + len);
+        if let Some(sel) = new_selected_range_utf16 {
+            // The OS gives the cursor relative to the composition text.
+            let end = self.editor.offset_from_utf16(sel.end).min(len);
+            self.editor.cursor = range.start + end;
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let layout = self.last_layout.as_ref()?;
+        let range = self.editor.range_from_utf16(&range_utf16);
+        Some(Bounds::from_corners(
+            point(
+                bounds.left() + layout.x_for_index(range.start),
+                bounds.top(),
+            ),
+            point(
+                bounds.left() + layout.x_for_index(range.end),
+                bounds.bottom(),
+            ),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        pt: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let local = self.last_bounds?.localize(&pt)?;
+        let layout = self.last_layout.as_ref()?;
+        let utf8 = layout.index_for_x(pt.x - local.x)?;
+        Some(self.editor.offset_to_utf16(utf8))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BlockText: a custom GPUI `Element` that draws the editor's text and cursor.
+//
+// GPUI elements go through three phases each frame:
+//   request_layout -> tell the layout engine how big we want to be
+//   prepaint       -> compute things that depend on final bounds (shape text)
+//   paint          -> draw, and register the input handler
+// ---------------------------------------------------------------------------
+struct BlockText {
+    app: Entity<NoteSec>,
+}
+
+/// Data computed in `prepaint` and consumed in `paint`.
+struct PrepaintState {
+    line: ShapedLine,
+    cursor: PaintQuad,
+}
+
+impl IntoElement for BlockText {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for BlockText {
+    type RequestLayoutState = ();
+    type PrepaintState = PrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        // Full width, one line tall (blocks are single-line).
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let app = self.app.read(cx);
+        let text: SharedString = app.editor.text.clone().into();
+        let cursor = app.editor.cursor;
+        let marked = app.editor.marked.clone();
+        let accent: Hsla = app.theme.accent.into();
+        let style = window.text_style();
+
+        let run = TextRun {
+            len: text.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        // Underline the IME composition range, if any, by splitting the text
+        // into up to three runs: before / marked / after.
+        let runs: Vec<TextRun> = match marked {
+            Some(m) => vec![
+                TextRun {
+                    len: m.start,
+                    ..run.clone()
+                },
+                TextRun {
+                    len: m.end - m.start,
+                    underline: Some(UnderlineStyle {
+                        color: Some(run.color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    ..run.clone()
+                },
+                TextRun {
+                    len: text.len() - m.end,
+                    ..run
+                },
+            ]
+            .into_iter()
+            .filter(|r| r.len > 0)
+            .collect(),
+            None => vec![run],
+        };
+
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(text, font_size, &runs, None);
+
+        let x = line.x_for_index(cursor);
+        let cursor = fill(
+            Bounds::new(
+                point(bounds.left() + x, bounds.top()),
+                size(px(1.5), bounds.size.height),
+            ),
+            accent,
+        );
+        PrepaintState { line, cursor }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Tell GPUI that keyboard text input for this window goes to our entity.
+        let focus_handle = self.app.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.app.clone()),
+            cx,
+        );
+
+        prepaint
+            .line
+            .paint(
+                bounds.origin,
+                window.line_height(),
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .expect("failed to paint block text");
+
+        if focus_handle.is_focused(window) {
+            window.paint_quad(prepaint.cursor.clone());
+        }
+
+        // Remember the layout for the OS input-method callbacks.
+        let line = std::mem::take(&mut prepaint.line);
+        self.app.update(cx, |app, _| {
+            app.last_layout = Some(line);
+            app.last_bounds = Some(bounds);
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
 impl Render for NoteSec {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -95,6 +612,7 @@ impl Render for NoteSec {
                 .hover(|d| d.bg(theme.selected_bg))
                 // `cx.listener` turns a closure over `&mut Self` into a GPUI handler.
                 .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.stop_edit(cx); // save the block being edited first
                     this.selected = ix;
                     cx.notify(); // ask GPUI to re-render this view
                 }))
@@ -119,6 +637,33 @@ impl Render for NoteSec {
 
         // --- Main pane: title + blocks --------------------------------------
         let page = &self.pages[self.selected];
+        let rows: Vec<AnyElement> = page
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(ix, block)| {
+                let is_editing = self.editing == Some(ix);
+                let depth = page.depth_of(ix);
+                let content: AnyElement = if is_editing {
+                    BlockText { app: cx.entity() }.into_any_element()
+                } else {
+                    div().child(block.content.clone()).into_any_element()
+                };
+                block_row(&theme, depth, content)
+                    .id(("block", ix))
+                    // Lets tests find this row's on-screen bounds; a no-op in
+                    // normal builds.
+                    .debug_selector(|| format!("block-{ix}"))
+                    .cursor_text()
+                    .when(!is_editing, |d| {
+                        d.on_click(cx.listener(move |this, _e, window, cx| {
+                            this.start_edit(ix, window, cx);
+                        }))
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
         let main = div()
             .id("main")
             .flex_1()
@@ -134,15 +679,169 @@ impl Render for NoteSec {
                     .text_color(theme.text)
                     .child(page.title.clone()),
             )
-            .children(page_blocks(&theme, page));
+            .children(rows)
+            // Empty space below the blocks: clicking it leaves edit mode.
+            .child(
+                div()
+                    .id("filler")
+                    .flex_1()
+                    .min_h(px(120.0))
+                    .on_click(cx.listener(|this, _e, _window, cx| this.stop_edit(cx))),
+            );
 
+        let is_editing = self.editing.is_some();
         div()
             .size_full()
             .flex()
             .flex_row()
             .bg(theme.bg)
             .text_color(theme.text)
+            .track_focus(&self.focus_handle)
+            // The key context only exists while editing, which is what makes
+            // the "BlockEditor" key bindings conditional.
+            .when(is_editing, |d| d.key_context("BlockEditor"))
+            .on_action(cx.listener(Self::enter))
+            .on_action(cx.listener(Self::tab))
+            .on_action(cx.listener(Self::shift_tab))
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::left))
+            .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::home))
+            .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(Self::paste))
             .child(sidebar)
             .child(main)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use std::path::PathBuf;
+
+    /// Build a window with a graph containing one page "Test" with `markdown`,
+    /// selected and rendered. Returns the view, a test context and the graph dir.
+    fn setup<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        markdown: &str,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("notesec-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        std::fs::write(dir.join("pages/Test.md"), markdown).unwrap();
+
+        cx.update(bind_keys);
+        let (view, cx) = cx.add_window_view(|_, cx| NoteSec::new(storage, cx));
+        view.update(cx, |app, cx| {
+            app.selected = app.pages.iter().position(|p| p.title == "Test").unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (view, cx, dir)
+    }
+
+    fn click_block(cx: &mut VisualTestContext, ix: usize) {
+        // `debug_bounds` needs 'static selectors, so leak a tiny string in tests.
+        let selector: &'static str = Box::leak(format!("block-{ix}").into_boxed_str());
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} was not rendered"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+    }
+
+    fn file(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("pages/Test.md")).unwrap()
+    }
+
+    #[gpui::test]
+    fn click_type_enter_tab_backspace(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "flow", "- one\n- two\n");
+
+        // Click block 0 -> edit mode, text loaded, cursor at end.
+        click_block(cx, 0);
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.editor.text, "one");
+            assert_eq!(app.editor.cursor, 3);
+        });
+
+        // Typing goes through the OS input handler.
+        cx.simulate_input("!");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "one!"));
+        // Nothing hits disk on keystrokes.
+        assert_eq!(file(&dir), "- one\n- two\n");
+
+        // Enter at end -> new empty block below, now being edited.
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.pages[app.selected].blocks.len(), 3);
+            assert_eq!(app.pages[app.selected].blocks[0].content, "one!");
+        });
+        assert_eq!(file(&dir), "- one!\n- \n- two\n");
+
+        cx.simulate_input("new");
+
+        // Tab nests it under "one!"; the typed text is saved with it.
+        cx.simulate_keystrokes("tab");
+        assert_eq!(file(&dir), "- one!\n  - new\n- two\n");
+
+        // Shift-Tab brings it back out.
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(file(&dir), "- one!\n- new\n- two\n");
+
+        // Backspace erases text first...
+        cx.simulate_keystrokes("backspace backspace backspace");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "");
+            assert_eq!(app.pages[app.selected].blocks.len(), 3);
+        });
+        // ...and on the now-empty block deletes it, moving to the block above.
+        cx.simulate_keystrokes("backspace");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.editor.text, "one!");
+            assert_eq!(app.pages[app.selected].blocks.len(), 2);
+        });
+        assert_eq!(file(&dir), "- one!\n- two\n");
+
+        // Escape leaves edit mode.
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn enter_in_the_middle_splits_the_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "split", "- hello world\n");
+        click_block(cx, 0);
+        cx.simulate_keystrokes("home right right right right right");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, 0);
+            assert_eq!(app.editor.text, " world");
+        });
+        assert_eq!(file(&dir), "- hello\n-  world\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn cannot_delete_last_block_or_block_with_children(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "guard", "- parent\n  - child\n");
+        // Empty the parent, then backspace: it has children, so it must stay.
+        click_block(cx, 0);
+        cx.simulate_keystrokes("backspace backspace backspace backspace backspace backspace");
+        cx.simulate_keystrokes("backspace");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks.len(), 2);
+        });
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

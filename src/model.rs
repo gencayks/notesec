@@ -69,6 +69,111 @@ impl Page {
         depth
     }
 
+    /// Index one past the last descendant of the block at `index`, i.e. the
+    /// end of its subtree in the flat list.
+    pub fn subtree_end(&self, index: usize) -> usize {
+        let depth = self.depth_of(index);
+        let mut end = index + 1;
+        while end < self.blocks.len() && self.depth_of(end) > depth {
+            end += 1;
+        }
+        end
+    }
+
+    /// Recompute every block's `order` from document order. Called after any
+    /// structural change so `order` never goes stale.
+    pub fn renumber(&mut self) {
+        let mut counts: std::collections::HashMap<Option<Uuid>, usize> = Default::default();
+        for block in &mut self.blocks {
+            let n = counts.entry(block.parent_id).or_insert(0);
+            block.order = *n;
+            *n += 1;
+        }
+    }
+
+    /// Enter: insert a new block with `content` right after block `index` and
+    /// return its index. If the block has children the new block becomes its
+    /// first child (as in Logseq); otherwise it is a sibling just below.
+    pub fn insert_after(&mut self, index: usize, content: String) -> usize {
+        let has_children = self.subtree_end(index) > index + 1;
+        let (parent_id, at) = if has_children {
+            (Some(self.blocks[index].id), index + 1)
+        } else {
+            (self.blocks[index].parent_id, index + 1)
+        };
+        self.blocks.insert(
+            at,
+            Block {
+                id: Uuid::new_v4(),
+                content,
+                parent_id,
+                page_id: self.id.clone(),
+                order: 0,
+            },
+        );
+        self.renumber();
+        at
+    }
+
+    /// Tab: make the block a child of its previous sibling. Fails (returns
+    /// false) for the first child, which has nothing to nest under.
+    pub fn indent(&mut self, index: usize) -> bool {
+        let parent = self.blocks[index].parent_id;
+        let order = self.blocks[index].order;
+        if order == 0 {
+            return false;
+        }
+        // The previous sibling is the block with the same parent and order-1.
+        let Some(prev) = self
+            .blocks
+            .iter()
+            .find(|b| b.parent_id == parent && b.order + 1 == order)
+            .map(|b| b.id)
+        else {
+            return false;
+        };
+        // Document order is unchanged: the block already sits directly after
+        // the previous sibling's subtree, so it just becomes that subtree's
+        // last child. Its own children come along automatically.
+        self.blocks[index].parent_id = Some(prev);
+        self.renumber();
+        true
+    }
+
+    /// Shift-Tab: make the block a sibling placed right after its parent.
+    /// Later siblings become the block's children so document order is kept
+    /// (this matches Logseq). Fails for top-level blocks.
+    pub fn outdent(&mut self, index: usize) -> bool {
+        let Some(parent_id) = self.blocks[index].parent_id else {
+            return false;
+        };
+        let id = self.blocks[index].id;
+        let order = self.blocks[index].order;
+        let grandparent = self
+            .blocks
+            .iter()
+            .find(|b| b.id == parent_id)
+            .and_then(|b| b.parent_id);
+        for b in &mut self.blocks {
+            if b.parent_id == Some(parent_id) && b.order > order {
+                b.parent_id = Some(id);
+            }
+        }
+        self.blocks[index].parent_id = grandparent;
+        self.renumber();
+        true
+    }
+
+    /// Delete a block that has no children. Returns false if it has children.
+    pub fn delete_leaf(&mut self, index: usize) -> bool {
+        if self.subtree_end(index) > index + 1 {
+            return false;
+        }
+        self.blocks.remove(index);
+        self.renumber();
+        true
+    }
+
     /// Parse Logseq-style markdown into a page.
     pub fn from_markdown(title: &str, is_journal: bool, text: &str) -> Self {
         let mut page = Page::new(title, is_journal);
@@ -186,6 +291,56 @@ mod tests {
         assert_eq!(page.blocks[3].parent_id, Some(page.blocks[0].id));
         assert_eq!(page.blocks[3].order, 1);
         assert_eq!(page.to_markdown(), md);
+    }
+
+    /// Helper: `(depth, content)` for each block, for readable assertions.
+    fn shape(page: &Page) -> Vec<(usize, String)> {
+        (0..page.blocks.len())
+            .map(|i| (page.depth_of(i), page.blocks[i].content.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn enter_makes_sibling_or_first_child() {
+        let mut page = Page::from_markdown("t", false, "- a\n  - b\n- c\n");
+        // `b` has no children -> sibling below it.
+        assert_eq!(page.insert_after(1, "x".into()), 2);
+        // `a` has children -> new block is its first child.
+        assert_eq!(page.insert_after(0, "y".into()), 1);
+        assert_eq!(
+            shape(&page),
+            vec![
+                (0, "a".into()),
+                (1, "y".into()),
+                (1, "b".into()),
+                (1, "x".into()),
+                (0, "c".into())
+            ]
+        );
+        assert_eq!(page.blocks[1].order, 0);
+        assert_eq!(page.blocks[3].order, 2);
+    }
+
+    #[test]
+    fn indent_and_outdent() {
+        let mut page = Page::from_markdown("t", false, "- a\n- b\n- c\n");
+        assert!(!page.indent(0), "first block cannot indent");
+        assert!(page.indent(1));
+        assert_eq!(page.to_markdown(), "- a\n  - b\n- c\n");
+        assert!(page.indent(2)); // c nests under a, after b
+        assert_eq!(page.to_markdown(), "- a\n  - b\n  - c\n");
+        // Outdenting b makes the later sibling c its child.
+        assert!(page.outdent(1));
+        assert_eq!(page.to_markdown(), "- a\n- b\n  - c\n");
+        assert!(!page.outdent(0));
+    }
+
+    #[test]
+    fn delete_only_leaves() {
+        let mut page = Page::from_markdown("t", false, "- a\n  - b\n- c\n");
+        assert!(!page.delete_leaf(0));
+        assert!(page.delete_leaf(1));
+        assert_eq!(page.to_markdown(), "- a\n- c\n");
     }
 
     #[test]

@@ -12,7 +12,7 @@
 use crate::model::Page;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct Storage {
     root: PathBuf,
@@ -34,10 +34,6 @@ impl Storage {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("notesec")
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Load every page in the graph. Unreadable files are skipped with a warning

@@ -1,12 +1,16 @@
-//! Text-editing state for a single block, independent of any UI code.
+//! Text-editing state for the block being edited, independent of any UI code.
 //!
-//! Keeping this separate from GPUI makes it easy to unit-test. In MVP feature 2
-//! a GPUI element will render this state and feed keyboard input into it.
+//! Keeping this separate from GPUI makes it easy to unit-test. `app.rs` owns one
+//! shared `EditorState` and loads whichever block you click into it.
 //!
-//! All offsets are **byte** offsets into `text` (Rust strings are UTF-8), and are
-//! always kept on grapheme-cluster boundaries so the cursor never lands inside
-//! a multi-byte character or an emoji sequence.
+//! All offsets are **byte** offsets into `text` (Rust strings are UTF-8) and are
+//! kept on grapheme-cluster boundaries, so the cursor never lands inside a
+//! multi-byte character or an emoji sequence. The OS input-method API speaks
+//! UTF-16, hence the `*_utf16` converters below.
+//!
+//! Blocks are single-line, so newlines are stripped from anything inserted.
 
+use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Debug, Default)]
@@ -14,20 +18,33 @@ pub struct EditorState {
     pub text: String,
     /// Cursor position in bytes.
     pub cursor: usize,
+    /// Range of in-progress IME composition text (e.g. while typing `é` via a
+    /// dead key), underlined by the renderer. `None` when not composing.
+    pub marked: Option<Range<usize>>,
 }
 
 impl EditorState {
+    /// New editor containing `text`, cursor at the end.
     pub fn new(text: &str) -> Self {
         EditorState {
             text: text.to_string(),
             cursor: text.len(),
+            marked: None,
         }
     }
 
-    /// Insert `s` at the cursor and move the cursor after it.
+    /// Replace `range` with `new_text` (newlines become spaces) and put the
+    /// cursor after the inserted text.
+    pub fn replace_range(&mut self, range: Range<usize>, new_text: &str) {
+        let clean = new_text.replace(['\n', '\r'], " ");
+        self.text.replace_range(range.clone(), &clean);
+        self.cursor = range.start + clean.len();
+        self.marked = None;
+    }
+
+    /// Insert `s` at the cursor.
     pub fn insert(&mut self, s: &str) {
-        self.text.insert_str(self.cursor, s);
-        self.cursor += s.len();
+        self.replace_range(self.cursor..self.cursor, s);
     }
 
     /// Delete the grapheme before the cursor. Returns false if at the start.
@@ -70,8 +87,48 @@ impl EditorState {
     /// Split at the cursor: keep the left half here, return the right half.
     /// Used for Enter ("new block below" carries over the text after the cursor).
     pub fn split_off_at_cursor(&mut self) -> String {
-        self.text.split_off(self.cursor)
+        let rest = self.text.split_off(self.cursor);
+        self.marked = None;
+        rest
     }
+
+    // --- UTF-8 <-> UTF-16 offset conversion --------------------------------
+
+    pub fn offset_from_utf16(&self, offset: usize) -> usize {
+        let mut utf8 = 0;
+        let mut utf16 = 0;
+        for ch in self.text.chars() {
+            if utf16 >= offset {
+                break;
+            }
+            utf16 += ch.len_utf16();
+            utf8 += ch.len_utf8();
+        }
+        utf8
+    }
+
+    pub fn offset_to_utf16(&self, offset: usize) -> usize {
+        let mut utf16 = 0;
+        let mut utf8 = 0;
+        for ch in self.text.chars() {
+            if utf8 >= offset {
+                break;
+            }
+            utf8 += ch.len_utf8();
+            utf16 += ch.len_utf16();
+        }
+        utf16
+    }
+
+    pub fn range_from_utf16(&self, r: &Range<usize>) -> Range<usize> {
+        self.offset_from_utf16(r.start)..self.offset_from_utf16(r.end)
+    }
+
+    pub fn range_to_utf16(&self, r: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(r.start)..self.offset_to_utf16(r.end)
+    }
+
+    // --- grapheme boundaries ------------------------------------------------
 
     fn prev_boundary(&self, offset: usize) -> usize {
         self.text
@@ -111,5 +168,29 @@ mod tests {
         e.cursor = 5;
         assert_eq!(e.split_off_at_cursor(), " world");
         assert_eq!(e.text, "hello");
+    }
+
+    #[test]
+    fn newlines_are_flattened() {
+        let mut e = EditorState::new("");
+        e.insert("a\nb");
+        assert_eq!(e.text, "a b");
+    }
+
+    #[test]
+    fn utf16_round_trip() {
+        let e = EditorState::new("a😀b"); // the emoji is 4 bytes, 2 UTF-16 units
+        assert_eq!(e.offset_to_utf16(5), 3);
+        assert_eq!(e.offset_from_utf16(3), 5);
+    }
+
+    #[test]
+    fn delete_forward() {
+        let mut e = EditorState::new("abc");
+        e.cursor = 1;
+        assert!(e.delete());
+        assert_eq!(e.text, "ac");
+        e.move_end();
+        assert!(!e.delete());
     }
 }
