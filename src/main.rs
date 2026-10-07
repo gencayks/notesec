@@ -1,6 +1,8 @@
 mod app;
 mod config;
 mod editor;
+mod graph;
+mod graph_view;
 mod model;
 mod search;
 mod storage;
@@ -26,6 +28,10 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // Wayland compositors (and X11 window managers) match this to
+                // the `.desktop` file's StartupWMClass / name to pick the
+                // launcher icon.
+                app_id: Some("notesec".into()),
                 ..Default::default()
             },
             // The closure builds the root view entity.

@@ -2242,6 +2242,7 @@ dependencies = [
  "gpui_linux",
  "gpui_macos",
  "gpui_web",
+ "gpui_wgpu",
  "gpui_windows",
 ]
 
@@ -2301,6 +2302,7 @@ dependencies = [
  "etagere",
  "gpui",
  "gpui_util",
+ "image",
  "itertools",
  "log",
  "parking_lot",
@@ -3216,6 +3218,7 @@ dependencies = [
  "dirs",
  "gpui",
  "gpui_platform",
+ "gpui_wgpu",
  "serde",
  "toml 0.9.8",
  "unicode-segmentation",

@@ -29,3 +29,5 @@ async-process = { git = "https://github.com/zed-industries/async-process.git", r
 [dev-dependencies]
 # test-support enables the headless TestAppContext used by the UI tests.
 gpui = { path = "/home/kazo/gpui-playground/crates/gpui", features = ["test-support"] }
+gpui_platform = { path = "/home/kazo/gpui-playground/crates/gpui_platform", features = ["test-support"] }
+gpui_wgpu = { path = "/home/kazo/gpui-playground/crates/gpui_wgpu" }

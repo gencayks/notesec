@@ -7,6 +7,7 @@
 
 use crate::config::Config;
 use crate::editor::EditorState;
+use crate::graph_view::{GraphEvent, GraphView};
 use crate::model::{backlinks, parse_references, tag_counts, Page};
 use crate::search::{search, Command, Hit, Target};
 use crate::storage::{today_title, Storage};
@@ -15,7 +16,7 @@ use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds, ClickEvent,
     Context, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
     GlobalElementId, HighlightStyle, Hsla, KeyBinding, LayoutId, PaintQuad, Pixels, ShapedLine,
-    SharedString, Style, StyledText, TextRun, UTF16Selection, UnderlineStyle, Window,
+    SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use std::ops::Range;
 
@@ -39,6 +40,7 @@ actions!(
         Paste,
         ToggleSearch,
         ToggleTheme,
+        ToggleGraph,
         IncreaseFont,
         DecreaseFont,
         ResetFont,
@@ -68,6 +70,7 @@ pub fn bind_keys(cx: &mut App) {
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
+        KeyBinding::new("ctrl-g", ToggleGraph, None),
         // `=` and `+` share a key on US layouts; bind both so Ctrl-+ works with
         // or without Shift.
         KeyBinding::new("ctrl-=", IncreaseFont, None),
@@ -77,6 +80,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
+}
+
+/// Which main view is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// A page's blocks (the default).
+    Notes,
+    /// The page graph.
+    Graph,
 }
 
 /// How many results the search overlay shows.
@@ -114,6 +126,13 @@ pub struct NoteSec {
     editor: EditorState,
     /// `Some` while the Ctrl-K search overlay is open.
     search: Option<SearchState>,
+    mode: Mode,
+    /// The graph view, created the first time it is opened and then kept so it
+    /// remembers node positions between visits.
+    graph: Option<Entity<GraphView>>,
+    /// Keeps the subscription to the graph's events alive (dropping a
+    /// `Subscription` cancels it).
+    _graph_subscription: Option<Subscription>,
     /// Shaped text + bounds from the last paint; needed to answer the OS
     /// input-method's questions about where characters are on screen.
     last_layout: Option<ShapedLine>,
@@ -191,6 +210,9 @@ impl NoteSec {
             editing: None,
             editor: EditorState::default(),
             search: None,
+            mode: Mode::Notes,
+            graph: None,
+            _graph_subscription: None,
             last_layout: None,
             last_bounds: None,
         }
@@ -226,18 +248,21 @@ impl NoteSec {
         self.config.theme = self.config.theme.toggled();
         self.theme = Theme::from_kind(self.config.theme);
         self.save_config();
+        self.sync_graph_style(cx);
         cx.notify();
     }
 
     fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.config.adjust_font_size(delta);
         self.save_config();
+        self.sync_graph_style(cx);
         cx.notify();
     }
 
     fn reset_font_size(&mut self, cx: &mut Context<Self>) {
         self.config.font_size = crate::config::DEFAULT_FONT_SIZE;
         self.save_config();
+        self.sync_graph_style(cx);
         cx.notify();
     }
 
@@ -247,6 +272,7 @@ impl NoteSec {
             Command::IncreaseFontSize => self.change_font_size(1.0, cx),
             Command::DecreaseFontSize => self.change_font_size(-1.0, cx),
             Command::ResetFontSize => self.reset_font_size(cx),
+            Command::ToggleGraph => self.toggle_graph(cx),
         }
     }
 
@@ -413,7 +439,57 @@ impl NoteSec {
             }
         };
         self.selected = ix;
+        self.mode = Mode::Notes;
         cx.notify();
+    }
+
+    // --- graph view ------------------------------------------------------------
+
+    /// Switch to the graph view, creating it on first use.
+    fn show_graph(&mut self, cx: &mut Context<Self>) {
+        // Save the block being edited so the graph sees up-to-date links.
+        self.stop_edit(cx);
+        let current = self.pages[self.selected].title.clone();
+        let pages = self.pages.clone();
+        if let Some(graph) = self.graph.clone() {
+            graph.update(cx, |g, cx| g.refresh(pages, current, cx));
+        } else {
+            let (theme, size, reduce_motion) =
+                (self.theme, self.config.font_size, cx.reduce_motion());
+            let graph = cx.new(|_| GraphView::new(pages, current, theme, size, reduce_motion));
+            // Clicking a node asks us to open that page.
+            self._graph_subscription = Some(cx.subscribe(
+                &graph,
+                |this, _graph, event: &GraphEvent, cx| {
+                    let GraphEvent::OpenPage(title) = event;
+                    this.open_page(title, cx);
+                },
+            ));
+            self.graph = Some(graph);
+        }
+        self.mode = Mode::Graph;
+        cx.notify();
+    }
+
+    fn toggle_graph(&mut self, cx: &mut Context<Self>) {
+        if self.mode == Mode::Graph {
+            self.mode = Mode::Notes;
+            cx.notify();
+        } else {
+            self.show_graph(cx);
+        }
+    }
+
+    fn on_toggle_graph(&mut self, _: &ToggleGraph, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_graph(cx);
+    }
+
+    /// Push theme and font changes into the graph view if it exists.
+    fn sync_graph_style(&self, cx: &mut Context<Self>) {
+        if let Some(graph) = &self.graph {
+            let (theme, size) = (self.theme, self.config.font_size);
+            graph.update(cx, |g, cx| g.set_style(theme, size, cx));
+        }
     }
 
     /// Copy the editor's text into the block being edited. Returns true if the
@@ -945,6 +1021,7 @@ impl Render for NoteSec {
                 .on_click(cx.listener(move |this, _event, _window, cx| {
                     this.stop_edit(cx); // save the block being edited first
                     this.selected = ix;
+                    this.mode = Mode::Notes;
                     cx.notify(); // ask GPUI to re-render this view
                 }))
                 .child(page.title.clone())
@@ -980,6 +1057,21 @@ impl Render for NoteSec {
             .collect();
         let has_tags = !tag_rows.is_empty();
 
+        // "Graph view" entry above the page list; highlighted while open.
+        let in_graph = self.mode == Mode::Graph;
+        let graph_item = div()
+            .id("graph-item")
+            .debug_selector(|| "graph-item".to_string())
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(if in_graph { theme.accent } else { theme.text })
+            .when(in_graph, |d| d.bg(theme.selected_bg))
+            .hover(|d| d.bg(theme.selected_bg))
+            .on_click(cx.listener(|this, _e, _window, cx| this.toggle_graph(cx)))
+            .child("Graph view");
+
         let sidebar = div()
             .id("sidebar")
             .w(px(240.0))
@@ -993,6 +1085,7 @@ impl Render for NoteSec {
             .border_r_1()
             .border_color(theme.border)
             .overflow_y_scroll()
+            .child(graph_item)
             .child(div().px_3().py_2().text_color(theme.muted).child("PAGES"))
             .children(sidebar_items)
             .when(has_tags, |d| {
@@ -1250,6 +1343,12 @@ impl Render for NoteSec {
                 )
         });
 
+        // The main area shows either the page or the graph.
+        let content: AnyElement = match (&self.mode, &self.graph) {
+            (Mode::Graph, Some(graph)) => graph.clone().into_any_element(),
+            _ => main.into_any_element(),
+        };
+
         let is_editing = self.editing.is_some() || self.search.is_some();
         div()
             .size_full()
@@ -1280,11 +1379,12 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::on_toggle_theme))
+            .on_action(cx.listener(Self::on_toggle_graph))
             .on_action(cx.listener(Self::on_increase_font))
             .on_action(cx.listener(Self::on_decrease_font))
             .on_action(cx.listener(Self::on_reset_font))
             .child(sidebar)
-            .child(main)
+            .child(content)
             .children(overlay)
     }
 }
@@ -1293,7 +1393,10 @@ impl Render for NoteSec {
 mod tests {
     use super::*;
     use crate::config::ThemeKind;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{
+        Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+        VisualTestContext,
+    };
     use std::path::PathBuf;
 
     /// Build a window with a graph containing one page "Test" with `markdown`,
@@ -1745,6 +1848,252 @@ mod tests {
             assert_eq!(app.config.font_size, 22.0);
         });
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Open the graph via the sidebar entry and return its entity plus the
+    /// on-screen bounds of the drawing area.
+    fn open_graph(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+    ) -> (Entity<GraphView>, Bounds<Pixels>) {
+        let item = cx
+            .debug_bounds("graph-item")
+            .expect("sidebar has a Graph view entry");
+        cx.simulate_click(item.center(), Modifiers::none());
+        cx.run_until_parked();
+        let graph = view
+            .update(cx, |app, _| app.graph.clone())
+            .expect("graph created");
+        let canvas = cx.debug_bounds("graph-canvas").expect("graph canvas drawn");
+        (graph, canvas)
+    }
+
+    /// Absolute window position of a node, found from the graph's own layout.
+    fn node_pos(
+        graph: &Entity<GraphView>,
+        canvas: Bounds<Pixels>,
+        title: &str,
+        cx: &mut VisualTestContext,
+    ) -> Point<Pixels> {
+        let (x, y) = graph
+            .update(cx, |g, _| g.node_screen_pos(title))
+            .unwrap_or_else(|| panic!("no node {title}"));
+        point(canvas.origin.x + px(x), canvas.origin.y + px(y))
+    }
+
+    fn graph_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- links to [[Alpha]]\n"),
+            ("Alpha", "- back to [[Test]] and [[Zed]]\n"),
+            ("Zed", "- leaf\n"),
+        ]
+    }
+
+    #[gpui::test]
+    fn graph_opens_from_sidebar_and_toggles_with_ctrl_g(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "graph-open", &graph_pages(), "Test");
+        assert!(
+            cx.debug_bounds("graph-canvas").is_none(),
+            "notes view first"
+        );
+
+        let (graph, canvas) = open_graph(&view, cx);
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+        assert!(canvas.size.width > px(300.) && canvas.size.height > px(200.));
+        // 3 pages + today's journal.
+        assert_eq!(
+            graph.update(cx, |g, _| g.node_screen_pos("Alpha").is_some()),
+            true
+        );
+
+        cx.simulate_keystrokes("ctrl-g");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Notes));
+        assert!(cx.debug_bounds("graph-canvas").is_none());
+        cx.simulate_keystrokes("ctrl-g");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+
+        // Choosing a page in the sidebar leaves the graph.
+        cx.simulate_keystrokes("ctrl-g");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn clicking_a_node_opens_that_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "graph-click", &graph_pages(), "Test");
+        let (graph, canvas) = open_graph(&view, cx);
+
+        let alpha = node_pos(&graph, canvas, "Alpha", cx);
+        cx.simulate_click(alpha, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Notes, "clicking a node leaves the graph");
+            assert_eq!(app.pages[app.selected].title, "Alpha");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn hovering_a_node_highlights_it_and_leaving_clears_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "graph-hover", &graph_pages(), "Test");
+        let (graph, canvas) = open_graph(&view, cx);
+
+        let zed = node_pos(&graph, canvas, "Zed", cx);
+        cx.simulate_mouse_move(zed, None, Modifiers::none());
+        assert_eq!(
+            graph.update(cx, |g, _| g.hovered_title()),
+            Some("Zed".to_string())
+        );
+
+        // Empty corner of the pane: nothing hovered.
+        let corner = point(canvas.origin.x + px(4.), canvas.origin.y + px(4.));
+        cx.simulate_mouse_move(corner, None, Modifiers::none());
+        assert_eq!(graph.update(cx, |g, _| g.hovered_title()), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn dragging_a_node_pins_it_without_leaving_the_graph(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "graph-drag", &graph_pages(), "Test");
+        let (graph, canvas) = open_graph(&view, cx);
+
+        let from = node_pos(&graph, canvas, "Zed", cx);
+        let to = point(from.x + px(70.), from.y + px(45.));
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(from.x + px(20.), from.y + px(10.)),
+            Some(MouseButton::Left),
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Graph, "a drag is not a click")
+        });
+        assert!(graph.update(cx, |g, _| g.is_pinned("Zed")));
+        let now = node_pos(&graph, canvas, "Zed", cx);
+        assert!(
+            (now.x - to.x).abs() < px(1.) && (now.y - to.y).abs() < px(1.),
+            "node sits where it was dropped"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn scroll_wheel_zooms_the_graph(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "graph-zoom", &graph_pages(), "Test");
+        let (graph, canvas) = open_graph(&view, cx);
+
+        let before = graph.update(cx, |g, _| g.zoom());
+        cx.simulate_event(ScrollWheelEvent {
+            position: canvas.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(120.))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        let zoomed_in = graph.update(cx, |g, _| g.zoom());
+        assert!(
+            zoomed_in > before,
+            "scroll up zooms in ({before} -> {zoomed_in})"
+        );
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: canvas.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-300.))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        assert!(
+            graph.update(cx, |g, _| g.zoom()) < zoomed_in,
+            "scroll down zooms out"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn journals_toggle_button_changes_the_node_count(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "graph-journals", &graph_pages(), "Test");
+        let (graph, _canvas) = open_graph(&view, cx);
+        let todays_journal = today_title();
+        assert!(graph.update(cx, |g, _| g.node_screen_pos(&todays_journal).is_some()));
+
+        let button = cx.debug_bounds("graph-journals").expect("toggle button");
+        cx.simulate_click(button.center(), Modifiers::none());
+        assert!(
+            graph.update(cx, |g, _| g.node_screen_pos(&todays_journal).is_none()),
+            "journal hidden"
+        );
+        cx.simulate_click(button.center(), Modifiers::none());
+        assert!(
+            graph.update(cx, |g, _| g.node_screen_pos(&todays_journal).is_some()),
+            "journal back"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn graph_follows_theme_changes_and_palette_command(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "graph-theme", &graph_pages(), "Test");
+        let (graph, _) = open_graph(&view, cx);
+        let dark = graph.update(cx, |g, _| g.theme_bg());
+        cx.simulate_keystrokes("ctrl-shift-t");
+        assert_ne!(
+            graph.update(cx, |g, _| g.theme_bg()),
+            dark,
+            "graph switches to the light theme"
+        );
+
+        // The palette command toggles the view too.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("graph");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Notes));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn graph_shows_edited_links_when_reopened_and_keeps_pins(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "graph-reopen", &graph_pages(), "Test");
+        let (graph, canvas) = open_graph(&view, cx);
+
+        // Drag Zed somewhere and leave the graph.
+        let from = node_pos(&graph, canvas, "Zed", cx);
+        let to = point(from.x + px(60.), from.y + px(60.));
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        cx.simulate_keystrokes("ctrl-g");
+
+        // Add a link to a brand-new page from the Test page.
+        click_block(cx, 0);
+        cx.simulate_input(" [[Fresh]]");
+        cx.simulate_keystrokes("escape");
+
+        let (graph, _) = open_graph_again(&view, cx);
+        assert!(
+            graph.update(cx, |g, _| g.node_screen_pos("Fresh").is_some()),
+            "new page appears"
+        );
+        assert!(
+            graph.update(cx, |g, _| g.is_pinned("Zed")),
+            "dragged node is still pinned"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Re-open the graph with Ctrl-G (the sidebar entry was used the first time).
+    fn open_graph_again(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+    ) -> (Entity<GraphView>, Bounds<Pixels>) {
+        cx.simulate_keystrokes("ctrl-g");
+        cx.run_until_parked();
+        let graph = view
+            .update(cx, |app, _| app.graph.clone())
+            .expect("graph exists");
+        (
+            graph,
+            cx.debug_bounds("graph-canvas").expect("canvas drawn"),
+        )
     }
 
     fn search_pages() -> [(&'static str, &'static str); 3] {

@@ -104,14 +104,16 @@ pub enum Command {
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
+    ToggleGraph,
 }
 
 impl Command {
-    pub const ALL: [Command; 4] = [
+    pub const ALL: [Command; 5] = [
         Command::ToggleTheme,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
         Command::ResetFontSize,
+        Command::ToggleGraph,
     ];
 
     pub fn label(self) -> &'static str {
@@ -120,6 +122,7 @@ impl Command {
             Command::IncreaseFontSize => "Increase font size",
             Command::DecreaseFontSize => "Decrease font size",
             Command::ResetFontSize => "Reset font size",
+            Command::ToggleGraph => "Toggle graph view",
         }
     }
 }
