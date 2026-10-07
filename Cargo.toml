@@ -1,0 +1,27 @@
+[package]
+name = "notesec"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, GPU-rendered outliner notes app (Logseq-style) built on GPUI"
+license = "MIT"
+repository = "https://github.com/gencayks/notesec"
+
+[dependencies]
+# GPUI is not published in a stable form, so for now we point at a local clone of
+# the Zed repo. (Absolute path: Cargo does not expand `~`.)
+gpui = { path = "/home/kazo/gpui-playground/crates/gpui" }
+gpui_platform = { path = "/home/kazo/gpui-playground/crates/gpui_platform", features = ["wayland", "x11"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+dirs = "6"
+unicode-segmentation = "1"
+
+# Zed's workspace patches a few crates; patches only apply at the *root* manifest,
+# so we must repeat the ones GPUI needs here.
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
