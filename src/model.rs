@@ -14,7 +14,52 @@
 //! tree structure is encoded by each block's `parent_id`, so rendering a block's
 //! indent is just "count how many ancestors it has".
 
+use std::ops::Range;
 use uuid::Uuid;
+
+/// A `[[wikilink]]` found inside a block's text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WikiLink {
+    /// Byte range of the whole `[[...]]`, brackets included.
+    pub range: Range<usize>,
+    /// The page name between the brackets, trimmed.
+    pub target: String,
+}
+
+/// Find every well-formed `[[name]]` in `text`, in order.
+///
+/// A link needs a non-empty name that contains no `[`, `]` or newline. In
+/// `[[a [[b]]` only the inner `[[b]]` counts.
+pub fn parse_wikilinks(text: &str) -> Vec<WikiLink> {
+    let mut links = Vec::new();
+    let mut pos = 0;
+    while let Some(offset) = text[pos..].find("[[") {
+        let start = pos + offset;
+        let inner_start = start + 2;
+        // No closing `]]` anywhere after this point: nothing more to find.
+        let Some(len) = text[inner_start..].find("]]") else {
+            break;
+        };
+        let end = inner_start + len;
+        let inner = &text[inner_start..end];
+        if inner.contains(['[', ']', '\n']) || inner.trim().is_empty() {
+            // Not a valid link; resume scanning just after this `[`.
+            pos = start + 1;
+            continue;
+        }
+        links.push(WikiLink {
+            range: start..end + 2,
+            target: inner.trim().to_string(),
+        });
+        pos = end + 2;
+    }
+    links
+}
+
+/// True for titles shaped like `YYYY-MM-DD` (daily journal pages).
+pub fn is_journal_title(title: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(title, "%Y-%m-%d").is_ok()
+}
 
 /// One bullet in the outline.
 #[derive(Clone, Debug, PartialEq)]
@@ -49,6 +94,20 @@ impl Page {
             blocks: Vec::new(),
             is_journal,
         }
+    }
+
+    /// A new page containing a single empty block, so there is something to
+    /// click into. Used when a `[[link]]` points at a page that doesn't exist.
+    pub fn with_empty_block(title: &str) -> Self {
+        let mut page = Page::new(title, is_journal_title(title));
+        page.blocks.push(Block {
+            id: Uuid::new_v4(),
+            content: String::new(),
+            parent_id: None,
+            page_id: page.id.clone(),
+            order: 0,
+        });
+        page
     }
 
     /// Nesting depth of the block at `index` (0 = top level).
@@ -291,6 +350,39 @@ mod tests {
         assert_eq!(page.blocks[3].parent_id, Some(page.blocks[0].id));
         assert_eq!(page.blocks[3].order, 1);
         assert_eq!(page.to_markdown(), md);
+    }
+
+    fn targets(text: &str) -> Vec<String> {
+        parse_wikilinks(text)
+            .into_iter()
+            .map(|l| l.target)
+            .collect()
+    }
+
+    #[test]
+    fn wikilinks_basic_and_ranges() {
+        let text = "see [[Foo]] and [[ Bar Baz ]]!";
+        let links = parse_wikilinks(text);
+        assert_eq!(targets(text), vec!["Foo", "Bar Baz"]);
+        assert_eq!(&text[links[0].range.clone()], "[[Foo]]");
+        assert_eq!(&text[links[1].range.clone()], "[[ Bar Baz ]]");
+    }
+
+    #[test]
+    fn wikilinks_reject_malformed() {
+        assert!(targets("[[]] [[ ]] [single] [[unclosed").is_empty());
+        assert!(targets("[[a\nb]]").is_empty());
+        // Only the inner, well-formed link counts.
+        assert_eq!(targets("[[a [[b]]"), vec!["b"]);
+        // Multi-byte text around and inside links is fine.
+        assert_eq!(targets("é [[ü]] 😀"), vec!["ü"]);
+    }
+
+    #[test]
+    fn journal_titles() {
+        assert!(is_journal_title("2026-10-07"));
+        assert!(!is_journal_title("Welcome"));
+        assert!(!is_journal_title("2026-13-40"));
     }
 
     /// Helper: `(depth, content)` for each block, for readable assertions.

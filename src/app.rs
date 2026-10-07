@@ -6,14 +6,14 @@
 //! the block and the page is saved to disk.
 
 use crate::editor::EditorState;
-use crate::model::Page;
+use crate::model::{parse_wikilinks, Page};
 use crate::storage::{today_title, Storage};
 use crate::ui::{block_row, Theme};
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds, Context,
-    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hsla,
-    KeyBinding, LayoutId, PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun,
-    UTF16Selection, UnderlineStyle, Window,
+    actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds, ClickEvent,
+    Context, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    GlobalElementId, HighlightStyle, Hsla, KeyBinding, LayoutId, PaintQuad, Pixels, ShapedLine,
+    SharedString, Style, StyledText, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use std::ops::Range;
 
@@ -124,11 +124,74 @@ impl NoteSec {
 
     // --- persistence helpers -------------------------------------------------
 
-    fn save_page(&self) {
+    /// Save the selected page, then create any pages its `[[links]]` point to.
+    ///
+    /// Doing link-target creation here (rather than per keystroke) means typing
+    /// `[[Ne` never creates a half-named page: links are only acted on once the
+    /// block is committed.
+    fn save_page(&mut self) {
         let page = &self.pages[self.selected];
         if let Err(err) = self.storage.save(page) {
             eprintln!("notesec: failed to save {}: {err}", page.title);
         }
+        self.ensure_link_targets();
+    }
+
+    /// Index of the page called `title`. Matching ignores case, like Logseq.
+    fn find_page(&self, title: &str) -> Option<usize> {
+        let wanted = title.to_lowercase();
+        self.pages
+            .iter()
+            .position(|p| p.title.to_lowercase() == wanted)
+    }
+
+    /// Add a page, keeping the sidebar sorted and `selected` pointing at the
+    /// same page as before (sorting can shift indices).
+    fn add_page(&mut self, page: Page) {
+        let current = self.pages[self.selected].title.clone();
+        self.pages.push(page);
+        sort_pages(&mut self.pages);
+        self.selected = self.find_page(&current).unwrap_or(0);
+    }
+
+    /// Create (and save) a page for every `[[link]]` on the selected page that
+    /// doesn't have one yet.
+    fn ensure_link_targets(&mut self) {
+        let targets: Vec<String> = self.pages[self.selected]
+            .blocks
+            .iter()
+            .flat_map(|b| parse_wikilinks(&b.content))
+            .map(|link| link.target)
+            .collect();
+        for target in targets {
+            if self.find_page(&target).is_none() {
+                let page = Page::with_empty_block(&target);
+                if let Err(err) = self.storage.save(&page) {
+                    eprintln!("notesec: failed to create page {target}: {err}");
+                }
+                self.add_page(page);
+            }
+        }
+    }
+
+    /// Navigate to the page called `title`, creating it if needed.
+    fn open_page(&mut self, title: &str, cx: &mut Context<Self>) {
+        // Leave edit mode first so the block being edited is saved (which may
+        // itself create pages and reorder the sidebar).
+        self.stop_edit(cx);
+        let ix = match self.find_page(title) {
+            Some(ix) => ix,
+            None => {
+                let page = Page::with_empty_block(title);
+                if let Err(err) = self.storage.save(&page) {
+                    eprintln!("notesec: failed to create page {title}: {err}");
+                }
+                self.add_page(page);
+                self.find_page(title).unwrap_or(0)
+            }
+        };
+        self.selected = ix;
+        cx.notify();
     }
 
     /// Copy the editor's text into the block being edited. Returns true if the
@@ -590,8 +653,19 @@ impl Element for BlockText {
 // Rendering
 // ---------------------------------------------------------------------------
 impl Render for NoteSec {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        // Style for `[[wikilinks]]` in display mode: accent colour + underline.
+        let text_style = window.text_style();
+        let link_style = HighlightStyle {
+            color: Some(theme.accent.into()),
+            underline: Some(UnderlineStyle {
+                color: Some(theme.accent.into()),
+                thickness: px(1.0),
+                wavy: false,
+            }),
+            ..Default::default()
+        };
 
         // --- Sidebar: one clickable row per page ---------------------------
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
@@ -644,22 +718,42 @@ impl Render for NoteSec {
             .map(|(ix, block)| {
                 let is_editing = self.editing == Some(ix);
                 let depth = page.depth_of(ix);
+                let links = parse_wikilinks(&block.content);
+                // Layout of this row's text, kept so a click can be mapped to
+                // the character (and so the link) under the mouse.
+                let mut text_layout = None;
                 let content: AnyElement = if is_editing {
                     BlockText { app: cx.entity() }.into_any_element()
-                } else {
+                } else if links.is_empty() {
                     div().child(block.content.clone()).into_any_element()
+                } else {
+                    let highlights = links.iter().map(|l| (l.range.clone(), link_style));
+                    let text = StyledText::new(block.content.clone())
+                        .with_default_highlights(&text_style, highlights);
+                    text_layout = Some(text.layout().clone());
+                    div().child(text).into_any_element()
                 };
+                // One click handler per row: follow the link under the mouse,
+                // or else start editing the block. Deciding in one place avoids
+                // the link click also triggering edit mode.
+                let on_click = cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    let link = text_layout.as_ref().and_then(|layout| {
+                        // `Ok` only when the mouse is over an actual glyph.
+                        let char_ix = layout.index_for_position(event.position()).ok()?;
+                        links.iter().find(|l| l.range.contains(&char_ix))
+                    });
+                    match link {
+                        Some(link) => this.open_page(&link.target, cx),
+                        None => this.start_edit(ix, window, cx),
+                    }
+                });
                 block_row(&theme, depth, content)
                     .id(("block", ix))
                     // Lets tests find this row's on-screen bounds; a no-op in
                     // normal builds.
                     .debug_selector(|| format!("block-{ix}"))
                     .cursor_text()
-                    .when(!is_editing, |d| {
-                        d.on_click(cx.listener(move |this, _e, window, cx| {
-                            this.start_edit(ix, window, cx);
-                        }))
-                    })
+                    .when(!is_editing, |d| d.on_click(on_click))
                     .into_any_element()
             })
             .collect();
@@ -829,6 +923,75 @@ mod tests {
             assert_eq!(app.editor.text, " world");
         });
         assert_eq!(file(&dir), "- hello\n-  world\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn page_file(dir: &std::path::Path, title: &str) -> PathBuf {
+        dir.join("pages").join(format!("{title}.md"))
+    }
+
+    #[gpui::test]
+    fn clicking_a_link_navigates_and_creates_the_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "linknav", "- [[Foo]] tail\n");
+        let row = cx.debug_bounds("block-0").expect("row rendered");
+
+        // The row is: bullet (6px) + gap (8px) + text, so x + 24 is on `[[Foo]]`.
+        cx.simulate_click(
+            point(row.left() + px(24.), row.center().y),
+            Modifiers::none(),
+        );
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, None, "link click must not start editing");
+            assert_eq!(app.pages[app.selected].title, "Foo");
+        });
+        assert!(page_file(&dir, "Foo").exists(), "Foo.md should be created");
+        // The page we came from is unchanged.
+        assert_eq!(file(&dir), "- [[Foo]] tail\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn clicking_outside_the_link_still_edits(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "linkedit", "- [[Foo]] tail\n");
+        let row = cx.debug_bounds("block-0").expect("row rendered");
+        // Far right of the row: past the end of the text.
+        cx.simulate_click(
+            point(row.right() - px(10.), row.center().y),
+            Modifiers::none(),
+        );
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.pages[app.selected].title, "Test");
+        });
+        assert!(!page_file(&dir, "Foo").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn typed_links_create_pages_only_on_commit(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "linktype", "- hi\n");
+        click_block(cx, 0);
+
+        // Half-typed link: nothing should be created.
+        cx.simulate_input(" [[Ba");
+        view.update(cx, |app, _| assert!(app.find_page("Ba").is_none()));
+        assert!(!page_file(&dir, "Ba").exists());
+
+        // Finish it, and add a differently-cased link to the existing page.
+        cx.simulate_input("r]] [[test]]");
+        let page_count = view.update(cx, |app, _| app.pages.len());
+        assert!(!page_file(&dir, "Bar").exists(), "not created until commit");
+
+        cx.simulate_keystrokes("escape");
+        assert!(page_file(&dir, "Bar").exists(), "created on commit");
+        assert_eq!(file(&dir), "- hi [[Bar]] [[test]]\n");
+        view.update(cx, |app, _| {
+            // Bar was added; `[[test]]` matched `Test` case-insensitively.
+            assert_eq!(app.pages.len(), page_count + 1);
+            assert!(app.find_page("Bar").is_some());
+            // Sorting moved pages around but we are still looking at Test.
+            assert_eq!(app.pages[app.selected].title, "Test");
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 
