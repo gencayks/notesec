@@ -39,6 +39,7 @@ actions!(
         Escape,
         Paste,
         ToggleSearch,
+        NewPage,
         ToggleTheme,
         ToggleGraph,
         IncreaseFont,
@@ -69,6 +70,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-v", Paste, ctx),
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
+        KeyBinding::new("ctrl-n", NewPage, None),
         KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
         KeyBinding::new("ctrl-g", ToggleGraph, None),
         // `=` and `+` share a key on US layouts; bind both so Ctrl-+ works with
@@ -315,6 +317,29 @@ impl NoteSec {
         cx.notify();
     }
 
+    fn new_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+        let title = (0..)
+            .map(|n| {
+                if n == 0 {
+                    "Untitled".to_string()
+                } else {
+                    format!("Untitled {n}")
+                }
+            })
+            .find(|title| self.find_page(title).is_none())
+            .expect("page title search must find a free name");
+        let page = Page::with_empty_block(&title);
+        if let Err(err) = self.storage.save(&page) {
+            eprintln!("notesec: failed to create page {title}: {err}");
+        }
+        self.pages.push(page);
+        sort_pages(&mut self.pages);
+        self.selected = self.find_page(&title).unwrap_or(0);
+        self.mode = Mode::Notes;
+        self.start_edit(0, window, cx);
+    }
+
     fn move_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.search_results().len();
         if let Some(s) = &mut self.search {
@@ -356,6 +381,10 @@ impl NoteSec {
 
     fn on_toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_theme(cx);
+    }
+
+    fn on_new_page(&mut self, _: &NewPage, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_page(window, cx);
     }
 
     fn on_increase_font(&mut self, _: &IncreaseFont, _: &mut Window, cx: &mut Context<Self>) {
@@ -1072,6 +1101,31 @@ impl Render for NoteSec {
             .on_click(cx.listener(|this, _e, _window, cx| this.toggle_graph(cx)))
             .child("Graph view");
 
+        let pages_header = div()
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .text_color(theme.muted)
+            .child("PAGES")
+            .child(
+                div()
+                    .id("new-page")
+                    .debug_selector(|| "new-page".to_string())
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(theme.accent)
+                    .hover(|d| d.bg(theme.selected_bg))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.new_page(window, cx);
+                    }))
+                    .child("+ New page"),
+            );
+
         let sidebar = div()
             .id("sidebar")
             .w(px(240.0))
@@ -1086,7 +1140,7 @@ impl Render for NoteSec {
             .border_color(theme.border)
             .overflow_y_scroll()
             .child(graph_item)
-            .child(div().px_3().py_2().text_color(theme.muted).child("PAGES"))
+            .child(pages_header)
             .children(sidebar_items)
             .when(has_tags, |d| {
                 d.child(
@@ -1378,6 +1432,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(Self::on_new_page))
             .on_action(cx.listener(Self::on_toggle_theme))
             .on_action(cx.listener(Self::on_toggle_graph))
             .on_action(cx.listener(Self::on_increase_font))
@@ -1446,6 +1501,55 @@ mod tests {
 
     fn file(dir: &std::path::Path) -> String {
         std::fs::read_to_string(dir.join("pages/Test.md")).unwrap()
+    }
+
+    #[gpui::test]
+    fn ctrl_n_creates_and_focuses_the_first_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "new-page-shortcut",
+            &[
+                ("Test", "- existing\n"),
+                ("Untitled", "- used\n"),
+                ("Untitled 1", "- used\n"),
+            ],
+            "Test",
+        );
+
+        cx.simulate_keystrokes("ctrl-n");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Untitled 2");
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.editor.text, "");
+            assert!(app.pages.iter().any(|page| page.title == "Untitled 2"));
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Untitled 2.md")).unwrap(),
+            "- \n"
+        );
+        assert!(cx.debug_bounds("new-page").is_some());
+    }
+
+    #[gpui::test]
+    fn new_page_button_creates_the_first_free_name_and_shows_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) =
+            setup_pages(cx, "new-page-button", &[("Test", "- existing\n")], "Test");
+        let button = cx
+            .debug_bounds("new-page")
+            .expect("new page button rendered");
+
+        cx.simulate_click(button.center(), Modifiers::none());
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Untitled");
+            assert_eq!(app.editing, Some(0));
+            assert!(app.pages.iter().any(|page| page.title == "Untitled"));
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Untitled.md")).unwrap(),
+            "- \n"
+        );
     }
 
     #[gpui::test]
