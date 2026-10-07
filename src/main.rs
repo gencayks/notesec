@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod editor;
 mod model;
 mod search;
@@ -17,6 +18,8 @@ fn main() {
         std::process::exit(1);
     });
 
+    let config = config::Config::load(storage.root());
+
     application().run(move |cx: &mut App| {
         app::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1100.), px(700.)), cx);
@@ -26,7 +29,7 @@ fn main() {
                 ..Default::default()
             },
             // The closure builds the root view entity.
-            |window, cx| cx.new(|cx| NoteSec::new(storage, window, cx)),
+            |window, cx| cx.new(|cx| NoteSec::new(storage, config, window, cx)),
         )
         .unwrap();
         cx.activate(true);

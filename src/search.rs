@@ -96,19 +96,56 @@ fn subsequence_only(q: &[char], t: &[char]) -> Option<i32> {
     (qi == q.len()).then_some(0)
 }
 
+/// An action the palette can run, listed alongside pages and blocks when the
+/// query matches its label (try typing "theme" or "font").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    ToggleTheme,
+    IncreaseFontSize,
+    DecreaseFontSize,
+    ResetFontSize,
+}
+
+impl Command {
+    pub const ALL: [Command; 4] = [
+        Command::ToggleTheme,
+        Command::IncreaseFontSize,
+        Command::DecreaseFontSize,
+        Command::ResetFontSize,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Command::ToggleTheme => "Toggle dark/light theme",
+            Command::IncreaseFontSize => "Increase font size",
+            Command::DecreaseFontSize => "Decrease font size",
+            Command::ResetFontSize => "Reset font size",
+        }
+    }
+}
+
+/// What a search result points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// A page, by index into the `pages` slice.
+    Page(usize),
+    /// A block: (page index, block index within that page).
+    Block(usize, usize),
+    Command(Command),
+}
+
 /// One search result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
-    /// Index into the `pages` slice.
-    pub page: usize,
-    /// `None` for a page-title hit, `Some(i)` for the page's i-th block.
-    pub block: Option<usize>,
+    pub target: Target,
     pub score: i32,
 }
 
 /// Extra score for title matches so a page named `Foo` beats a block that
 /// merely mentions foo.
 const TITLE_BONUS: i32 = 25;
+/// Commands rank just below title matches but above block text.
+const COMMAND_BONUS: i32 = 20;
 
 /// Search all pages. Returns at most `limit` hits, best first.
 ///
@@ -119,19 +156,25 @@ pub fn search(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
     if query.is_empty() {
         return (0..pages.len().min(limit))
             .map(|page| Hit {
-                page,
-                block: None,
+                target: Target::Page(page),
                 score: 0,
             })
             .collect();
     }
 
     let mut hits = Vec::new();
+    for command in Command::ALL {
+        if let Some(score) = fuzzy_score(query, command.label()) {
+            hits.push(Hit {
+                target: Target::Command(command),
+                score: score + COMMAND_BONUS,
+            });
+        }
+    }
     for (page_ix, page) in pages.iter().enumerate() {
         if let Some(score) = fuzzy_score(query, &page.title) {
             hits.push(Hit {
-                page: page_ix,
-                block: None,
+                target: Target::Page(page_ix),
                 score: score + TITLE_BONUS,
             });
         }
@@ -141,8 +184,7 @@ pub fn search(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
             }
             if let Some(score) = fuzzy_score(query, &block.content) {
                 hits.push(Hit {
-                    page: page_ix,
-                    block: Some(block_ix),
+                    target: Target::Block(page_ix, block_ix),
                     score,
                 });
             }
@@ -217,17 +259,33 @@ mod tests {
     #[test]
     fn title_hit_outranks_block_hit() {
         let hits = search(&pages(), "needle", 10);
-        assert_eq!(hits[0].page, 1);
-        assert_eq!(hits[0].block, None);
-        assert_eq!((hits[1].page, hits[1].block), (0, Some(1)));
+        assert_eq!(hits[0].target, Target::Page(1));
+        assert_eq!(hits[1].target, Target::Block(0, 1));
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn commands_match_by_label() {
+        let hits = search(&pages(), "theme", 10);
+        assert_eq!(hits[0].target, Target::Command(Command::ToggleTheme));
+        // Several commands share the word "font".
+        let font: Vec<Target> = search(&pages(), "font", 10)
+            .into_iter()
+            .map(|h| h.target)
+            .collect();
+        assert!(font.contains(&Target::Command(Command::IncreaseFontSize)));
+        assert!(font.contains(&Target::Command(Command::ResetFontSize)));
+        // An empty query lists only pages, never commands.
+        assert!(search(&pages(), "", 10)
+            .iter()
+            .all(|h| matches!(h.target, Target::Page(_))));
     }
 
     #[test]
     fn empty_query_lists_pages_and_limit_applies() {
         let hits = search(&pages(), "  ", 2);
         assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|h| h.block.is_none()));
+        assert!(hits.iter().all(|h| matches!(h.target, Target::Page(_))));
     }
 
     #[test]

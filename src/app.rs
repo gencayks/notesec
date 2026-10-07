@@ -5,9 +5,10 @@
 //! stops (Escape, click elsewhere, switching pages) the text is written back to
 //! the block and the page is saved to disk.
 
+use crate::config::Config;
 use crate::editor::EditorState;
 use crate::model::{backlinks, parse_references, tag_counts, Page};
-use crate::search::{search, Hit};
+use crate::search::{search, Command, Hit, Target};
 use crate::storage::{today_title, Storage};
 use crate::ui::{block_row, Theme};
 use gpui::{
@@ -37,6 +38,10 @@ actions!(
         Escape,
         Paste,
         ToggleSearch,
+        ToggleTheme,
+        IncreaseFont,
+        DecreaseFont,
+        ResetFont,
         Quit,
     ]
 );
@@ -62,6 +67,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-v", Paste, ctx),
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
+        KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
+        // `=` and `+` share a key on US layouts; bind both so Ctrl-+ works with
+        // or without Shift.
+        KeyBinding::new("ctrl-=", IncreaseFont, None),
+        KeyBinding::new("ctrl-+", IncreaseFont, None),
+        KeyBinding::new("ctrl--", DecreaseFont, None),
+        KeyBinding::new("ctrl-0", ResetFont, None),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -85,7 +97,14 @@ pub struct NoteSec {
     pages: Vec<Page>,
     /// Index into `pages` of the page shown in the main pane.
     selected: usize,
+    /// Persisted user settings (`config.toml`).
+    config: Config,
+    /// Colours for `config.theme`, kept in sync by `apply_theme`.
     theme: Theme,
+    /// The font family actually in use: `config.font_family` if that font is
+    /// installed, else `None` (the system UI font). Kept apart from the config
+    /// so an unknown name in the file is never overwritten by a save.
+    font_family: Option<SharedString>,
 
     /// Handle used to give this view keyboard focus while editing.
     focus_handle: FocusHandle,
@@ -105,7 +124,12 @@ impl NoteSec {
     /// Build the root view. The view takes keyboard focus straight away:
     /// GPUI only delivers key events (and so global shortcuts like Ctrl-K) to
     /// views on the focused path, and nothing is focused in a new window.
-    pub fn new(storage: Storage, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        storage: Storage,
+        config: Config,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut pages = storage.load_all();
 
         // Auto-create today's journal if it doesn't exist yet.
@@ -145,11 +169,24 @@ impl NoteSec {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
+        // Only use the configured font if it is actually installed; GPUI would
+        // otherwise fall back silently and the user would not know why.
+        let font_family = config.font_family.clone().and_then(|family| {
+            if cx.text_system().all_font_names().contains(&family) {
+                Some(SharedString::from(family))
+            } else {
+                eprintln!("notesec: font {family:?} is not installed; using the system font");
+                None
+            }
+        });
+
         NoteSec {
             storage,
             pages,
             selected,
-            theme: Theme::dark(),
+            theme: Theme::from_kind(config.theme),
+            config,
+            font_family,
             focus_handle,
             editing: None,
             editor: EditorState::default(),
@@ -174,6 +211,42 @@ impl NoteSec {
         match &mut self.search {
             Some(s) => &mut s.query,
             None => &mut self.editor,
+        }
+    }
+
+    // --- settings --------------------------------------------------------------
+
+    fn save_config(&self) {
+        if let Err(err) = self.config.save(self.storage.root()) {
+            eprintln!("notesec: failed to save config: {err}");
+        }
+    }
+
+    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        self.config.theme = self.config.theme.toggled();
+        self.theme = Theme::from_kind(self.config.theme);
+        self.save_config();
+        cx.notify();
+    }
+
+    fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.config.adjust_font_size(delta);
+        self.save_config();
+        cx.notify();
+    }
+
+    fn reset_font_size(&mut self, cx: &mut Context<Self>) {
+        self.config.font_size = crate::config::DEFAULT_FONT_SIZE;
+        self.save_config();
+        cx.notify();
+    }
+
+    fn run_command(&mut self, command: Command, cx: &mut Context<Self>) {
+        match command {
+            Command::ToggleTheme => self.toggle_theme(cx),
+            Command::IncreaseFontSize => self.change_font_size(1.0, cx),
+            Command::DecreaseFontSize => self.change_font_size(-1.0, cx),
+            Command::ResetFontSize => self.reset_font_size(cx),
         }
     }
 
@@ -235,16 +308,40 @@ impl NoteSec {
         }
     }
 
-    /// Go to a search result: its page, and for a block hit, into that block.
+    /// Act on a search result: open its page (and for a block hit, start
+    /// editing that block) or run the command.
     fn open_hit(&mut self, hit: &Hit, window: &mut Window, cx: &mut Context<Self>) {
-        let title = self.pages[hit.page].title.clone();
         self.close_search(cx);
-        self.open_page(&title, cx);
-        if let Some(block) = hit.block {
-            if block < self.pages[self.selected].blocks.len() {
-                self.start_edit(block, window, cx);
+        match hit.target {
+            Target::Page(page) => {
+                let title = self.pages[page].title.clone();
+                self.open_page(&title, cx);
             }
+            Target::Block(page, block) => {
+                let title = self.pages[page].title.clone();
+                self.open_page(&title, cx);
+                if block < self.pages[self.selected].blocks.len() {
+                    self.start_edit(block, window, cx);
+                }
+            }
+            Target::Command(command) => self.run_command(command, cx),
         }
+    }
+
+    fn on_toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_theme(cx);
+    }
+
+    fn on_increase_font(&mut self, _: &IncreaseFont, _: &mut Window, cx: &mut Context<Self>) {
+        self.change_font_size(1.0, cx);
+    }
+
+    fn on_decrease_font(&mut self, _: &DecreaseFont, _: &mut Window, cx: &mut Context<Self>) {
+        self.change_font_size(-1.0, cx);
+    }
+
+    fn on_reset_font(&mut self, _: &ResetFont, _: &mut Window, cx: &mut Context<Self>) {
+        self.reset_font_size(cx);
     }
 
     // --- persistence helpers -------------------------------------------------
@@ -807,6 +904,7 @@ impl Element for BlockText {
 impl Render for NoteSec {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let font_size = self.config.font_size;
         // Style for `[[wikilinks]]` in display mode: accent colour + underline.
         let text_style = window.text_style();
         let link_style = HighlightStyle {
@@ -950,7 +1048,7 @@ impl Render for NoteSec {
                         None => this.start_edit(ix, window, cx),
                     }
                 });
-                block_row(&theme, depth, content)
+                block_row(&theme, depth, font_size, content)
                     .id(("block", ix))
                     // Lets tests find this row's on-screen bounds; a no-op in
                     // normal builds.
@@ -1032,7 +1130,7 @@ impl Render for NoteSec {
             .child(
                 div()
                     .mb_4()
-                    .text_3xl()
+                    .text_size(px(font_size * 1.9))
                     .text_color(theme.text)
                     .child(page.title.clone()),
             )
@@ -1051,48 +1149,54 @@ impl Render for NoteSec {
         let overlay = self.search.as_ref().map(|state| {
             let hits = self.search_results();
             let selected = state.selected;
-            let rows: Vec<AnyElement> = hits
-                .into_iter()
-                .enumerate()
-                .map(|(i, hit)| {
-                    let page = &self.pages[hit.page];
-                    // Page hit: just the title. Block hit: the text, then the
-                    // page it lives on in a muted colour.
-                    let label = match hit.block {
-                        None => div().text_color(theme.accent).child(page.title.clone()),
-                        Some(b) => div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(
+            let rows: Vec<AnyElement> =
+                hits.into_iter()
+                    .enumerate()
+                    .map(|(i, hit)| {
+                        // Page hit: just the title. Block hit: the text, then the
+                        // page it lives on. Command: its label and a muted tag.
+                        // (Muted text is the secondary column in each case.)
+                        let row =
+                            |main: gpui::Div, side: String| {
+                                div().flex().flex_row().gap_2().child(main).child(
+                                    div().flex_shrink_0().text_color(theme.muted).child(side),
+                                )
+                            };
+                        let label = match hit.target {
+                            Target::Page(p) => row(
+                                div()
+                                    .text_color(theme.accent)
+                                    .child(self.pages[p].title.clone()),
+                                String::new(),
+                            ),
+                            Target::Block(p, b) => row(
                                 div()
                                     .truncate()
                                     .text_color(theme.text)
-                                    .child(page.blocks[b].content.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_color(theme.muted)
-                                    .child(page.title.clone()),
+                                    .child(self.pages[p].blocks[b].content.clone()),
+                                self.pages[p].title.clone(),
                             ),
-                    };
-                    div()
-                        .id(("search-result", i))
-                        .debug_selector(|| format!("search-result-{i}"))
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(i == selected, |d| d.bg(theme.selected_bg))
-                        .hover(|d| d.bg(theme.selected_bg))
-                        .on_click(cx.listener(move |this, _e, window, cx| {
-                            this.open_hit(&hit, window, cx);
-                        }))
-                        .child(label)
-                        .into_any_element()
-                })
-                .collect();
+                            Target::Command(c) => row(
+                                div().text_color(theme.text).child(c.label()),
+                                "command".into(),
+                            ),
+                        };
+                        div()
+                            .id(("search-result", i))
+                            .debug_selector(|| format!("search-result-{i}"))
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(i == selected, |d| d.bg(theme.selected_bg))
+                            .hover(|d| d.bg(theme.selected_bg))
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.open_hit(&hit, window, cx);
+                            }))
+                            .child(label)
+                            .into_any_element()
+                    })
+                    .collect();
             let no_results = rows.is_empty();
 
             // Backdrop: dims the app, swallows mouse events, closes on click.
@@ -1154,6 +1258,9 @@ impl Render for NoteSec {
             .flex_row()
             .bg(theme.bg)
             .text_color(theme.text)
+            // Font settings are set on the root so every descendant inherits them.
+            .text_size(px(font_size))
+            .when_some(self.font_family.clone(), |d, family| d.font_family(family))
             .track_focus(&self.focus_handle)
             // The key context only exists while editing, which is what makes
             // the "BlockEditor" key bindings conditional.
@@ -1172,6 +1279,10 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(Self::on_toggle_theme))
+            .on_action(cx.listener(Self::on_increase_font))
+            .on_action(cx.listener(Self::on_decrease_font))
+            .on_action(cx.listener(Self::on_reset_font))
             .child(sidebar)
             .child(main)
             .children(overlay)
@@ -1181,6 +1292,7 @@ impl Render for NoteSec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThemeKind;
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use std::path::PathBuf;
 
@@ -1210,7 +1322,8 @@ mod tests {
         }
 
         cx.update(bind_keys);
-        let (view, cx) = cx.add_window_view(|window, cx| NoteSec::new(storage, window, cx));
+        let (view, cx) =
+            cx.add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
         view.update(cx, |app, cx| {
             app.selected = app.pages.iter().position(|p| p.title == selected).unwrap();
             cx.notify();
@@ -1500,6 +1613,136 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.pages[app.selected].title, "Test");
             assert_eq!(tag_counts(&app.pages).len(), 2);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn saved_config(dir: &std::path::Path) -> Config {
+        Config::load(dir)
+    }
+
+    #[gpui::test]
+    fn theme_shortcut_toggles_and_persists(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "theme-key", "- hi\n");
+        let dark = view.update(cx, |app, _| app.theme.bg);
+        assert_eq!(view.update(cx, |app, _| app.config.theme), ThemeKind::Dark);
+
+        cx.simulate_keystrokes("ctrl-shift-t");
+        view.update(cx, |app, _| {
+            assert_eq!(app.config.theme, ThemeKind::Light);
+            assert_ne!(app.theme.bg, dark, "colours actually changed");
+        });
+        assert_eq!(
+            saved_config(&dir).theme,
+            ThemeKind::Light,
+            "written to config.toml"
+        );
+
+        cx.simulate_keystrokes("ctrl-shift-t");
+        view.update(cx, |app, _| assert_eq!(app.theme.bg, dark));
+        assert_eq!(saved_config(&dir).theme, ThemeKind::Dark);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn font_size_shortcuts_change_layout_and_persist(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "font-keys", "- hi\n");
+        let row_height =
+            |cx: &mut VisualTestContext| cx.debug_bounds("block-0").unwrap().size.height;
+        let base = row_height(cx);
+
+        cx.simulate_keystrokes("ctrl-= ctrl-= ctrl-=");
+        view.update(cx, |app, _| assert_eq!(app.config.font_size, 19.0));
+        assert_eq!(saved_config(&dir).font_size, 19.0);
+        assert!(row_height(cx) > base, "bigger font gives taller rows");
+
+        cx.simulate_keystrokes("ctrl--");
+        view.update(cx, |app, _| assert_eq!(app.config.font_size, 18.0));
+
+        cx.simulate_keystrokes("ctrl-0");
+        view.update(cx, |app, _| assert_eq!(app.config.font_size, 16.0));
+        assert_eq!(row_height(cx), base, "reset restores the original layout");
+
+        // Limits: it cannot shrink or grow without bound.
+        for _ in 0..40 {
+            cx.simulate_keystrokes("ctrl--");
+        }
+        view.update(cx, |app, _| {
+            assert_eq!(app.config.font_size, crate::config::MIN_FONT_SIZE)
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn palette_commands_run(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "palette-cmd", "- hi\n");
+
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("toggle theme");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.search_results()[0].target,
+                Target::Command(Command::ToggleTheme),
+                "the command is the top result"
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert!(
+                app.search.is_none(),
+                "palette closes after running a command"
+            );
+            assert_eq!(app.config.theme, ThemeKind::Light);
+        });
+        assert_eq!(saved_config(&dir).theme, ThemeKind::Light);
+
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("increase font");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.config.font_size, 17.0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn unknown_font_is_ignored_but_not_erased(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("notesec-test-badfont-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        let config = Config {
+            font_family: Some("Definitely Not A Font 12345".into()),
+            ..Config::default()
+        };
+
+        cx.update(bind_keys);
+        let (view, cx) = cx.add_window_view(|window, cx| NoteSec::new(storage, config, window, cx));
+        view.update(cx, |app, _| {
+            assert_eq!(app.font_family, None, "falls back to the system font");
+            assert!(
+                app.config.font_family.is_some(),
+                "the setting itself is kept"
+            );
+        });
+        // Changing another setting rewrites the file; the user's font name stays.
+        cx.simulate_keystrokes("ctrl-shift-t");
+        assert_eq!(
+            saved_config(&dir).font_family.as_deref(),
+            Some("Definitely Not A Font 12345")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn settings_loaded_from_config_are_applied(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("notesec-test-loadcfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        std::fs::write(Config::path(&dir), "theme = \"light\"\nfont_size = 22.0\n").unwrap();
+        let config = Config::load(&dir);
+
+        let (view, cx) = cx.add_window_view(|window, cx| NoteSec::new(storage, config, window, cx));
+        view.update(cx, |app, _| {
+            assert_eq!(app.theme.bg, Theme::light().bg);
+            assert_eq!(app.config.font_size, 22.0);
         });
         let _ = std::fs::remove_dir_all(dir);
     }

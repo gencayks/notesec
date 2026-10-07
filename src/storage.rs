@@ -11,8 +11,29 @@
 
 use crate::model::Page;
 use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+/// Write `contents` to `path` atomically: write a temporary file next to it,
+/// flush it to disk, then rename it over the target. A crash or kill at any
+/// point leaves either the complete old file or the complete new one, never a
+/// truncated mix. (Rename is atomic when both paths are on the same
+/// filesystem, which is why the temp file lives in the same directory.)
+pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    // Hidden, and not `.md`, so page loading never mistakes it for a page.
+    let tmp = path.with_file_name(format!(".{}.tmp", name.to_string_lossy()));
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, path).inspect_err(|_| {
+        // Don't leave the temp file behind if the rename failed.
+        let _ = fs::remove_file(&tmp);
+    })
+}
 
 pub struct Storage {
     root: PathBuf,
@@ -66,7 +87,12 @@ impl Storage {
 
     /// Write a page to its file (creating it if needed).
     pub fn save(&self, page: &Page) -> io::Result<()> {
-        fs::write(self.path_for(page), page.to_markdown())
+        write_atomic(&self.path_for(page), &page.to_markdown())
+    }
+
+    /// The graph directory.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn path_for(&self, page: &Page) -> PathBuf {
