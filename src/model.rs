@@ -56,6 +56,48 @@ pub fn parse_wikilinks(text: &str) -> Vec<WikiLink> {
     links
 }
 
+/// All blocks on one page that link to the page being viewed.
+#[derive(Debug, PartialEq)]
+pub struct BacklinkGroup {
+    /// Index into the `pages` slice of the page the links come from.
+    pub page: usize,
+    /// Indices (into that page's `blocks`) of the blocks containing a link.
+    pub blocks: Vec<usize>,
+}
+
+/// Find every block, on any *other* page, that contains `[[title]]`.
+///
+/// Title matching ignores case, like page lookup does. Groups come back in the
+/// order of `pages`, and blocks in document order. A page's links to itself
+/// are not backlinks and are skipped.
+pub fn backlinks(pages: &[Page], title: &str) -> Vec<BacklinkGroup> {
+    let wanted = title.to_lowercase();
+    let mut groups = Vec::new();
+    for (page_ix, page) in pages.iter().enumerate() {
+        if page.title.to_lowercase() == wanted {
+            continue;
+        }
+        let blocks: Vec<usize> = page
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                parse_wikilinks(&b.content)
+                    .iter()
+                    .any(|l| l.target.to_lowercase() == wanted)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !blocks.is_empty() {
+            groups.push(BacklinkGroup {
+                page: page_ix,
+                blocks,
+            });
+        }
+    }
+    groups
+}
+
 /// True for titles shaped like `YYYY-MM-DD` (daily journal pages).
 pub fn is_journal_title(title: &str) -> bool {
     chrono::NaiveDate::parse_from_str(title, "%Y-%m-%d").is_ok()
@@ -376,6 +418,30 @@ mod tests {
         assert_eq!(targets("[[a [[b]]"), vec!["b"]);
         // Multi-byte text around and inside links is fine.
         assert_eq!(targets("é [[ü]] 😀"), vec!["ü"]);
+    }
+
+    #[test]
+    fn backlinks_skip_self_and_ignore_case() {
+        let pages = vec![
+            Page::from_markdown("A", false, "- one [[Target]]\n- none\n- two [[target]]\n"),
+            Page::from_markdown("Target", false, "- self [[Target]]\n"),
+            Page::from_markdown("B", false, "- nothing\n"),
+            Page::from_markdown("C", false, "- [[Other]]\n  - deep [[ TARGET ]]\n"),
+        ];
+        assert_eq!(
+            backlinks(&pages, "Target"),
+            vec![
+                BacklinkGroup {
+                    page: 0,
+                    blocks: vec![0, 2]
+                },
+                BacklinkGroup {
+                    page: 3,
+                    blocks: vec![1]
+                },
+            ]
+        );
+        assert!(backlinks(&pages, "Nobody").is_empty());
     }
 
     #[test]

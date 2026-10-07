@@ -6,7 +6,7 @@
 //! the block and the page is saved to disk.
 
 use crate::editor::EditorState;
-use crate::model::{parse_wikilinks, Page};
+use crate::model::{backlinks, parse_wikilinks, Page};
 use crate::storage::{today_title, Storage};
 use crate::ui::{block_row, Theme};
 use gpui::{
@@ -758,6 +758,66 @@ impl Render for NoteSec {
             })
             .collect();
 
+        // --- Backlinks: blocks on other pages that link here ----------------
+        // Recomputed every frame. That is a scan of every block, which is fine
+        // for a personal graph; an index can replace it if it ever shows up in
+        // a profile.
+        let groups = backlinks(&self.pages, &page.title);
+        let total: usize = groups.iter().map(|g| g.blocks.len()).sum();
+        let mut backlink_items: Vec<AnyElement> = Vec::new();
+        let mut n: usize = 0; // running index over all references, for ids
+        for group in &groups {
+            let source = &self.pages[group.page];
+            let source_title = source.title.clone();
+            backlink_items.push(
+                div()
+                    .id(("backlink-page", group.page))
+                    .mt_2()
+                    .text_color(theme.accent)
+                    .cursor_pointer()
+                    .on_click(cx.listener({
+                        let title = source_title.clone();
+                        move |this, _e, _window, cx| this.open_page(&title, cx)
+                    }))
+                    .child(source_title.clone())
+                    .into_any_element(),
+            );
+            for &block_ix in &group.blocks {
+                let title = source_title.clone();
+                backlink_items.push(
+                    div()
+                        .id(("backlink", n))
+                        .debug_selector(|| format!("backlink-{n}"))
+                        .pl_4()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_color(theme.text)
+                        .hover(|d| d.bg(theme.selected_bg))
+                        .on_click(
+                            cx.listener(move |this, _e, _window, cx| this.open_page(&title, cx)),
+                        )
+                        .child(source.blocks[block_ix].content.clone())
+                        .into_any_element(),
+                );
+                n += 1;
+            }
+        }
+        let backlinks_panel = (total > 0).then(|| {
+            div()
+                .id("backlinks")
+                .mt_8()
+                .pt_4()
+                .border_t_1()
+                .border_color(theme.border)
+                .flex()
+                .flex_col()
+                .child(div().text_color(theme.muted).child(format!(
+                    "{total} LINKED REFERENCE{}",
+                    if total == 1 { "" } else { "S" }
+                )))
+                .children(backlink_items)
+        });
+
         let main = div()
             .id("main")
             .flex_1()
@@ -774,6 +834,7 @@ impl Render for NoteSec {
                     .child(page.title.clone()),
             )
             .children(rows)
+            .children(backlinks_panel)
             // Empty space below the blocks: clicking it leaves edit mode.
             .child(
                 div()
@@ -825,15 +886,28 @@ mod tests {
         name: &str,
         markdown: &str,
     ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        setup_pages(cx, name, &[("Test", markdown)], "Test")
+    }
+
+    /// Like `setup`, but seeds several `(title, markdown)` pages and selects
+    /// the one called `selected`.
+    fn setup_pages<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        pages: &[(&str, &str)],
+        selected: &str,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
         let dir = std::env::temp_dir().join(format!("notesec-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = Storage::open(dir.clone()).unwrap();
-        std::fs::write(dir.join("pages/Test.md"), markdown).unwrap();
+        for (title, markdown) in pages {
+            std::fs::write(dir.join(format!("pages/{title}.md")), markdown).unwrap();
+        }
 
         cx.update(bind_keys);
         let (view, cx) = cx.add_window_view(|_, cx| NoteSec::new(storage, cx));
         view.update(cx, |app, cx| {
-            app.selected = app.pages.iter().position(|p| p.title == "Test").unwrap();
+            app.selected = app.pages.iter().position(|p| p.title == selected).unwrap();
             cx.notify();
         });
         cx.run_until_parked();
@@ -992,6 +1066,66 @@ mod tests {
             // Sorting moved pages around but we are still looking at Test.
             assert_eq!(app.pages[app.selected].title, "Test");
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn backlinks_panel_lists_and_navigates(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "backlinks",
+            &[
+                ("Test", "- hi [[Test]]\n"), // self-link: must not count
+                ("Alpha", "- see [[Test]]\n- unrelated\n"),
+                ("Beta", "- x [[test]] y\n  - nested [[Other]]\n"),
+            ],
+            "Test",
+        );
+
+        // Two references (Alpha's first block, Beta's first block), in order.
+        assert!(cx.debug_bounds("backlink-0").is_some());
+        assert!(cx.debug_bounds("backlink-1").is_some());
+        assert!(cx.debug_bounds("backlink-2").is_none());
+
+        // Clicking the first reference opens its source page, Alpha.
+        let r = cx.debug_bounds("backlink-0").unwrap();
+        cx.simulate_click(r.center(), Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Alpha")
+        });
+
+        // Nothing links to Alpha, so its panel is gone.
+        assert!(cx.debug_bounds("backlink-0").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn backlinks_update_after_editing(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "backlinks-live",
+            &[("Test", "- one\n"), ("Alpha", "- plain\n")],
+            "Alpha",
+        );
+        assert!(cx.debug_bounds("backlink-0").is_none());
+
+        // Add a link to Alpha from the Test page and commit it.
+        view.update(cx, |app, cx| {
+            app.selected = app.pages.iter().position(|p| p.title == "Test").unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        click_block(cx, 0);
+        cx.simulate_input(" [[Alpha]]");
+        cx.simulate_keystrokes("escape");
+
+        // Back on Alpha, the new reference shows up.
+        view.update(cx, |app, cx| {
+            app.selected = app.pages.iter().position(|p| p.title == "Alpha").unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("backlink-0").is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 
