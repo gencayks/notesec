@@ -40,6 +40,8 @@ actions!(
         Paste,
         ToggleSearch,
         NewPage,
+        Undo,
+        Redo,
         ToggleTheme,
         ToggleGraph,
         IncreaseFont,
@@ -71,6 +73,9 @@ pub fn bind_keys(cx: &mut App) {
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-n", NewPage, None),
+        KeyBinding::new("ctrl-z", Undo, None),
+        KeyBinding::new("ctrl-shift-z", Redo, None),
+        KeyBinding::new("ctrl-y", Redo, None),
         KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
         KeyBinding::new("ctrl-g", ToggleGraph, None),
         // `=` and `+` share a key on US layouts; bind both so Ctrl-+ works with
@@ -105,6 +110,16 @@ struct SearchState {
     selected: usize,
 }
 
+const MAX_HISTORY: usize = 100;
+
+#[derive(Clone)]
+struct HistoryState {
+    pages: Vec<Page>,
+    selected: usize,
+    editing: Option<usize>,
+    editor: EditorState,
+}
+
 pub struct NoteSec {
     storage: Storage,
     /// All pages, kept sorted for the sidebar (journals first, newest first).
@@ -128,6 +143,9 @@ pub struct NoteSec {
     editor: EditorState,
     /// `Some` while the Ctrl-K search overlay is open.
     search: Option<SearchState>,
+    undo_stack: Vec<HistoryState>,
+    redo_stack: Vec<HistoryState>,
+    text_history_active: bool,
     mode: Mode,
     /// The graph view, created the first time it is opened and then kept so it
     /// remembers node positions between visits.
@@ -212,6 +230,9 @@ impl NoteSec {
             editing: None,
             editor: EditorState::default(),
             search: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            text_history_active: false,
             mode: Mode::Notes,
             graph: None,
             _graph_subscription: None,
@@ -317,6 +338,78 @@ impl NoteSec {
         cx.notify();
     }
 
+    fn history_state(&self) -> HistoryState {
+        HistoryState {
+            pages: self.pages.clone(),
+            selected: self.selected,
+            editing: self.editing,
+            editor: self.editor.clone(),
+        }
+    }
+
+    fn record_state(&mut self, state: HistoryState) {
+        self.undo_stack.push(state);
+        if self.undo_stack.len() > MAX_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    fn record_edit(&mut self) {
+        self.record_state(self.history_state());
+    }
+
+    fn save_all_pages(&self) {
+        for page in &self.pages {
+            if let Err(err) = self.storage.save(page) {
+                eprintln!("notesec: failed to save {}: {err}", page.title);
+            }
+        }
+    }
+
+    fn restore_history(
+        &mut self,
+        state: HistoryState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pages = state.pages;
+        self.selected = state.selected.min(self.pages.len().saturating_sub(1));
+        self.editing = state.editing.filter(|&ix| {
+            self.selected < self.pages.len() && ix < self.pages[self.selected].blocks.len()
+        });
+        self.editor = state.editor;
+        self.text_history_active = false;
+        if let Some(ix) = self.editing {
+            self.editor.cursor = self.editor.cursor.min(self.editor.text.len());
+            self.editor.marked = None;
+            self.pages[self.selected].blocks[ix].content = self.editor.text.clone();
+        }
+        self.save_all_pages();
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            return;
+        }
+        if let Some(state) = self.undo_stack.pop() {
+            self.redo_stack.push(self.history_state());
+            self.restore_history(state, window, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            return;
+        }
+        if let Some(state) = self.redo_stack.pop() {
+            self.undo_stack.push(self.history_state());
+            self.restore_history(state, window, cx);
+        }
+    }
+
     fn new_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_edit(cx);
         let title = (0..)
@@ -385,6 +478,14 @@ impl NoteSec {
 
     fn on_new_page(&mut self, _: &NewPage, window: &mut Window, cx: &mut Context<Self>) {
         self.new_page(window, cx);
+    }
+
+    fn on_undo(&mut self, action: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        self.undo(action, window, cx);
+    }
+
+    fn on_redo(&mut self, action: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        self.redo(action, window, cx);
     }
 
     fn on_increase_font(&mut self, _: &IncreaseFont, _: &mut Window, cx: &mut Context<Self>) {
@@ -556,6 +657,7 @@ impl NoteSec {
 
     fn start_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.commit();
+        self.text_history_active = false;
         self.load_editor(ix, false);
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -563,6 +665,7 @@ impl NoteSec {
 
     fn stop_edit(&mut self, cx: &mut Context<Self>) {
         self.commit();
+        self.text_history_active = false;
         self.editing = None;
         self.last_layout = None;
         self.last_bounds = None;
@@ -573,6 +676,7 @@ impl NoteSec {
     /// navigation between blocks).
     fn move_edit(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.commit();
+        self.text_history_active = false;
         self.load_editor(ix, false);
         cx.notify();
     }
@@ -586,6 +690,8 @@ impl NoteSec {
             return;
         }
         let Some(ix) = self.editing else { return };
+        self.text_history_active = false;
+        self.record_edit();
         let rest = self.editor.split_off_at_cursor();
         self.sync_content();
         let new_ix = self.pages[self.selected].insert_after(ix, rest);
@@ -606,8 +712,11 @@ impl NoteSec {
     /// save. The block keeps its index (document order never changes).
     fn restructure(&mut self, cx: &mut Context<Self>, op: impl FnOnce(&mut Page, usize) -> bool) {
         let Some(ix) = self.editing else { return };
+        self.text_history_active = false;
+        let before = self.history_state();
         self.sync_content();
         if op(&mut self.pages[self.selected], ix) {
+            self.record_state(before);
             self.save_page();
         }
         cx.notify();
@@ -622,14 +731,21 @@ impl NoteSec {
         }
         let Some(ix) = self.editing else { return };
         if !self.editor.text.is_empty() {
-            self.editor.backspace();
+            self.text_history_active = false;
+            let before = self.history_state();
+            if self.editor.backspace() {
+                self.record_state(before);
+            }
             cx.notify();
             return;
         }
         // Empty block: delete it (never the last remaining block, and never a
         // block that still has children).
+        self.text_history_active = false;
+        let before = self.history_state();
         let page = &mut self.pages[self.selected];
         if page.blocks.len() > 1 && page.delete_leaf(ix) {
+            self.record_state(before);
             self.save_page();
             // Move to the block above (or the new first block if we deleted #0).
             self.load_editor(ix.saturating_sub(1), false);
@@ -639,7 +755,11 @@ impl NoteSec {
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
         if self.editing.is_some() || self.search.is_some() {
-            self.active_editor_mut().delete();
+            self.text_history_active = false;
+            let before = self.history_state();
+            if self.active_editor_mut().delete() && self.search.is_none() {
+                self.record_state(before);
+            }
             self.text_changed();
             cx.notify();
         }
@@ -697,6 +817,10 @@ impl NoteSec {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if self.search.is_none() && self.editing.is_some() {
+                self.record_edit();
+            }
+            self.text_history_active = false;
             self.active_editor_mut().insert(&text);
             self.text_changed();
             cx.notify();
@@ -776,7 +900,20 @@ impl EntityInputHandler for NoteSec {
             .map(|r| self.active_editor().range_from_utf16(r))
             .or(self.active_editor().marked.clone())
             .unwrap_or(self.active_editor().cursor..self.active_editor().cursor);
+        let before = if self.search.is_none() && self.editing.is_some() {
+            if self.text_history_active {
+                None
+            } else {
+                self.text_history_active = true;
+                Some(self.history_state())
+            }
+        } else {
+            None
+        };
         self.active_editor_mut().replace_range(range, new_text);
+        if let Some(before) = before {
+            self.record_state(before);
+        }
         self.text_changed();
         cx.notify();
     }
@@ -794,6 +931,16 @@ impl EntityInputHandler for NoteSec {
             .map(|r| self.active_editor().range_from_utf16(r))
             .or(self.active_editor().marked.clone())
             .unwrap_or(self.active_editor().cursor..self.active_editor().cursor);
+        let before = if self.search.is_none() && self.editing.is_some() {
+            if self.text_history_active {
+                None
+            } else {
+                self.text_history_active = true;
+                Some(self.history_state())
+            }
+        } else {
+            None
+        };
         self.active_editor_mut()
             .replace_range(range.clone(), new_text);
         let len = self.active_editor().cursor - range.start;
@@ -802,6 +949,9 @@ impl EntityInputHandler for NoteSec {
             // The OS gives the cursor relative to the composition text.
             let end = self.active_editor().offset_from_utf16(sel.end).min(len);
             self.active_editor_mut().cursor = range.start + end;
+        }
+        if let Some(before) = before {
+            self.record_state(before);
         }
         self.text_changed();
         cx.notify();
@@ -1433,6 +1583,8 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::on_new_page))
+            .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_toggle_theme))
             .on_action(cx.listener(Self::on_toggle_graph))
             .on_action(cx.listener(Self::on_increase_font))
@@ -1550,6 +1702,75 @@ mod tests {
             std::fs::read_to_string(dir.join("pages/Untitled.md")).unwrap(),
             "- \n"
         );
+    }
+
+    #[gpui::test]
+    fn undo_and_redo_restore_block_text(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = setup(cx, "undo-text", "- one\n");
+        click_block(cx, 0);
+        cx.simulate_input(" changed");
+
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "one changed"));
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "one");
+            assert_eq!(app.pages[app.selected].blocks[0].content, "one");
+        });
+
+        cx.simulate_keystrokes("ctrl-shift-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "one changed"));
+        cx.simulate_keystrokes("ctrl-z ctrl-y");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "one changed"));
+    }
+
+    #[gpui::test]
+    fn undo_restores_structural_block_changes(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = setup(cx, "undo-structure", "- one\n- two\n");
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end enter");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks.len(), 3)
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks.len(), 2);
+            assert_eq!(app.pages[app.selected].blocks[0].content, "one");
+        });
+        cx.simulate_keystrokes("ctrl-y");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks.len(), 3)
+        });
+
+        cx.simulate_keystrokes("escape");
+        click_block(cx, 1);
+        cx.simulate_keystrokes("tab");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].depth_of(1), 1);
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].depth_of(1), 0);
+        });
+        cx.simulate_keystrokes("ctrl-y");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].depth_of(1), 1);
+        });
+        cx.simulate_keystrokes("shift-tab");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].depth_of(1), 0);
+        });
+    }
+
+    #[gpui::test]
+    fn new_edit_clears_redo_history(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = setup(cx, "undo-redo-clear", "- one\n");
+        click_block(cx, 0);
+        cx.simulate_input(" two");
+        cx.simulate_keystrokes("ctrl-z");
+        cx.simulate_input(" three");
+        cx.simulate_keystrokes("ctrl-y");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "one three"));
     }
 
     #[gpui::test]
