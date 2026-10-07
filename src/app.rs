@@ -6,7 +6,7 @@
 //! the block and the page is saved to disk.
 
 use crate::editor::EditorState;
-use crate::model::{backlinks, parse_wikilinks, Page};
+use crate::model::{backlinks, parse_references, tag_counts, Page};
 use crate::search::{search, Hit};
 use crate::storage::{today_title, Storage};
 use crate::ui::{block_row, Theme};
@@ -285,7 +285,7 @@ impl NoteSec {
         let targets: Vec<String> = self.pages[self.selected]
             .blocks
             .iter()
-            .flat_map(|b| parse_wikilinks(&b.content))
+            .flat_map(|b| parse_references(&b.content))
             .map(|link| link.target)
             .collect();
         for target in targets {
@@ -819,6 +819,13 @@ impl Render for NoteSec {
             ..Default::default()
         };
 
+        // Tags look like small chips: accent text on a subtle background.
+        let tag_style = HighlightStyle {
+            color: Some(theme.accent.into()),
+            background_color: Some(theme.selected_bg.into()),
+            ..Default::default()
+        };
+
         // --- Sidebar: one clickable row per page ---------------------------
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = ix == self.selected;
@@ -845,6 +852,36 @@ impl Render for NoteSec {
                 .child(page.title.clone())
         });
 
+        // Tag index: every tag in the graph with how many blocks use it.
+        // Clicking one opens its page, whose backlinks panel lists the uses.
+        let tags = tag_counts(&self.pages);
+        let tag_rows: Vec<AnyElement> = tags
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, count))| {
+                let target = name.clone();
+                div()
+                    .id(("tag", i))
+                    .debug_selector(|| format!("tag-{i}"))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .cursor_pointer()
+                    .text_color(theme.text)
+                    .hover(|d| d.bg(theme.selected_bg))
+                    .on_click(cx.listener(move |this, _e, _window, cx| {
+                        this.open_page(&target, cx);
+                    }))
+                    .child(format!("#{name}"))
+                    .child(div().text_color(theme.muted).child(count.to_string()))
+                    .into_any_element()
+            })
+            .collect();
+        let has_tags = !tag_rows.is_empty();
+
         let sidebar = div()
             .id("sidebar")
             .w(px(240.0))
@@ -859,7 +896,18 @@ impl Render for NoteSec {
             .border_color(theme.border)
             .overflow_y_scroll()
             .child(div().px_3().py_2().text_color(theme.muted).child("PAGES"))
-            .children(sidebar_items);
+            .children(sidebar_items)
+            .when(has_tags, |d| {
+                d.child(
+                    div()
+                        .mt_2()
+                        .px_3()
+                        .py_2()
+                        .text_color(theme.muted)
+                        .child("TAGS"),
+                )
+                .children(tag_rows)
+            });
 
         // --- Main pane: title + blocks --------------------------------------
         let page = &self.pages[self.selected];
@@ -870,7 +918,7 @@ impl Render for NoteSec {
             .map(|(ix, block)| {
                 let is_editing = self.editing == Some(ix);
                 let depth = page.depth_of(ix);
-                let links = parse_wikilinks(&block.content);
+                let links = parse_references(&block.content);
                 // Layout of this row's text, kept so a click can be mapped to
                 // the character (and so the link) under the mouse.
                 let mut text_layout = None;
@@ -879,7 +927,10 @@ impl Render for NoteSec {
                 } else if links.is_empty() {
                     div().child(block.content.clone()).into_any_element()
                 } else {
-                    let highlights = links.iter().map(|l| (l.range.clone(), link_style));
+                    let highlights = links.iter().map(|l| {
+                        let style = if l.is_tag { tag_style } else { link_style };
+                        (l.range.clone(), style)
+                    });
                     let text = StyledText::new(block.content.clone())
                         .with_default_highlights(&text_style, highlights);
                     text_layout = Some(text.layout().clone());
@@ -1380,6 +1431,76 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("backlink-0").is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn tag_index_in_sidebar_opens_tag_page_with_its_uses(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "tags-index", "- a #idea\n- b #idea #todo\n- plain\n");
+
+        // Sidebar lists tags by usage: idea (2 blocks), then todo (1).
+        assert!(cx.debug_bounds("tag-0").is_some());
+        assert!(cx.debug_bounds("tag-1").is_some());
+        assert!(cx.debug_bounds("tag-2").is_none());
+        view.update(cx, |app, _| {
+            let tags = tag_counts(&app.pages);
+            assert_eq!(tags, vec![("idea".to_string(), 2), ("todo".to_string(), 1)]);
+        });
+
+        // Clicking the first tag opens (and creates) the `idea` page...
+        let row = cx.debug_bounds("tag-0").unwrap();
+        cx.simulate_click(row.center(), Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "idea")
+        });
+        assert!(page_file(&dir, "idea").exists());
+
+        // ...whose backlinks panel is the tag's index: both tagged blocks.
+        assert!(cx.debug_bounds("backlink-0").is_some());
+        assert!(cx.debug_bounds("backlink-1").is_some());
+        assert!(cx.debug_bounds("backlink-2").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn clicking_a_tag_in_a_block_navigates(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "tags-click", "- #idea tail\n");
+        let row = cx.debug_bounds("block-0").expect("row rendered");
+
+        // Same geometry as the wikilink test: x + 24 lands on the tag text.
+        cx.simulate_click(
+            point(row.left() + px(24.), row.center().y),
+            Modifiers::none(),
+        );
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, None, "tag click must not start editing");
+            assert_eq!(app.pages[app.selected].title, "idea");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn typed_tags_create_pages_only_on_commit(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "tags-type", "- hi\n");
+        click_block(cx, 0);
+
+        cx.simulate_input(" #ne");
+        assert!(!page_file(&dir, "ne").exists(), "nothing while typing");
+        cx.simulate_input("wtag and #[[two words]]");
+        assert!(!page_file(&dir, "newtag").exists());
+
+        cx.simulate_keystrokes("escape");
+        assert!(page_file(&dir, "newtag").exists());
+        assert!(page_file(&dir, "two words").exists());
+        assert!(
+            !page_file(&dir, "ne").exists(),
+            "partial tag never became a page"
+        );
+        assert_eq!(file(&dir), "- hi #newtag and #[[two words]]\n");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Test");
+            assert_eq!(tag_counts(&app.pages).len(), 2);
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 

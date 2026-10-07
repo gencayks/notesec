@@ -17,20 +17,24 @@
 use std::ops::Range;
 use uuid::Uuid;
 
-/// A `[[wikilink]]` found inside a block's text.
+/// A reference to a page found inside a block's text: either a
+/// `[[wikilink]]` or a `#tag`. Both point at the page named `target`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct WikiLink {
-    /// Byte range of the whole `[[...]]`, brackets included.
+pub struct Reference {
+    /// Byte range of the whole reference as written (`[[...]]`, `#tag` or
+    /// `#[[...]]`), brackets and `#` included.
     pub range: Range<usize>,
-    /// The page name between the brackets, trimmed.
+    /// The page name, trimmed and without brackets or `#`.
     pub target: String,
+    /// True for `#tag` / `#[[tag]]`, false for a plain `[[wikilink]]`.
+    pub is_tag: bool,
 }
 
 /// Find every well-formed `[[name]]` in `text`, in order.
 ///
 /// A link needs a non-empty name that contains no `[`, `]` or newline. In
 /// `[[a [[b]]` only the inner `[[b]]` counts.
-pub fn parse_wikilinks(text: &str) -> Vec<WikiLink> {
+pub fn parse_wikilinks(text: &str) -> Vec<Reference> {
     let mut links = Vec::new();
     let mut pos = 0;
     while let Some(offset) = text[pos..].find("[[") {
@@ -47,13 +51,125 @@ pub fn parse_wikilinks(text: &str) -> Vec<WikiLink> {
             pos = start + 1;
             continue;
         }
-        links.push(WikiLink {
+        links.push(Reference {
             range: start..end + 2,
             target: inner.trim().to_string(),
+            is_tag: false,
         });
         pos = end + 2;
     }
     links
+}
+
+/// Characters allowed in a bare `#tag`. Punctuation such as `,` `.` `!` ends it.
+fn is_tag_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '/')
+}
+
+/// If a tag starts at the `#` at byte `pos`, return where it ends and its name.
+fn tag_at(text: &str, pos: usize) -> Option<(usize, String)> {
+    let rest = &text[pos + 1..];
+    if let Some(inner) = rest.strip_prefix("[[") {
+        // `#[[multi word tag]]`
+        let len = inner.find("]]")?;
+        let name = &inner[..len];
+        if name.contains(['[', ']', '\n']) || name.trim().is_empty() {
+            return None;
+        }
+        return Some((pos + 1 + 2 + len + 2, name.trim().to_string()));
+    }
+    // Bare `#tag`: run of tag characters. Trailing `-` or `/` are dropped so
+    // "#todo-" is the tag `todo`.
+    let len = rest
+        .char_indices()
+        .find(|&(_, c)| !is_tag_char(c))
+        .map_or(rest.len(), |(i, _)| i);
+    let name = rest[..len].trim_end_matches(['-', '/']);
+    // Pure numbers (`#1`, `#42`) are issue references, not tags.
+    if name.is_empty() || name.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((pos + 1 + name.len(), name.to_string()))
+}
+
+/// Find every `#tag` and `#[[multi word tag]]` in `text`.
+///
+/// A `#` only starts a tag at the start of the text or after whitespace or one
+/// of `( [ { , ;`. That keeps URL fragments (`page.html#top`), headings
+/// (`# Title`, `##x`) and words like `C#` from being treated as tags.
+/// `skip` lists byte ranges (wikilinks) that tags must not start inside.
+fn parse_tags(text: &str, skip: &[Range<usize>]) -> Vec<Reference> {
+    let mut tags = Vec::new();
+    let mut pos = 0;
+    let mut prev: Option<char> = None;
+    while pos < text.len() {
+        let c = text[pos..].chars().next().unwrap_or('\0');
+        let boundary = prev.map_or(true, |p| p.is_whitespace() || "([{,;".contains(p));
+        if c == '#' && boundary && !skip.iter().any(|r| r.contains(&pos)) {
+            if let Some((end, target)) = tag_at(text, pos) {
+                tags.push(Reference {
+                    range: pos..end,
+                    target,
+                    is_tag: true,
+                });
+                prev = text[..end].chars().last();
+                pos = end;
+                continue;
+            }
+        }
+        prev = Some(c);
+        pos += c.len_utf8();
+    }
+    tags
+}
+
+/// Every page reference in `text` (wikilinks and tags), in text order.
+pub fn parse_references(text: &str) -> Vec<Reference> {
+    let links = parse_wikilinks(text);
+    let skip: Vec<Range<usize>> = links.iter().map(|l| l.range.clone()).collect();
+    let tags = parse_tags(text, &skip);
+    // `#[[x]]` is found by both parsers; the tag (which includes the `#`)
+    // wins, so drop any link lying inside a tag.
+    let mut all: Vec<Reference> = links
+        .into_iter()
+        .filter(|l| {
+            !tags
+                .iter()
+                .any(|t| t.range.start <= l.range.start && l.range.end <= t.range.end)
+        })
+        .chain(tags.iter().cloned())
+        .collect();
+    all.sort_by_key(|r| r.range.start);
+    all
+}
+
+/// How many blocks use each tag, as `(name, count)`, most used first.
+///
+/// Names compare case-insensitively; the spelling shown is the first one seen.
+/// A tag repeated within one block counts once.
+pub fn tag_counts(pages: &[Page]) -> Vec<(String, usize)> {
+    // lowercase name -> (display name, blocks using it)
+    let mut counts: std::collections::HashMap<String, (String, usize)> = Default::default();
+    for page in pages {
+        for block in &page.blocks {
+            let mut seen = std::collections::HashSet::new();
+            for r in parse_references(&block.content)
+                .into_iter()
+                .filter(|r| r.is_tag)
+            {
+                let key = r.target.to_lowercase();
+                if seen.insert(key.clone()) {
+                    counts.entry(key).or_insert((r.target, 0)).1 += 1;
+                }
+            }
+        }
+    }
+    let mut out: Vec<(String, usize)> = counts.into_values().collect();
+    out.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
+    out
 }
 
 /// All blocks on one page that link to the page being viewed.
@@ -82,9 +198,9 @@ pub fn backlinks(pages: &[Page], title: &str) -> Vec<BacklinkGroup> {
             .iter()
             .enumerate()
             .filter(|(_, b)| {
-                parse_wikilinks(&b.content)
+                parse_references(&b.content)
                     .iter()
-                    .any(|l| l.target.to_lowercase() == wanted)
+                    .any(|r| r.target.to_lowercase() == wanted)
             })
             .map(|(i, _)| i)
             .collect();
@@ -442,6 +558,103 @@ mod tests {
             ]
         );
         assert!(backlinks(&pages, "Nobody").is_empty());
+    }
+
+    fn refs(text: &str) -> Vec<(String, bool)> {
+        parse_references(text)
+            .into_iter()
+            .map(|r| (r.target, r.is_tag))
+            .collect()
+    }
+
+    #[test]
+    fn tags_basic_and_ranges() {
+        let text = "#start mid #two, and #[[multi word]]!";
+        let found = parse_references(text);
+        let shown: Vec<&str> = found.iter().map(|r| &text[r.range.clone()]).collect();
+        assert_eq!(shown, vec!["#start", "#two", "#[[multi word]]"]);
+        assert_eq!(
+            refs(text),
+            vec![
+                ("start".into(), true),
+                ("two".into(), true),
+                ("multi word".into(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn tags_boundaries() {
+        // Not tags: URL fragments, C#, headings, issue numbers, lone hashes.
+        assert!(refs("see page.html#top and C# and ## x").is_empty());
+        assert!(refs("# Heading").is_empty());
+        assert!(refs("fixed #42 and # and #").is_empty());
+        assert!(refs("##double").is_empty());
+        // Allowed after an opening bracket; punctuation ends the tag.
+        assert_eq!(
+            refs("(#a) [#b] #c."),
+            vec![("a".into(), true), ("b".into(), true), ("c".into(), true)]
+        );
+        // Nested names and trailing dashes.
+        assert_eq!(
+            refs("#proj/sub #todo-"),
+            vec![("proj/sub".into(), true), ("todo".into(), true)]
+        );
+        // Multi-byte tag names work.
+        assert_eq!(
+            refs("#café 😀 #über"),
+            vec![("café".into(), true), ("über".into(), true)]
+        );
+        // Malformed multi-word tags are ignored.
+        assert!(refs("#[[unclosed and #[[]]").is_empty());
+    }
+
+    #[test]
+    fn links_and_tags_mix_without_double_counting() {
+        // `#[[x]]` is one tag, not a tag plus a link; a `#` inside a link is
+        // part of the link name, not a tag.
+        assert_eq!(
+            refs("[[a #b]] #[[c d]] [[e]] #f"),
+            vec![
+                ("a #b".into(), false),
+                ("c d".into(), true),
+                ("e".into(), false),
+                ("f".into(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_counts_group_case_insensitively_per_block() {
+        let pages = vec![
+            Page::from_markdown(
+                "A",
+                false,
+                "- #Idea one #idea\n- #idea and #b\n- [[idea]]\n",
+            ),
+            Page::from_markdown("B", false, "- #b #IDEA\n- #c\n"),
+        ];
+        // idea: blocks 0,1 of A and 0 of B = 3 (repeat in one block counts once,
+        // the [[idea]] link is not a tag). b: 2. c: 1.
+        assert_eq!(
+            tag_counts(&pages),
+            vec![("Idea".into(), 3), ("b".into(), 2), ("c".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn backlinks_include_tags() {
+        let pages = vec![
+            Page::from_markdown("A", false, "- tagged #target\n"),
+            Page::from_markdown("Target", false, "- x\n"),
+        ];
+        assert_eq!(
+            backlinks(&pages, "Target"),
+            vec![BacklinkGroup {
+                page: 0,
+                blocks: vec![0]
+            }]
+        );
     }
 
     #[test]
