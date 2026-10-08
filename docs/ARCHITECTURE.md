@@ -661,6 +661,24 @@ that mutate, and data races are essentially impossible.
     a press on it stops there (it never starts editing the query block) and
     a click opens that page. The macro itself stays in the file and in the
     editor exactly as typed.
+26. **Pipe tables are drawn only in reading view, and blocks keep their
+    text byte for byte**: `table::parse_table` finds a header row, a
+    `---` separator row (`:` sets left, center or right alignment) and the
+    rows after it, splitting cells on unescaped `|`. Short or long rows are
+    padded to the widest, so ragged tables never panic. The table is laid
+    out column by column (each column as wide as its widest cell, every
+    cell one line high), so cells line up without a grid engine, and a wide
+    table scrolls sideways. Cells use `DisplayBlock::inline` (links, tags,
+    emphasis and block refs, but no `# `/`TODO` prefix). Nothing is
+    rewritten: continuation lines now drop exactly the indent `to_markdown`
+    writes (two spaces per level plus two) and keep the rest, padding and
+    trailing spaces included, so tables survive a load and save unchanged.
+    Because tables are multi-line blocks, the editor (`BlockText`) is now
+    multi-line too: it shapes each `\n`-separated line on its own
+    (`TextLines`), since GPUI's `shape_line` panics on newlines, which
+    clicking any multi-line Logseq block used to trigger. Up and Down move
+    between lines before moving between blocks, Shift+Enter inserts a line
+    break, and pasted newlines still become spaces.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

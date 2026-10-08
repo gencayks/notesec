@@ -8,6 +8,7 @@ mod model;
 mod search;
 mod state;
 mod storage;
+mod table;
 mod tabs;
 mod ui;
 

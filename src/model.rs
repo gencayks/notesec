@@ -834,10 +834,19 @@ impl Page {
                     }
                     continue;
                 }
+                // Strip exactly the indent `to_markdown` writes (two spaces
+                // per level, plus two to line up under the bullet text) and
+                // keep the rest as is, so spacing inside the line, like a
+                // table's padding, survives a save byte for byte. Lines
+                // indented some other way just lose their leading space.
+                let indent = "  ".repeat(stack.len());
+                let text = line
+                    .strip_prefix(indent.as_str())
+                    .unwrap_or(line.trim_start());
                 match page.blocks.last_mut() {
                     Some(last) => {
                         last.content.push('\n');
-                        last.content.push_str(line.trim());
+                        last.content.push_str(text);
                     }
                     None => {
                         // Stray text before any bullet: promote it to a block.
@@ -1497,5 +1506,17 @@ mod tests {
         let page = Page::from_markdown("t", false, md);
         assert_eq!(page.blocks[0].content, "one\nmore text");
         assert_eq!(page.to_markdown(), md);
+    }
+
+    #[test]
+    fn continuation_lines_keep_their_inner_spacing() {
+        // Deeper indent and trailing spaces past the block's own indent are
+        // part of the text; a line with too little indent is re-indented.
+        let md = "- a\n  - b\n    |  x  |  \n      deeper\n- c\n";
+        let page = Page::from_markdown("t", false, md);
+        assert_eq!(page.blocks[1].content, "b\n|  x  |  \n  deeper");
+        assert_eq!(page.to_markdown(), md);
+        let page = Page::from_markdown("t", false, "- a\n  - b\n  under\n");
+        assert_eq!(page.blocks[1].content, "b\nunder");
     }
 }

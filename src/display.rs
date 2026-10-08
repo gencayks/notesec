@@ -99,8 +99,27 @@ impl DisplayBlock {
     /// The reading view of `content`; `resolve` gives the content of a
     /// referenced block, or `None` if there is no such block.
     pub fn with_refs(content: &str, resolve: impl Fn(Uuid) -> Option<String>) -> Self {
-        let (kind, body) = BlockKind::parse(content);
-        let (task, body) = TaskState::parse(body);
+        Self::build(content, resolve, true)
+    }
+
+    /// The reading view of inline text, like a table cell: links, tags,
+    /// emphasis and block references, but a leading `# ` or `TODO ` is
+    /// shown as written rather than read as the block's type.
+    pub fn inline(content: &str, resolve: impl Fn(Uuid) -> Option<String>) -> Self {
+        Self::build(content, resolve, false)
+    }
+
+    fn build(content: &str, resolve: impl Fn(Uuid) -> Option<String>, block: bool) -> Self {
+        let (kind, body) = if block {
+            BlockKind::parse(content)
+        } else {
+            (BlockKind::Text, content)
+        };
+        let (task, body) = if block {
+            TaskState::parse(body)
+        } else {
+            (None, body)
+        };
         let prefix = content.len() - body.len();
         let refs = parse_references(body);
         // Resolved block references, with the text each one shows.
@@ -540,5 +559,14 @@ mod tests {
         // After "ü" (inside the bold) the cursor is before the closing "**".
         let after_u = "é😀ü".len();
         assert_eq!(d.to_source(after_u), "é**😀ü".len());
+    }
+
+    #[test]
+    fn inline_text_keeps_block_prefixes() {
+        let d = DisplayBlock::inline("# TODO **x** [[P]]", |_| None);
+        assert_eq!(d.kind, BlockKind::Text);
+        assert_eq!(d.task, None);
+        assert_eq!(d.text, "# TODO x [[P]]");
+        assert_eq!(d.links.len(), 1);
     }
 }

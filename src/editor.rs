@@ -154,6 +154,17 @@ impl EditorState {
         self.marked = None;
     }
 
+    /// Insert a line break at the cursor, replacing the selection if there
+    /// is one. The only way a `\n` gets into the text: typed and pasted
+    /// text has its newlines turned into spaces.
+    pub fn insert_line_break(&mut self) {
+        let range = self.selected_range();
+        self.text.replace_range(range.clone(), "\n");
+        self.cursor = range.start + 1;
+        self.anchor = None;
+        self.marked = None;
+    }
+
     /// Insert `s` at the cursor, replacing the selection if there is one.
     pub fn insert(&mut self, s: &str) {
         self.replace_range(self.selected_range(), s);

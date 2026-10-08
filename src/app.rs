@@ -16,6 +16,7 @@ use crate::model::{
 use crate::search::{search, search_blocks, search_templates, Command, Hit, Target};
 use crate::state::UiState;
 use crate::storage::{today_title, Storage, Template};
+use crate::table::{parse_table, Align};
 use crate::tabs::{TabTarget, Tabs};
 use crate::ui::{
     block_row, drag_handle, drop_line, favorite_star, fold_arrow, fold_badge, task_checkbox,
@@ -61,6 +62,7 @@ actions!(
         CycleTask,
         MoveBlockUp,
         MoveBlockDown,
+        NewLine,
         CloseTab,
         NextTab,
         PrevTab,
@@ -94,6 +96,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("right", Right, ctx),
         KeyBinding::new("up", Up, ctx),
         KeyBinding::new("down", Down, ctx),
+        KeyBinding::new("shift-enter", NewLine, ctx),
         KeyBinding::new("home", Home, ctx),
         KeyBinding::new("end", End, ctx),
         KeyBinding::new("escape", Escape, ctx),
@@ -279,7 +282,7 @@ pub struct NoteSec {
     _graph_subscription: Option<Subscription>,
     /// Shaped text + bounds from the last paint; needed to answer the OS
     /// input-method's questions about where characters are on screen.
-    last_layout: Option<ShapedLine>,
+    last_layout: Option<TextLines>,
     last_bounds: Option<Bounds<Pixels>>,
     /// Text layouts of the rows in reading view from the last render, so
     /// tests can find where a displayed character is on screen.
@@ -1641,7 +1644,7 @@ impl NoteSec {
     /// painted last frame.
     fn index_for_mouse(&self, position: gpui::Point<Pixels>) -> usize {
         let len = self.editor.text.len();
-        let (Some(bounds), Some(line)) = (self.last_bounds, self.last_layout.as_ref()) else {
+        let (Some(bounds), Some(lines)) = (self.last_bounds, self.last_layout.as_ref()) else {
             return self.editor.cursor;
         };
         if position.y < bounds.top() {
@@ -1649,8 +1652,7 @@ impl NoteSec {
         } else if position.y > bounds.bottom() {
             len
         } else {
-            line.closest_index_for_x(position.x - bounds.left())
-                .min(len)
+            lines.closest_index(position - bounds.origin).min(len)
         }
     }
 
@@ -1706,6 +1708,9 @@ impl NoteSec {
             self.move_ref_selection(-1, cx);
             return;
         }
+        if self.move_cursor_line(-1, cx) {
+            return;
+        }
         if let Some(prev) = self.editing.and_then(|ix| self.visible_neighbor(ix, false)) {
             self.move_edit(prev, cx);
         }
@@ -1724,9 +1729,57 @@ impl NoteSec {
             self.move_ref_selection(1, cx);
             return;
         }
+        if self.move_cursor_line(1, cx) {
+            return;
+        }
         if let Some(next) = self.editing.and_then(|ix| self.visible_neighbor(ix, true)) {
             self.move_edit(next, cx);
         }
+    }
+
+    /// In a block with line breaks, move the cursor to the line above
+    /// (`-1`) or below (`1`), keeping its horizontal position. False when
+    /// there is no such line, so Up and Down move to the next block instead.
+    fn move_cursor_line(&mut self, direction: isize, cx: &mut Context<Self>) -> bool {
+        if self.editing.is_none() {
+            return false;
+        }
+        let Some(lines) = self.last_layout.as_ref() else {
+            return false;
+        };
+        let cursor = self.editor.cursor;
+        let Some(row) = lines.row_of(cursor).checked_add_signed(direction) else {
+            return false;
+        };
+        if row >= lines.lines.len() {
+            return false;
+        }
+        let x = lines.point_for_index(cursor).x;
+        let target = lines
+            .closest_index_in_row(row, x)
+            .min(self.editor.text.len());
+        self.text_history_active = false;
+        self.editor.set_cursor(target);
+        cx.notify();
+        true
+    }
+
+    /// Shift+Enter: a line break inside the block (Enter starts a new
+    /// block). Pipe tables are written this way, one row per line.
+    fn new_line(&mut self, _: &NewLine, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_none()
+            || self.search.is_some()
+            || self.slash.is_some()
+            || self.ref_menu_open()
+        {
+            return;
+        }
+        let before = self.history_state();
+        self.text_history_active = false;
+        self.editor.insert_line_break();
+        self.record_state(before);
+        self.text_changed();
+        cx.notify();
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
@@ -1815,6 +1868,70 @@ impl NoteSec {
         }
         cx.notify();
     }
+}
+
+/// A pipe table in reading view. It is laid out column by column, each
+/// column as wide as its widest cell, so cells line up whatever their text;
+/// every cell is one line high, so rows line up too. The header row is bold
+/// on the sidebar colour, and a table wider than the page scrolls sideways.
+fn table_grid(
+    theme: &Theme,
+    ix: usize,
+    rows: Vec<Vec<StyledText>>,
+    align: &[Align],
+) -> impl IntoElement {
+    let row_count = rows.len();
+    let mut columns: Vec<Vec<StyledText>> = (0..align.len()).map(|_| Vec::new()).collect();
+    for row in rows {
+        for (c, cell) in row.into_iter().enumerate() {
+            columns[c].push(cell);
+        }
+    }
+    let column_count = columns.len();
+    let columns = columns.into_iter().enumerate().map(|(c, cells)| {
+        let align = align[c];
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .when(c + 1 < column_count, |col| {
+                col.border_r_1().border_color(theme.border)
+            })
+            .children(cells.into_iter().enumerate().map(move |(r, cell)| {
+                div()
+                    .debug_selector(move || format!("table-{ix}-cell-{r}-{c}"))
+                    .flex()
+                    .flex_row()
+                    .px_2()
+                    .py(px(2.0))
+                    .whitespace_nowrap()
+                    .when(align == Align::Center, |d| d.justify_center())
+                    .when(align == Align::Right, |d| d.justify_end())
+                    .when(r == 0, |d| {
+                        d.font_weight(FontWeight::BOLD).bg(theme.sidebar_bg)
+                    })
+                    .when(r + 1 < row_count, |d| {
+                        d.border_b_1().border_color(theme.border)
+                    })
+                    .child(cell)
+            }))
+    });
+    div()
+        .id(("table", ix))
+        .debug_selector(move || format!("table-{ix}"))
+        .overflow_x_scroll()
+        .max_w_full()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .overflow_hidden()
+                .children(columns),
+        )
 }
 
 /// Highlights for a block in reading view: link/tag styling with bold and
@@ -2047,17 +2164,18 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let layout = self.last_layout.as_ref()?;
+        let lines = self.last_layout.as_ref()?;
         let range = self.active_editor().range_from_utf16(&range_utf16);
+        // The range's first line only: enough for the IME to place its window.
+        let start = lines.point_for_index(range.start);
+        let end = if lines.row_of(range.end) == lines.row_of(range.start) {
+            lines.point_for_index(range.end)
+        } else {
+            point(lines.row_width(lines.row_of(range.start)), start.y)
+        };
         Some(Bounds::from_corners(
-            point(
-                bounds.left() + layout.x_for_index(range.start),
-                bounds.top(),
-            ),
-            point(
-                bounds.left() + layout.x_for_index(range.end),
-                bounds.bottom(),
-            ),
+            bounds.origin + start,
+            bounds.origin + point(end.x, end.y + lines.line_height),
         ))
     }
 
@@ -2068,8 +2186,8 @@ impl EntityInputHandler for NoteSec {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let local = self.last_bounds?.localize(&pt)?;
-        let layout = self.last_layout.as_ref()?;
-        let utf8 = layout.index_for_x(pt.x - local.x)?;
+        let lines = self.last_layout.as_ref()?;
+        let utf8 = lines.index_for_point(local)?;
         Some(self.active_editor().offset_to_utf16(utf8))
     }
 }
@@ -2086,12 +2204,96 @@ struct BlockText {
     app: Entity<NoteSec>,
 }
 
+/// The edited text shaped one line per `\n`-separated line (GPUI shapes
+/// single lines only), stacked `line_height` apart. Positions are relative
+/// to the top-left of the text.
+#[derive(Default)]
+struct TextLines {
+    /// Each line's byte offset in the text, and its shaped glyphs.
+    lines: Vec<(usize, ShapedLine)>,
+    line_height: Pixels,
+}
+
+impl TextLines {
+    /// The line that byte `ix` is on (a `\n` belongs to the line it ends).
+    fn row_of(&self, ix: usize) -> usize {
+        self.lines
+            .iter()
+            .rposition(|(start, _)| *start <= ix)
+            .unwrap_or(0)
+    }
+
+    fn row_width(&self, row: usize) -> Pixels {
+        self.lines.get(row).map_or(px(0.), |(_, line)| line.width())
+    }
+
+    /// Top-left corner of the caret before byte `ix`.
+    fn point_for_index(&self, ix: usize) -> gpui::Point<Pixels> {
+        let row = self.row_of(ix);
+        let x = self
+            .lines
+            .get(row)
+            .map_or(px(0.), |(start, line)| line.x_for_index(ix - start));
+        point(x, self.line_height * row as f32)
+    }
+
+    /// The row under `y`, clamped to the existing lines.
+    fn row_at(&self, y: Pixels) -> usize {
+        let row = (y / self.line_height).floor().max(0.) as usize;
+        row.min(self.lines.len().saturating_sub(1))
+    }
+
+    /// The caret position in `row` closest to `x`.
+    fn closest_index_in_row(&self, row: usize, x: Pixels) -> usize {
+        self.lines
+            .get(row)
+            .map_or(0, |(start, line)| start + line.closest_index_for_x(x))
+    }
+
+    /// The caret position closest to `position`.
+    fn closest_index(&self, position: gpui::Point<Pixels>) -> usize {
+        self.closest_index_in_row(self.row_at(position.y), position.x)
+    }
+
+    /// The byte of the character under `position`, if it is over one.
+    fn index_for_point(&self, position: gpui::Point<Pixels>) -> Option<usize> {
+        let (start, line) = self.lines.get(self.row_at(position.y))?;
+        Some(start + line.index_for_x(position.x)?)
+    }
+}
+
+/// The runs covering `range` of the text, cut to fit it. Never empty, so
+/// an empty line still shapes with the block's font.
+fn runs_in(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for run in runs {
+        let (start, end) = (pos.max(range.start), (pos + run.len).min(range.end));
+        if start < end {
+            out.push(TextRun {
+                len: end - start,
+                ..run.clone()
+            });
+        }
+        pos += run.len;
+    }
+    if out.is_empty() {
+        if let Some(run) = runs.first() {
+            out.push(TextRun {
+                len: 0,
+                ..run.clone()
+            });
+        }
+    }
+    out
+}
+
 /// Data computed in `prepaint` and consumed in `paint`.
 struct PrepaintState {
-    line: ShapedLine,
+    lines: TextLines,
     cursor: PaintQuad,
-    /// Highlight behind the selected text, if any.
-    selection: Option<PaintQuad>,
+    /// Highlight behind the selected text, one quad per line it covers.
+    selection: Vec<PaintQuad>,
 }
 
 impl IntoElement for BlockText {
@@ -2120,10 +2322,11 @@ impl Element for BlockText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        // Full width, one line tall (blocks are single-line).
+        // Full width, one line tall per line of the block.
+        let rows = self.app.read(cx).active_editor().text.split('\n').count();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
+        style.size.height = (window.line_height() * rows as f32).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -2182,31 +2385,58 @@ impl Element for BlockText {
         };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_line(text, font_size, &runs, None);
+        let line_height = window.line_height();
+        let mut start = 0;
+        let lines = text
+            .split('\n')
+            .map(|line_text| {
+                let range = start..start + line_text.len();
+                start = range.end + 1;
+                let shaped = window.text_system().shape_line(
+                    SharedString::from(line_text.to_string()),
+                    font_size,
+                    &runs_in(&runs, range.clone()),
+                    None,
+                );
+                (range.start, shaped)
+            })
+            .collect();
+        let lines = TextLines { lines, line_height };
 
-        let x = line.x_for_index(cursor);
+        let caret = lines.point_for_index(cursor);
         let cursor = fill(
-            Bounds::new(
-                point(bounds.left() + x, bounds.top()),
-                size(px(1.5), bounds.size.height),
-            ),
+            Bounds::new(bounds.origin + caret, size(px(1.5), line_height)),
             accent,
         );
-        // The selection is a translucent quad painted *under* the text, so it
+        // The selection is translucent quads painted *under* the text, so it
         // never changes the text runs (colours, IME underline) on top of it.
-        let selection = selected.map(|range| {
-            fill(
-                Bounds::from_corners(
-                    point(bounds.left() + line.x_for_index(range.start), bounds.top()),
-                    point(bounds.left() + line.x_for_index(range.end), bounds.bottom()),
-                ),
-                selection_color,
-            )
+        // Every line but the last also covers its line break.
+        let selection = selected.map_or(Vec::new(), |range| {
+            let (first, last) = (lines.row_of(range.start), lines.row_of(range.end));
+            (first..=last)
+                .map(|row| {
+                    let from = if row == first {
+                        lines.point_for_index(range.start)
+                    } else {
+                        point(px(0.), line_height * row as f32)
+                    };
+                    let to_x = if row == last {
+                        lines.point_for_index(range.end).x
+                    } else {
+                        lines.row_width(row) + px(4.)
+                    };
+                    fill(
+                        Bounds::from_corners(
+                            bounds.origin + from,
+                            bounds.origin + point(to_x, from.y + line_height),
+                        ),
+                        selection_color,
+                    )
+                })
+                .collect()
         });
         PrepaintState {
-            line,
+            lines,
             cursor,
             selection,
         }
@@ -2230,29 +2460,30 @@ impl Element for BlockText {
             cx,
         );
 
-        if let Some(selection) = prepaint.selection.take() {
+        for selection in prepaint.selection.drain(..) {
             window.paint_quad(selection);
         }
-        prepaint
-            .line
-            .paint(
-                bounds.origin,
-                window.line_height(),
+        let line_height = prepaint.lines.line_height;
+        for (row, (_, line)) in prepaint.lines.lines.iter().enumerate() {
+            line.paint(
+                bounds.origin + point(px(0.), line_height * row as f32),
+                line_height,
                 gpui::TextAlign::Left,
                 None,
                 window,
                 cx,
             )
             .expect("failed to paint block text");
+        }
 
         if focus_handle.is_focused(window) {
             window.paint_quad(prepaint.cursor.clone());
         }
 
         // Remember the layout for the OS input-method callbacks.
-        let line = std::mem::take(&mut prepaint.line);
+        let lines = std::mem::take(&mut prepaint.lines);
         self.app.update(cx, |app, _| {
-            app.last_layout = Some(line);
+            app.last_layout = Some(lines);
             app.last_bounds = Some(bounds);
         });
     }
@@ -2962,18 +3193,64 @@ impl Render for NoteSec {
                         .child(BlockText { app: cx.entity() })
                         .into_any_element(),
                     Some(d) => {
-                        let highlights = reading_highlights(d, link_style, tag_style, ref_style);
-                        // `with_highlights` resolves against the inherited text
-                        // style, so heading size/weight and quote styling (and
-                        // the theme's text colour) apply to the unhighlighted
-                        // parts.
-                        let text = StyledText::new(d.text.clone()).with_highlights(highlights);
-                        text_layout = Some(text.layout().clone());
-                        #[cfg(test)]
-                        reading_layouts.push((ix, text.layout().clone()));
+                        // A pipe table is drawn as a grid between the text
+                        // before and after it. Its cells aren't mapped back
+                        // to `content`, so a press on it starts editing at
+                        // the start of the block.
+                        let table = parse_table(&block.content).map(|table| {
+                            let resolve = |id| {
+                                find_block(&self.pages, id)
+                                    .map(|(p, b)| self.pages[p].blocks[b].content.clone())
+                            };
+                            let styled = |d: &DisplayBlock| {
+                                StyledText::new(d.text.clone()).with_highlights(reading_highlights(
+                                    d, link_style, tag_style, ref_style,
+                                ))
+                            };
+                            // The text around the table keeps the block's
+                            // type prefix and task keyword (hidden) in `before`.
+                            let before = (!table.before.is_empty())
+                                .then(|| styled(&DisplayBlock::with_refs(&table.before, resolve)));
+                            let after = (!table.after.is_empty())
+                                .then(|| styled(&DisplayBlock::inline(&table.after, resolve)));
+                            let cells = table
+                                .rows
+                                .iter()
+                                .map(|row| {
+                                    row.iter()
+                                        .map(|cell| styled(&DisplayBlock::inline(cell, resolve)))
+                                        .collect()
+                                })
+                                .collect();
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .children(before)
+                                .child(table_grid(&theme, ix, cells, &table.align))
+                                .children(after)
+                        });
+                        let text = match table {
+                            Some(table) => table.into_any_element(),
+                            None => {
+                                let highlights =
+                                    reading_highlights(d, link_style, tag_style, ref_style);
+                                // `with_highlights` resolves against the
+                                // inherited text style, so heading size/weight
+                                // and quote styling (and the theme's text
+                                // colour) apply to the unhighlighted parts.
+                                let text =
+                                    StyledText::new(d.text.clone()).with_highlights(highlights);
+                                text_layout = Some(text.layout().clone());
+                                #[cfg(test)]
+                                reading_layouts.push((ix, text.layout().clone()));
+                                text.into_any_element()
+                            }
+                        };
                         // DONE text is dimmed and struck through.
                         let text = div()
                             .flex_1()
+                            .min_w_0()
                             .when(d.task == Some(TaskState::Done), |t| {
                                 t.text_color(theme.muted)
                                     .line_through()
@@ -3673,6 +3950,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::new_line))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::escape))
@@ -5043,8 +5321,9 @@ mod tests {
     fn text_point(view: &Entity<NoteSec>, cx: &mut VisualTestContext, ix: usize) -> Point<Pixels> {
         view.update(cx, |app, _| {
             let bounds = app.last_bounds.expect("edited block painted");
-            let x = app.last_layout.as_ref().unwrap().x_for_index(ix);
-            point(bounds.left() + x, bounds.center().y)
+            let lines = app.last_layout.as_ref().unwrap();
+            let at = lines.point_for_index(ix);
+            bounds.origin + point(at.x, at.y + lines.line_height / 2.)
         })
     }
 
@@ -5508,7 +5787,8 @@ mod tests {
             assert_eq!(app.editor.cursor, 2, "start of the text, inside the bold");
             // The edited row is drawn by the editor with the raw text.
             let layout = app.last_layout.as_ref().expect("edited block painted");
-            assert_eq!(layout.text.as_ref(), "**bold** *it*");
+            assert_eq!(layout.lines.len(), 1);
+            assert_eq!(layout.lines[0].1.text.as_ref(), "**bold** *it*");
         });
         assert_eq!(reading_text(&view, cx, 0), None);
         // Leaving the block goes back to the reading view.
@@ -6899,6 +7179,193 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.pages[app.selected].title, "Other")
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn table_columns_line_up(cx: &mut TestAppContext) {
+        let md = "- Prices **now**\n  | Item | Qty | Note |\n  | :--- | :-: | ---: |\n  | a | 1000000 | x |\n  | a much longer item | 2 | [[P]] |\n- after\n";
+        let (_view, cx, dir) = setup_pages(cx, "table-align", &[("Test", md)], "Test");
+        assert!(has(cx, "table-0"));
+        let cell = |cx: &mut VisualTestContext, r: usize, c: usize| {
+            bounds_of(cx, &format!("table-0-cell-{r}-{c}"))
+        };
+        for c in 0..3 {
+            let first = cell(cx, 0, c);
+            for r in 1..3 {
+                let b = cell(cx, r, c);
+                assert_eq!(
+                    (b.origin.x, b.size.width),
+                    (first.origin.x, first.size.width)
+                );
+            }
+            if c > 0 {
+                assert!(first.origin.x >= cell(cx, 0, c - 1).right());
+            }
+        }
+        for r in 0..3 {
+            let first = cell(cx, r, 0);
+            for c in 1..3 {
+                let b = cell(cx, r, c);
+                assert_eq!(
+                    (b.origin.y, b.size.height),
+                    (first.origin.y, first.size.height)
+                );
+            }
+            if r > 0 {
+                assert!(first.origin.y >= cell(cx, r - 1, 0).bottom());
+            }
+        }
+        // The widest cell sets the column's width.
+        assert!(cell(cx, 0, 0).size.width > cell(cx, 0, 2).size.width);
+        // Text before the table is above it, and the next block still renders.
+        assert!(has(cx, "block-1"));
+        assert!(bounds_of(cx, "block-1").top() >= bounds_of(cx, "table-0").bottom());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn ragged_table_rows_render_without_crashing(cx: &mut TestAppContext) {
+        let md =
+            "- | a | b |\n  |---|---|\n  | 1 |\n  | 1 | 2 | 3 | 4 |\n  ||\n- | only |\n  | --- |\n";
+        let (_view, cx, dir) = setup_pages(cx, "table-ragged", &[("Test", md)], "Test");
+        // Four columns in every row, short rows padded with empty cells.
+        for r in 0..4 {
+            for c in 0..4 {
+                assert!(has(cx, &format!("table-0-cell-{r}-{c}")), "cell {r},{c}");
+            }
+        }
+        assert!(!has(cx, "table-0-cell-0-4") && !has(cx, "table-0-cell-4-0"));
+        // A header with no body rows is still a table.
+        assert!(has(cx, "table-1-cell-0-0") && !has(cx, "table-1-cell-1-0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn tables_survive_save_and_load_byte_for_byte(cx: &mut TestAppContext) {
+        // Odd padding, trailing spaces, an escaped pipe, alignment colons and
+        // a table nested two levels down.
+        let md = "- Groceries\n  - | Item   |  Qty |\n    | :---   | --:  |\n    |  tea   | 2    |  \n    | a \\| b |\n    after the table\n  - other\n- Prices\n  a|b\n  -|:-:\n  1|2\n";
+        let (view, cx, dir) = setup_pages(cx, "table-roundtrip", &[("Test", md)], "Test");
+        assert!(has(cx, "table-1") && has(cx, "table-3"));
+        // Storage alone gives back exactly what it read.
+        let storage = Storage::open(dir.clone()).unwrap();
+        let page = storage
+            .load_all()
+            .into_iter()
+            .find(|p| p.title == "Test")
+            .unwrap();
+        storage.save(&page).unwrap();
+        assert_eq!(file(&dir), md);
+        // So does opening the table for editing and leaving again.
+        click_block(cx, 1);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        // Editing another block rewrites the file with the tables untouched.
+        click_block(cx, 2);
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), md.replace("  - other\n", "  - other!\n"));
+        assert!(has(cx, "table-1") && has(cx, "table-3"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn editing_a_multi_line_block_shows_every_line(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(
+            cx,
+            "multi-line-edit",
+            "- first\n  second\n  third\n- next\n",
+        );
+        click_block(cx, 0);
+        let line_height = view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.editor.text, "first\nsecond\nthird");
+            let lines = app.last_layout.as_ref().expect("edited block painted");
+            let texts: Vec<&str> = lines.lines.iter().map(|(_, l)| l.text.as_ref()).collect();
+            assert_eq!(texts, ["first", "second", "third"]);
+            assert_eq!(lines.lines[2].0, "first\nsecond\n".len());
+            let bounds = app.last_bounds.unwrap();
+            assert_eq!(bounds.size.height, lines.line_height * 3.);
+            lines.line_height
+        });
+        // A click on the second line puts the cursor there.
+        let at = text_point(&view, cx, "first\nsec".len());
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.cursor, "first\nsec".len())
+        });
+        // The next block sits below all three lines.
+        cx.simulate_keystrokes("escape");
+        assert!(
+            bounds_of(cx, "block-1").top() >= bounds_of(cx, "block-0").top() + line_height * 3.
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn up_and_down_move_between_lines_before_blocks(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "multi-line-keys", "- above\n- abc\n  abcdef\n- below\n");
+        click_block(cx, 1);
+        view.update(cx, |app, cx| {
+            app.editor.set_cursor(2);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, "abc\nab".len(), "same column, next line");
+        });
+        cx.simulate_keystrokes("down");
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(2)));
+        cx.simulate_keystrokes("up");
+        view.update(cx, |app, cx| {
+            assert_eq!(app.editing, Some(1));
+            app.editor.set_cursor("abc\nabcdef".len());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("up");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, 3, "end of the shorter line above");
+        });
+        cx.simulate_keystrokes("up");
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn shift_enter_writes_a_table_that_renders(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "shift-enter-table", "- \n");
+        click_block(cx, 0);
+        cx.simulate_input("| a | b |");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("|---|--:|");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("| 1 | 2 |");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0), "still the same block");
+            assert_eq!(app.editor.text, "| a | b |\n|---|--:|\n| 1 | 2 |");
+            assert_eq!(app.last_layout.as_ref().unwrap().lines.len(), 3);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(file(&dir), "- | a | b |\n  |---|--:|\n  | 1 | 2 |\n");
+        assert!(has(cx, "table-0-cell-1-1"));
+        // Undo takes the last line break back out.
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end");
+        cx.simulate_keystrokes("shift-enter");
+        view.update(cx, |app, _| {
+            assert!(app.editor.text.ends_with("| 1 | 2 |\n"))
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert!(app.editor.text.ends_with("| 1 | 2 |")));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
