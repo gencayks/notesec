@@ -269,27 +269,99 @@ pub struct BacklinkGroup {
     pub blocks: Vec<usize>,
 }
 
-/// Find every block, on any *other* page, that contains `[[title]]`.
+/// The names a page declares for itself with an `alias::` line in its
+/// first block (Logseq's page property): `alias:: JS, [[ECMAScript]]`.
+/// Names are split on commas and trimmed, `[[ ]]` around a name is
+/// dropped, and empty names, repeats (ignoring case) and the page's own
+/// title are left out. The key ignores case; several `alias::` lines add up.
+pub fn page_aliases(page: &Page) -> Vec<String> {
+    let Some(first) = page.blocks.first() else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::from([page.title.to_lowercase()]);
+    let mut out = Vec::new();
+    for line in first.content.split('\n') {
+        let line = line.trim();
+        let Some(key) = line.get(..7) else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("alias::") {
+            continue;
+        }
+        for name in line[7..].split(',') {
+            let name = name.trim();
+            let name = name
+                .strip_prefix("[[")
+                .and_then(|n| n.strip_suffix("]]"))
+                .unwrap_or(name)
+                .trim();
+            if !name.is_empty() && seen.insert(name.to_lowercase()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The page a link to `name` means: the page with that title (ignoring
+/// case), else the first page (in `pages` order) that declares it as an
+/// alias. A real title always wins over an alias.
+pub fn resolve_page(pages: &[Page], name: &str) -> Option<usize> {
+    let wanted = name.trim().to_lowercase();
+    pages
+        .iter()
+        .position(|p| p.title.to_lowercase() == wanted)
+        .or_else(|| {
+            pages
+                .iter()
+                .position(|p| page_aliases(p).iter().any(|a| a.to_lowercase() == wanted))
+        })
+}
+
+/// Find every block, on any *other* page, that links to page `target`
+/// (an index into `pages`): with `[[Title]]` or `#Title` (or one of its
+/// aliases that resolves to it, see `resolve_page`), or with a block
+/// reference `((id))` to one of its blocks. A block that does both is
+/// listed once.
 ///
 /// Title matching ignores case, like page lookup does. Groups come back in the
 /// order of `pages`, and blocks in document order. A page's links to itself
-/// are not backlinks and are skipped.
-pub fn backlinks(pages: &[Page], title: &str) -> Vec<BacklinkGroup> {
-    let wanted = title.to_lowercase();
+/// (including references to its own blocks) are not backlinks and are
+/// skipped.
+pub fn backlinks(pages: &[Page], target: usize) -> Vec<BacklinkGroup> {
+    let Some(target_page) = pages.get(target) else {
+        return Vec::new();
+    };
+    let wanted = target_page.title.to_lowercase();
+    // Its aliases count only where they resolve to it (no page has that
+    // title, and no earlier page claims the alias).
+    let names: Vec<String> = std::iter::once(wanted.clone())
+        .chain(
+            page_aliases(target_page)
+                .into_iter()
+                .filter(|a| resolve_page(pages, a) == Some(target))
+                .map(|a| a.to_lowercase()),
+        )
+        .collect();
+    let ids: std::collections::HashSet<Uuid> = target_page.blocks.iter().map(|b| b.id).collect();
+    let links_here = |content: &str| {
+        parse_references(content)
+            .iter()
+            .any(|r| names.contains(&r.target.trim().to_lowercase()))
+            || parse_block_refs(content)
+                .iter()
+                .any(|(_, id)| ids.contains(id))
+    };
     let mut groups = Vec::new();
     for (page_ix, page) in pages.iter().enumerate() {
-        if page.title.to_lowercase() == wanted {
+        if page_ix == target || page.title.to_lowercase() == wanted {
             continue;
         }
         let blocks: Vec<usize> = page
             .blocks
             .iter()
             .enumerate()
-            .filter(|(_, b)| {
-                parse_references(&b.content)
-                    .iter()
-                    .any(|r| r.target.to_lowercase() == wanted)
-            })
+            .filter(|(_, b)| links_here(&b.content))
             .map(|(i, _)| i)
             .collect();
         if !blocks.is_empty() {
@@ -1252,7 +1324,7 @@ mod tests {
             Page::from_markdown("C", false, "- [[Other]]\n  - deep [[ TARGET ]]\n"),
         ];
         assert_eq!(
-            backlinks(&pages, "Target"),
+            backlinks(&pages, 1),
             vec![
                 BacklinkGroup {
                     page: 0,
@@ -1264,7 +1336,39 @@ mod tests {
                 },
             ]
         );
-        assert!(backlinks(&pages, "Nobody").is_empty());
+        assert!(backlinks(&pages, 2).is_empty());
+        assert!(backlinks(&pages, 99).is_empty());
+    }
+
+    #[test]
+    fn backlinks_include_block_references_once() {
+        let id = "6f9b2c1e-0000-4000-8000-000000000001";
+        let pages = vec![
+            Page::from_markdown(
+                "Target",
+                false,
+                &format!("- the plan\n  id:: {id}\n- own (({id}))\n"),
+            ),
+            Page::from_markdown("A", false, &format!("- see (({id}))\n- none\n")),
+            // A wikilink and a block reference in one block: listed once.
+            Page::from_markdown("B", false, &format!("- [[Target]] and (({id}))\n")),
+            // A reference to a block that isn't on Target.
+            Page::from_markdown("C", false, "- ((6f9b2c1e-0000-4000-8000-000000000002))\n"),
+        ];
+        assert_eq!(pages[0].blocks[0].id.to_string(), id);
+        assert_eq!(
+            backlinks(&pages, 0),
+            vec![
+                BacklinkGroup {
+                    page: 1,
+                    blocks: vec![0]
+                },
+                BacklinkGroup {
+                    page: 2,
+                    blocks: vec![0]
+                },
+            ]
+        );
     }
 
     fn refs(text: &str) -> Vec<(String, bool)> {
@@ -1356,7 +1460,7 @@ mod tests {
             Page::from_markdown("Target", false, "- x\n"),
         ];
         assert_eq!(
-            backlinks(&pages, "Target"),
+            backlinks(&pages, 1),
             vec![BacklinkGroup {
                 page: 0,
                 blocks: vec![0]
@@ -1582,5 +1686,61 @@ mod tests {
         let mut empty = Page::new("e", false);
         assert_eq!(empty.push_block("x".into()), 0);
         assert_eq!(empty.to_markdown(), "- x\n");
+    }
+
+    #[test]
+    fn page_aliases_come_from_the_first_block() {
+        let page = Page::from_markdown(
+            "JavaScript",
+            false,
+            "alias:: JS, [[ECMAScript]] ,, js\nALIAS:: javascript, Node\n\n- body\n- alias:: Ignored\n",
+        );
+        assert_eq!(page_aliases(&page), vec!["JS", "ECMAScript", "Node"]);
+        // As a bullet too, which is how a save writes it back.
+        let page = Page::from_markdown("P", false, "- alias:: Q\n  more text\n");
+        assert_eq!(page_aliases(&page), vec!["Q"]);
+        assert!(page_aliases(&Page::from_markdown("P", false, "- aliasing:: x\n")).is_empty());
+        assert!(page_aliases(&Page::new("Empty", false)).is_empty());
+    }
+
+    #[test]
+    fn resolve_page_prefers_titles_then_first_alias() {
+        let pages = vec![
+            Page::from_markdown("JavaScript", false, "- alias:: JS, Web\n"),
+            Page::from_markdown("Web", false, "- the real web page\n"),
+            Page::from_markdown("Script", false, "- alias:: js\n"),
+        ];
+        assert_eq!(resolve_page(&pages, "javascript"), Some(0));
+        assert_eq!(
+            resolve_page(&pages, " js "),
+            Some(0),
+            "first page claiming it"
+        );
+        assert_eq!(resolve_page(&pages, "WEB"), Some(1), "a real title wins");
+        assert_eq!(resolve_page(&pages, "nobody"), None);
+    }
+
+    #[test]
+    fn backlinks_follow_aliases_that_resolve() {
+        let pages = vec![
+            Page::from_markdown("JavaScript", false, "- alias:: JS, Web\n"),
+            Page::from_markdown("A", false, "- uses [[js]]\n- and #JS\n- see [[Web]]\n"),
+            Page::from_markdown("Web", false, "- the real web page\n"),
+        ];
+        // [[Web]] means the page called Web, not JavaScript's alias.
+        assert_eq!(
+            backlinks(&pages, 0),
+            vec![BacklinkGroup {
+                page: 1,
+                blocks: vec![0, 1]
+            }]
+        );
+        assert_eq!(
+            backlinks(&pages, 2),
+            vec![BacklinkGroup {
+                page: 1,
+                blocks: vec![2]
+            }]
+        );
     }
 }

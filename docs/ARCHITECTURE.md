@@ -912,6 +912,57 @@ that mutate, and data races are essentially impossible.
     Shift+Enter adds no line break, Up / Down don't move between lines,
     and Ctrl+V pastes text only and never saves an image. The sidebar's
     reorder line is `page_drop_line`, so it doesn't shadow `ui::drop_line`.
+34. **Global search is the palette in a second mode, with exact matches.**
+    Ctrl+Shift+F (or the palette's *Search all pages*) opens the Ctrl-K
+    overlay with `SearchState.global` set, so it reuses the query box,
+    arrow keys, Enter, Esc and mouse handling as they are; only where the
+    results come from and how a row is drawn differ. `search::search_text`
+    is a substring search ignoring case (`find_ignore_case` compares
+    character by character, so offsets stay on the text's own char
+    boundaries), not the fuzzy match: across hundreds of pages, scattered
+    letters match nearly everything. It lists page titles that contain
+    the query first (whole title, then title prefix, then anywhere), then
+    one result per matching *line* of a block, in page and document
+    order, journals included, at most 100. A line result is a
+    `Target::Match` holding the byte range in the block's `content`, and
+    the row shows the page title over the matching line (`search::snippet`:
+    indentation dropped, cut to about 90 characters around the match with
+    "…", the match in bold accent). Enter or a click opens the page in a
+    tab and edits the block with the match *selected*: that is the
+    highlight, and it uses the editor's own selection, so there is no
+    extra state to clear. Searching scans every block on each keystroke;
+    like backlinks, an index can come later if it is ever slow.
+35. **"Linked from" covers block references too, and is always shown.**
+    `model::backlinks` takes the page (an index) instead of a title, so
+    besides `[[Title]]` and `#Title` it can also match `((id))` references
+    to any of that page's blocks; a block that does both is listed once,
+    and the page's own blocks never count. Every page ends with the
+    "Linked from" section: a page row per linking page (click opens it)
+    and a row per linking block (click opens its page and unfolds down to
+    it), with the page and reference counts, or "No other page links here
+    yet." The block rows show reading text (`DisplayBlock::with_refs`), so
+    a block reference reads as the text it points at, not `((uuid))`. It
+    is still a full scan per render, as before.
+
+36. **Page aliases are read from the page, not stored anywhere else.**
+    A page declares other names with an `alias::` line in its first block
+    (`alias:: JS, [[ECMAScript]]`, comma-separated; the key ignores case).
+    `model::page_aliases` reads them on demand and `model::resolve_page`
+    turns a link name into a page: a real title first, then the first
+    page (in order) claiming the alias, so an alias never steals a link
+    from a page that really has that name. Everything that follows links
+    goes through it: `navigate` (so clicking `[[JS]]` opens JavaScript
+    and committing the block creates no "JS" page), "Linked from", the
+    graph's edges and global search (an alias match ranks like a title
+    match, one hit per page). Typing `[[` now opens a page picker in the
+    same place as the `((` block picker (the same code, `RefKind`/
+    `RefItem`; whichever was typed last wins): it fuzzy-matches titles
+    and aliases, shows "alias: X" when an alias matched, and inserts the
+    real title, taking in a `]]` that's already after the cursor. Links
+    keep the alias text you typed by hand; nothing rewrites them. The
+    Ctrl-K palette still matches titles only. Reading aliases per lookup
+    is a scan over pages, like backlinks; fine at this size.
+
 37. **Trash: deleting moves the file to `.trash/`; restore, delete
     forever, empty** (34-36 are the pages track's). *Layout*: one folder
     per deleted page, `<graph>/.trash/<millis>/<relative path>`, e.g.

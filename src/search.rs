@@ -5,10 +5,15 @@
 //! each other (`fbr` matches `Foo Bar`). Matches are scored so that tighter,
 //! earlier, word-aligned matches rank higher.
 //!
+//! Global search (Ctrl+Shift+F, `search_text`) is different: plain
+//! substring matching, ignoring case, over every line of every page and
+//! journal, so it finds exact words rather than scattered letters.
+//!
 //! This module is pure (no UI, no I/O), so it is easy to unit-test.
 
 use crate::commands::Command;
-use crate::model::Page;
+use crate::model::{page_aliases, resolve_page, Page};
+use std::ops::Range;
 use uuid::Uuid;
 
 /// Only the first this-many characters of a block are searched. Keeps the cost
@@ -123,6 +128,14 @@ pub enum Target {
     Command(Command),
     /// A template, by index into the list given to `search_templates`.
     Template(usize),
+    /// A global search match: the byte range `start..end` of the block's
+    /// `content` (page and block are indices, as in `Block`).
+    Match {
+        page: usize,
+        block: usize,
+        start: usize,
+        end: usize,
+    },
 }
 
 impl Target {
@@ -256,6 +269,183 @@ pub fn search_templates(names: &[&str], query: &str, limit: usize) -> Vec<Hit> {
     hits.sort_by(|a, b| b.score.cmp(&a.score));
     hits.truncate(limit);
     hits
+}
+
+/// The byte range of the first occurrence of `needle` in `haystack`,
+/// ignoring case (character by character, so offsets always fall on
+/// `haystack`'s own char boundaries even where lowercasing would change a
+/// character's length). An empty needle matches nothing.
+pub fn find_ignore_case(haystack: &str, needle: &str) -> Option<Range<usize>> {
+    if needle.is_empty() {
+        return None;
+    }
+    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    'start: for (start, _) in haystack.char_indices() {
+        let mut rest = haystack[start..].char_indices();
+        let mut end = start;
+        for n in needle.chars() {
+            match rest.next() {
+                Some((i, h)) if same(h, n) => end = start + i + h.len_utf8(),
+                _ => continue 'start,
+            }
+        }
+        return Some(start..end);
+    }
+    None
+}
+
+/// How a page title matches a global search query: the whole title, its
+/// start, or somewhere inside. Higher ranks first.
+fn title_rank(title: &str, query: &str) -> Option<i32> {
+    let range = find_ignore_case(title, query)?;
+    Some(if range == (0..title.len()) {
+        3
+    } else if range.start == 0 {
+        2
+    } else {
+        1
+    })
+}
+
+/// Global search: every page (journals included) whose title, or one of
+/// whose aliases (`alias::`, where it resolves to that page), contains
+/// `query`, then every line of every block that contains it, ignoring case.
+/// A page is listed once, ranked by its best-matching name.
+///
+/// Title matches come first, whole-title matches before prefix matches
+/// before the rest; body matches follow in page and document order, one
+/// per matching line (its first occurrence), as `Target::Match`. At most
+/// `limit` results; an empty (or all-blank) query finds nothing.
+pub fn search_text(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<Hit> = pages
+        .iter()
+        .enumerate()
+        .filter_map(|(page, p)| {
+            let alias_rank = page_aliases(p)
+                .iter()
+                .filter(|a| resolve_page(pages, a) == Some(page))
+                .filter_map(|a| title_rank(a, query))
+                .max();
+            title_rank(&p.title, query)
+                .max(alias_rank)
+                .map(|score| Hit {
+                    target: Target::Page(page),
+                    score,
+                })
+        })
+        .collect();
+    // Stable: equal ranks keep page order.
+    hits.sort_by(|a, b| b.score.cmp(&a.score));
+    'pages: for (page, p) in pages.iter().enumerate() {
+        for (block, b) in p.blocks.iter().enumerate() {
+            let mut offset = 0;
+            for line in b.content.split('\n') {
+                if hits.len() >= limit {
+                    break 'pages;
+                }
+                if let Some(r) = find_ignore_case(line, query) {
+                    hits.push(Hit {
+                        target: Target::Match {
+                            page,
+                            block,
+                            start: offset + r.start,
+                            end: offset + r.end,
+                        },
+                        score: 0,
+                    });
+                }
+                offset += line.len() + 1;
+            }
+        }
+    }
+    hits.truncate(limit);
+    hits
+}
+
+/// Pages for the `[[` link picker, best first: each page whose title or
+/// alias fuzzy-matches `query`, once, with the alias when that is what
+/// matched better (the picker shows it, and inserts the page's real
+/// title). An alias that resolves to another page (a real title, or an
+/// earlier claim) is skipped. With an empty query, the first `limit`
+/// pages in the given order.
+pub fn search_link_pages(
+    pages: &[Page],
+    query: &str,
+    limit: usize,
+) -> Vec<(usize, Option<String>)> {
+    let query = query.trim();
+    let mut hits: Vec<(i32, usize, Option<String>)> = Vec::new();
+    for (ix, page) in pages.iter().enumerate() {
+        let mut best = fuzzy_score(query, &page.title).map(|s| (s, None));
+        for alias in page_aliases(page) {
+            if resolve_page(pages, &alias) != Some(ix) {
+                continue;
+            }
+            if let Some(score) = fuzzy_score(query, &alias) {
+                if best.as_ref().is_none_or(|(b, _)| score > *b) {
+                    best = Some((score, Some(alias)));
+                }
+            }
+        }
+        if let Some((score, alias)) = best {
+            hits.push((score, ix, alias));
+        }
+    }
+    // Stable: ties (and an empty query) keep page order.
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.into_iter()
+        .take(limit)
+        .map(|(_, ix, alias)| (ix, alias))
+        .collect()
+}
+
+/// What a global search result shows for a match: the line of `content`
+/// holding `range`, without its indentation, and cut to about `max`
+/// characters around the match ("…" marks a cut end). Returns that text and
+/// where the match is in it.
+pub fn snippet(content: &str, range: Range<usize>, max: usize) -> (String, Range<usize>) {
+    let line_start = content[..range.start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = content[range.end..]
+        .find('\n')
+        .map_or(content.len(), |i| range.end + i);
+    let line = &content[line_start..line_end];
+    let indent = line.len() - line.trim_start().len();
+    // The match itself is never cut.
+    let mut from = (line_start + indent).min(range.start);
+    let mut to = line_end;
+    let chars = |a: usize, b: usize| content[a..b].chars().count();
+    let matched = chars(range.start, range.end);
+    if chars(from, to) > max {
+        // A third of the room before the match, the rest after it.
+        let room = max.saturating_sub(matched);
+        let before = (room / 3).min(chars(from, range.start));
+        let after = room - before;
+        from = content[..range.start]
+            .char_indices()
+            .rev()
+            .take(before)
+            .last()
+            .map_or(range.start, |(i, _)| i)
+            .max(from);
+        to = content[range.end..]
+            .char_indices()
+            .nth(after)
+            .map_or(line_end, |(i, _)| range.end + i)
+            .min(line_end);
+    }
+    let lead = if from > line_start + indent {
+        "…"
+    } else {
+        ""
+    };
+    let tail = if to < line_end { "…" } else { "" };
+    let text = format!("{lead}{}{tail}", &content[from..to]);
+    let start = lead.len() + range.start - from;
+    (text, start..start + range.end - range.start)
 }
 
 #[cfg(test)]
@@ -465,5 +655,163 @@ mod tests {
             .collect();
         assert!(targets.contains(&Target::Command(Command::OpenAgenda)));
         assert!(!targets.contains(&Target::Command(Command::NewPage)));
+    }
+
+    fn page(title: &str, markdown: &str) -> Page {
+        Page::from_markdown(title, false, markdown)
+    }
+
+    #[test]
+    fn find_ignore_case_returns_original_offsets() {
+        assert_eq!(find_ignore_case("Hello World", "world"), Some(6..11));
+        assert_eq!(find_ignore_case("ÜBER über", "über"), Some(0..5));
+        assert_eq!(find_ignore_case("aÄb", "äB"), Some(1..4));
+        assert_eq!(find_ignore_case("abc", "abcd"), None);
+        assert_eq!(find_ignore_case("abc", ""), None);
+        assert_eq!(find_ignore_case("aab", "ab"), Some(1..3));
+    }
+
+    #[test]
+    fn global_search_ranks_titles_above_body_matches() {
+        let pages = [
+            page("Notes on rust", "- nothing here\n"),
+            page("Garden", "- water the plants\n- Rust on the shed\n"),
+            page("Rust", "- the language\n"),
+            page("Rusty tools", "- old saw\n  rust everywhere\n"),
+        ];
+        let hits = search_text(&pages, "  rust ", 20);
+        let targets: Vec<Target> = hits.iter().map(|h| h.target).collect();
+        assert_eq!(
+            targets,
+            vec![
+                Target::Page(2), // whole title
+                Target::Page(3), // title prefix
+                Target::Page(0), // inside the title
+                Target::Match {
+                    page: 1,
+                    block: 1,
+                    start: 0,
+                    end: 4
+                },
+                // Second line of a multi-line block: offset into content.
+                Target::Match {
+                    page: 3,
+                    block: 0,
+                    start: 8,
+                    end: 12
+                },
+            ]
+        );
+        assert_eq!(&pages[3].blocks[0].content[8..12], "rust");
+        assert!(search_text(&pages, "   ", 20).is_empty());
+        assert!(search_text(&pages, "nowhere at all", 20).is_empty());
+        assert_eq!(search_text(&pages, "rust", 2).len(), 2);
+    }
+
+    #[test]
+    fn global_search_is_a_substring_search_one_hit_per_line() {
+        let pages = [page("A", "- ab ab\n  xab\n- a b\n")];
+        let hits = search_text(&pages, "ab", 20);
+        // Not fuzzy: "a b" doesn't match; one hit per line, first occurrence.
+        assert_eq!(
+            hits.iter().map(|h| h.target).collect::<Vec<_>>(),
+            vec![
+                Target::Match {
+                    page: 0,
+                    block: 0,
+                    start: 0,
+                    end: 2
+                },
+                Target::Match {
+                    page: 0,
+                    block: 0,
+                    start: 7,
+                    end: 9
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn snippet_shows_the_matching_line_around_the_match() {
+        let content = "first line\n    second line with the needle in it\nthird";
+        let start = content.find("needle").unwrap();
+        let (text, r) = snippet(content, start..start + 6, 80);
+        assert_eq!(text, "second line with the needle in it");
+        assert_eq!(&text[r], "needle");
+
+        // Long lines are cut around the match, marked with "…".
+        let long = format!("{} needle {}", "é".repeat(100), "x".repeat(100));
+        let start = long.find("needle").unwrap();
+        let (text, r) = snippet(&long, start..start + 6, 40);
+        assert_eq!(&text[r.clone()], "needle");
+        assert!(text.starts_with('…') && text.ends_with('…'), "{text}");
+        assert!(text.chars().count() <= 42, "{text}");
+        assert_eq!(
+            text[..r.start].chars().count(),
+            1 + 11,
+            "a third of the room before"
+        );
+
+        // A match at the very start of a long line: nothing cut before it.
+        let start_hit = format!("needle {}", "y".repeat(200));
+        let (text, r) = snippet(&start_hit, 0..6, 30);
+        assert_eq!(r, 0..6);
+        assert!(text.starts_with("needle") && text.ends_with('…'));
+    }
+
+    #[test]
+    fn global_search_finds_pages_by_alias() {
+        let pages = [
+            page("JavaScript", "- alias:: JS, Web\n- body\n"),
+            page("Web", "- the real web page\n"),
+            page("Notes", "- js tips\n"),
+        ];
+        let hits = search_text(&pages, "js", 20);
+        let targets: Vec<Target> = hits.iter().map(|h| h.target).collect();
+        // The alias is a whole-name match, ranked like a title; the alias
+        // line itself and Notes' text are ordinary line matches.
+        assert_eq!(
+            targets,
+            vec![
+                Target::Page(0),
+                Target::Match {
+                    page: 0,
+                    block: 0,
+                    start: 8,
+                    end: 10
+                },
+                Target::Match {
+                    page: 2,
+                    block: 0,
+                    start: 0,
+                    end: 2
+                },
+            ]
+        );
+        // "Web" is a real page: JavaScript's alias doesn't claim it.
+        let hits = search_text(&pages, "web", 20);
+        assert_eq!(hits[0].target, Target::Page(1));
+        assert!(!hits.iter().any(|h| h.target == Target::Page(0)));
+    }
+
+    #[test]
+    fn link_picker_matches_titles_and_aliases_once() {
+        let pages = [
+            page("JavaScript", "- alias:: JS, Web\n"),
+            page("Web", "- real\n"),
+            page("Jazz", "- music\n"),
+        ];
+        assert_eq!(
+            search_link_pages(&pages, "js", 8),
+            vec![(0, Some("JS".to_string()))]
+        );
+        // The title matches better than any alias: no alias shown.
+        assert_eq!(search_link_pages(&pages, "javas", 8), vec![(0, None)]);
+        // "Web" belongs to the real page.
+        assert_eq!(search_link_pages(&pages, "web", 8), vec![(1, None)]);
+        // Empty query: pages in order, limited.
+        assert_eq!(search_link_pages(&pages, "", 2), vec![(0, None), (1, None)]);
+        assert_eq!(search_link_pages(&pages, "ja", 8).len(), 2);
     }
 }

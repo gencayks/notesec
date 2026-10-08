@@ -16,10 +16,12 @@ use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::hotkeys::{self, effective_shortcuts, KeyChoice, KeyOwner, Overrides};
 use crate::model::{
-    backlinks, cycle_task, find_block, parse_block_refs, parse_query, parse_references, tag_counts,
-    tag_query, BlockKind, Page, TaskState,
+    backlinks, cycle_task, find_block, parse_block_refs, parse_query, parse_references,
+    resolve_page, tag_counts, tag_query, BlockKind, Page, TaskState,
 };
-use crate::search::{search, search_blocks, search_templates, Hit, Target};
+use crate::search::{
+    search, search_blocks, search_link_pages, search_templates, search_text, snippet, Hit, Target,
+};
 use crate::state::UiState;
 use crate::storage::{today_title, validate_title, Storage, Template, TrashEntry};
 use crate::table::{parse_table, Align};
@@ -74,6 +76,7 @@ actions!(
         NextTab,
         PrevTab,
         ToggleSearch,
+        SearchAllPages,
         NewPage,
         OpenToday,
         Undo,
@@ -185,6 +188,7 @@ pub fn shortcuts() -> Vec<Shortcut> {
     vec![
         // Global (no context): work whether or not a block is being edited.
         s("ctrl-k",         ToggleSearch,  None, Navigation, "Search pages, blocks and commands"),
+        s("ctrl-shift-f",   SearchAllPages, None, Navigation, "Search the text of every page and journal"),
         s("ctrl-j",         OpenToday,     None, Navigation, "Open today's journal"),
         s("ctrl-n",         NewPage,       None, Navigation, "New page"),
         s("up",             Up,            ed,   Navigation, "Block above / below (or palette result)"),
@@ -350,9 +354,34 @@ enum Nav {
     Tab,
 }
 
+/// Which reference picker is open while editing (see `NoteSec::ref_query`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefKind {
+    /// `((query`: pick a block to reference.
+    Block,
+    /// `[[query`: pick a page to link to.
+    Page,
+}
+
+/// One entry of a reference picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RefItem {
+    /// A block, as `(page, block)` indices.
+    Block(usize, usize),
+    /// A page, with the alias it was found by (if that, not its title,
+    /// matched the query).
+    Page(usize, Option<String>),
+}
+
 /// How many page and block results the search overlay shows (commands
 /// come on top of these with an empty query).
 const MAX_RESULTS: usize = 12;
+
+/// How many results global search lists (titles first, then lines).
+const MAX_TEXT_RESULTS: usize = 100;
+
+/// Longest snippet (in characters) a global search result shows.
+const SNIPPET_CHARS: usize = 90;
 
 /// Height of the palette's scrolling result list.
 const PALETTE_LIST_HEIGHT: f32 = 440.0;
@@ -377,6 +406,10 @@ struct SearchState {
     /// The result list scrolls (an empty query lists every command); arrow
     /// keys keep the highlighted row in view through this.
     scroll: ScrollHandle,
+    /// Global search (Ctrl+Shift+F): the same overlay, but the results are
+    /// `search_text`'s exact matches in titles and text, not fuzzy pages,
+    /// blocks and commands.
+    global: bool,
 }
 
 const MAX_HISTORY: usize = 100;
@@ -471,6 +504,9 @@ struct PageView {
     /// The reading-view text layouts by block, for tests (focused pane only).
     #[cfg(test)]
     layouts: Vec<(usize, gpui::TextLayout)>,
+    /// The "Linked from" rows' reading text, for tests.
+    #[cfg(test)]
+    backlink_texts: Vec<String>,
 }
 
 /// Debug selector prefix for the unfocused pane's page (`other-block-0`).
@@ -606,12 +642,13 @@ pub struct NoteSec {
     slash: Option<SlashState>,
     /// `Some` while the settings panel is open.
     settings: Option<SettingsState>,
-    /// The `((` block-reference picker's highlighted entry, with the
-    /// `((query` range it was chosen in (typing changes the range, which
-    /// starts again from the top). The picker itself shows whenever
-    /// `block_ref_query` finds a query; see `ref_query`.
+    /// The reference picker's highlighted entry (the `((` block picker or
+    /// the `[[` page picker), with the `((query` / `[[query` range it was
+    /// chosen in (typing changes the range, which starts again from the
+    /// top). The picker itself shows whenever `block_ref_query` or
+    /// `link_query` finds a query; see `ref_query`.
     ref_selected: (Range<usize>, usize),
-    /// Esc closed the picker for the `((` at this offset.
+    /// Esc closed the picker for the `((` or `[[` at this offset.
     ref_dismissed: Option<usize>,
     /// `Some` while a page's context menu (or its rename / delete step) is
     /// open.
@@ -668,6 +705,10 @@ pub struct NoteSec {
     /// The same for the unfocused pane while split (decision 40).
     #[cfg(test)]
     other_layouts: Vec<(usize, gpui::TextLayout)>,
+    /// The focused pane's "Linked from" rows' text from the last render,
+    /// for tests.
+    #[cfg(test)]
+    backlink_texts: Vec<String>,
     /// Monospace font for code blocks: the first of `MONO_FONTS` installed.
     mono_font: Option<SharedString>,
     /// The code block (block id, its number in the block) under the mouse;
@@ -817,6 +858,8 @@ impl NoteSec {
             reading_layouts: Vec::new(),
             #[cfg(test)]
             other_layouts: Vec::new(),
+            #[cfg(test)]
+            backlink_texts: Vec::new(),
             mono_font,
             hovered_code: None,
             copied_code: None,
@@ -1328,6 +1371,7 @@ impl NoteSec {
             resume: None,
             templates: Some(self.storage.load_templates()),
             scroll: ScrollHandle::new(),
+            global: false,
         });
         cx.notify();
     }
@@ -1370,6 +1414,7 @@ impl NoteSec {
                 let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
                 search_templates(&names, &query.text, MAX_RESULTS)
             }
+            Some(s) if s.global => search_text(&self.pages, &s.query.text, MAX_TEXT_RESULTS),
             Some(s) => search(
                 &self.pages,
                 &self.available_commands(),
@@ -1417,6 +1462,36 @@ impl NoteSec {
             resume,
             templates: None,
             scroll: ScrollHandle::new(),
+            global: false,
+        });
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+F: open global search, or close it if it is open. From the
+    /// Ctrl-K palette it switches over (the query starts empty).
+    fn search_all_pages(
+        &mut self,
+        _: &SearchAllPages,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search.as_ref().is_some_and(|s| s.global) {
+            self.close_search(cx);
+            return;
+        }
+        self.stop_edit(cx);
+        self.settings = None;
+        self.page_menu = None;
+        self.shortcuts_open = false;
+        self.search = Some(SearchState {
+            query: EditorState::default(),
+            selected: 0,
+            insert_after: None,
+            resume: None,
+            templates: None,
+            scroll: ScrollHandle::new(),
+            global: true,
         });
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -1604,6 +1679,26 @@ impl NoteSec {
                 self.navigate(&title, Nav::Tab, cx);
                 if block < self.pages[self.selected].blocks.len() {
                     self.start_edit(block, window, cx);
+                }
+            }
+            // Edit the block with the match selected, so it shows highlighted
+            // (and typing replaces it, as with any selection).
+            Target::Match {
+                page,
+                block,
+                start,
+                end,
+            } => {
+                let title = self.pages[page].title.clone();
+                self.navigate(&title, Nav::Tab, cx);
+                let blocks = &self.pages[self.selected].blocks;
+                if block < blocks.len() {
+                    let valid = blocks[block].content.get(start..end).is_some();
+                    self.start_edit(block, window, cx);
+                    if valid {
+                        self.editor.anchor = Some(start);
+                        self.editor.cursor = end;
+                    }
                 }
             }
             // Keeps the palette open, now listing templates (after the
@@ -1944,35 +2039,59 @@ impl NoteSec {
         cx.notify();
     }
 
-    // --- "((" block-reference picker ----------------------------------------
+    // --- "((" block-reference and "[[" page-link pickers ----------------------
 
-    /// The `((query` range the picker is open for, if it is: while editing a
-    /// block (and no other menu or overlay is up), unless Esc closed it.
-    fn ref_query(&self) -> Option<Range<usize>> {
+    /// The `((query` or `[[query` range the picker is open for, if it is,
+    /// and which picker: while editing a block (and no other menu or
+    /// overlay is up), unless Esc closed it. When both could apply (a `((`
+    /// inside a `[[`, say), the one typed last wins.
+    fn ref_query(&self) -> Option<(Range<usize>, RefKind)> {
         self.editing?;
         if self.search.is_some() || self.slash.is_some() || self.settings.is_some() {
             return None;
         }
-        let range = self.editor.block_ref_query()?;
-        (self.ref_dismissed != Some(range.start)).then_some(range)
+        let block = self.editor.block_ref_query().map(|r| (r, RefKind::Block));
+        let page = self.editor.link_query().map(|r| (r, RefKind::Page));
+        let (range, kind) = match (block, page) {
+            (Some(b), Some(p)) => {
+                if p.0.start > b.0.start {
+                    p
+                } else {
+                    b
+                }
+            }
+            (b, p) => b.or(p)?,
+        };
+        (self.ref_dismissed != Some(range.start)).then_some((range, kind))
     }
 
-    /// Blocks the open picker lists, as `(page, block)`; empty when closed.
-    fn ref_matches(&self) -> Vec<(usize, usize)> {
-        let Some(range) = self.ref_query() else {
+    /// What the open picker lists; empty when closed.
+    fn ref_matches(&self) -> Vec<RefItem> {
+        let Some((range, kind)) = self.ref_query() else {
             return Vec::new();
         };
         let query = &self.editor.text[range.start + 2..range.end];
-        let editing_id = self
-            .editing
-            .map(|ix| self.pages[self.selected].blocks[ix].id);
-        search_blocks(&self.pages, query, editing_id, 8)
+        match kind {
+            RefKind::Block => {
+                let editing_id = self
+                    .editing
+                    .map(|ix| self.pages[self.selected].blocks[ix].id);
+                search_blocks(&self.pages, query, editing_id, 8)
+                    .into_iter()
+                    .map(|(page, block)| RefItem::Block(page, block))
+                    .collect()
+            }
+            RefKind::Page => search_link_pages(&self.pages, query, 8)
+                .into_iter()
+                .map(|(page, alias)| RefItem::Page(page, alias))
+                .collect(),
+        }
     }
 
     /// The picker's highlighted entry, for the current query.
     fn ref_highlight(&self) -> usize {
         match self.ref_query() {
-            Some(range) if self.ref_selected.0 == range => self.ref_selected.1,
+            Some((range, _)) if self.ref_selected.0 == range => self.ref_selected.1,
             _ => 0,
         }
     }
@@ -1985,32 +2104,47 @@ impl NoteSec {
 
     fn move_ref_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.ref_matches().len();
-        if let (Some(range), true) = (self.ref_query(), count > 0) {
+        if let (Some((range, _)), true) = (self.ref_query(), count > 0) {
             let selected = (self.ref_highlight() as isize + delta).clamp(0, count as isize - 1);
             self.ref_selected = (range, selected as usize);
         }
         cx.notify();
     }
 
-    /// Replace the typed `((query` with a reference to block `target`
-    /// (`(page, block)`): `((<its id>))`, cursor after it. One undo step;
-    /// saved right away, which also writes the target's id to its page (see
-    /// `save_page`).
-    fn insert_block_ref(&mut self, target: (usize, usize), cx: &mut Context<Self>) {
-        let Some(range) = self.ref_query() else {
+    /// Replace the typed query with the picked entry, cursor after it: a
+    /// block becomes `((<its id>))`, a page `[[<its title>]]` (its real
+    /// title even when an alias matched; a `]]` already right after the
+    /// cursor is taken in, not doubled). One undo step; saved right away,
+    /// which also writes a block's id to its page (see `save_page`).
+    fn insert_ref(&mut self, item: RefItem, cx: &mut Context<Self>) {
+        let Some((mut range, _)) = self.ref_query() else {
             return;
         };
-        let Some(id) = self
-            .pages
-            .get(target.0)
-            .and_then(|page| page.blocks.get(target.1))
-            .map(|b| b.id)
-        else {
-            return;
+        let text = match item {
+            RefItem::Block(page, block) => {
+                let Some(id) = self
+                    .pages
+                    .get(page)
+                    .and_then(|page| page.blocks.get(block))
+                    .map(|b| b.id)
+                else {
+                    return;
+                };
+                format!("(({id}))")
+            }
+            RefItem::Page(page, _) => {
+                let Some(page) = self.pages.get(page) else {
+                    return;
+                };
+                if self.editor.text[range.end..].starts_with("]]") {
+                    range.end += 2;
+                }
+                format!("[[{}]]", page.title)
+            }
         };
         self.text_history_active = false;
         let before = self.history_state();
-        self.editor.replace_range(range, &format!("(({id}))"));
+        self.editor.replace_range(range, &text);
         self.record_state(before);
         self.sync_content();
         self.save_page();
@@ -2090,6 +2224,13 @@ impl NoteSec {
             .position(|p| p.title.to_lowercase() == wanted)
     }
 
+    /// The page a `[[link]]` (or `#tag`) to `name` goes to: the page with
+    /// that title, else the first page declaring it as an `alias::` (see
+    /// `model::resolve_page`).
+    fn link_target(&self, name: &str) -> Option<usize> {
+        resolve_page(&self.pages, name)
+    }
+
     /// Add a page, keeping the sidebar sorted and `selected` pointing at the
     /// same page as before (sorting can shift indices). With a custom order
     /// the new page goes at the end of it.
@@ -2122,7 +2263,7 @@ impl NoteSec {
     }
 
     /// Create (and save) a page for every `[[link]]` on the selected page that
-    /// doesn't have one yet.
+    /// doesn't have one yet (a link to an alias has one).
     fn ensure_link_targets(&mut self) {
         let targets: Vec<String> = self.pages[self.selected]
             .blocks
@@ -2131,7 +2272,7 @@ impl NoteSec {
             .map(|link| link.target)
             .collect();
         for target in targets {
-            if self.find_page(&target).is_none() {
+            if self.link_target(&target).is_none() {
                 let page = Page::with_empty_block(&target);
                 if let Err(err) = self.storage.save(&page) {
                     eprintln!("notesec: failed to create page {target}: {err}");
@@ -2148,13 +2289,13 @@ impl NoteSec {
         self.navigate(title, Nav::Replace, cx);
     }
 
-    /// Show the page called `title`, creating it if needed, in a tab as
-    /// `nav` says.
+    /// Show the page called `title` (or that has it as an alias), creating
+    /// it if needed, in a tab as `nav` says.
     fn navigate(&mut self, title: &str, nav: Nav, cx: &mut Context<Self>) {
         // Leave edit mode first so the block being edited is saved (which may
         // itself create pages and reorder the sidebar).
         self.stop_edit(cx);
-        let ix = match self.find_page(title) {
+        let ix = match self.link_target(title) {
             Some(ix) => ix,
             None => {
                 let page = Page::with_empty_block(title);
@@ -3128,8 +3269,8 @@ impl NoteSec {
             }
             return;
         }
-        if let Some(&target) = self.ref_matches().get(self.ref_highlight()) {
-            self.insert_block_ref(target, cx);
+        if let Some(item) = self.ref_matches().get(self.ref_highlight()).cloned() {
+            self.insert_ref(item, cx);
             return;
         }
         let Some(ix) = self.editing else { return };
@@ -3676,7 +3817,7 @@ impl NoteSec {
             self.close_search(cx);
         } else if self.slash.is_some() {
             self.dismiss_slash(cx);
-        } else if let (Some(range), true) = (self.ref_query(), self.ref_menu_open()) {
+        } else if let (Some((range, _)), true) = (self.ref_query(), self.ref_menu_open()) {
             self.ref_dismissed = Some(range.start);
             cx.notify();
         } else if self.editor.selection().is_some() {
@@ -4124,8 +4265,9 @@ impl EntityInputHandler for NoteSec {
             .or(self.active_editor().marked.clone())
             .unwrap_or(self.active_editor().selected_range());
         let in_block = self.search.is_none() && self.editing.is_some();
-        // Typing another "(" may start a new "((": show the picker again.
-        if new_text.contains('(') {
+        // Typing another "(" or "[" may start a new "((" or "[[": show the
+        // picker again.
+        if new_text.contains(['(', '[']) {
             self.ref_dismissed = None;
         }
         // "/" typed into an empty block, or over a selection, opens the
@@ -6193,20 +6335,28 @@ impl NoteSec {
             })
             .collect();
 
-        // --- Backlinks: blocks on other pages that link here ----------------
+        // --- Linked from: blocks on other pages that link here ---------------
         // Recomputed every frame. That is a scan of every block, which is fine
         // for a personal graph; an index can replace it if it ever shows up in
         // a profile.
-        let groups = backlinks(&self.pages, &page.title);
+        let groups = backlinks(&self.pages, page_ix);
         let total: usize = groups.iter().map(|g| g.blocks.len()).sum();
+        // Blocks are shown as in reading view, so a block reference reads as
+        // the text it points at rather than `((uuid))`.
+        let pages = &self.pages;
+        let resolve =
+            |id: Uuid| find_block(pages, id).map(|(p, b)| pages[p].blocks[b].content.clone());
         let mut backlink_items: Vec<AnyElement> = Vec::new();
+        #[cfg(test)]
+        let mut backlink_texts = Vec::new();
         let mut n: usize = 0; // running index over all references, for ids
-        for group in &groups {
+        for (g, group) in groups.iter().enumerate() {
             let source = &self.pages[group.page];
             let source_title = source.title.clone();
             backlink_items.push(
                 div()
                     .id(("backlink-page", group.page))
+                    .debug_selector(move || format!("{prefix}linked-page-{g}"))
                     .mt_2()
                     .text_color(theme.accent)
                     .cursor_pointer()
@@ -6219,6 +6369,9 @@ impl NoteSec {
             );
             for &block_ix in &group.blocks {
                 let title = source_title.clone();
+                let text = DisplayBlock::with_refs(&source.blocks[block_ix].content, &resolve).text;
+                #[cfg(test)]
+                backlink_texts.push(text.clone());
                 backlink_items.push(
                     div()
                         .id(("backlink", n))
@@ -6235,27 +6388,47 @@ impl NoteSec {
                                 this.reveal(block_ix);
                             }
                         }))
-                        .child(source.blocks[block_ix].content.clone())
+                        .child(text)
                         .into_any_element(),
                 );
                 n += 1;
             }
         }
-        let backlinks_panel = (total > 0).then(|| {
-            div()
-                .id("backlinks")
-                .mt_8()
-                .pt_4()
-                .border_t_1()
-                .border_color(theme.border)
-                .flex()
-                .flex_col()
-                .child(div().text_color(theme.muted).child(format!(
-                    "{total} LINKED REFERENCE{}",
-                    if total == 1 { "" } else { "S" }
-                )))
-                .children(backlink_items)
-        });
+        // Every page has the section; with nothing linking here it says so.
+        let pages_count = groups.len();
+        let backlinks_panel = div()
+            .id("backlinks")
+            .debug_selector(|| format!("{prefix}linked-from"))
+            .mt_8()
+            .pt_4()
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().text_color(theme.text).child("Linked from"))
+                    .when(total > 0, |d| {
+                        d.child(div().text_color(theme.muted).child(format!(
+                            "{pages_count} page{}, {total} reference{}",
+                            if pages_count == 1 { "" } else { "s" },
+                            if total == 1 { "" } else { "s" }
+                        )))
+                    }),
+            )
+            .when(total == 0, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| format!("{prefix}linked-from-empty"))
+                        .mt_1()
+                        .text_color(theme.muted)
+                        .child("No other page links here yet."),
+                )
+            })
+            .children(backlink_items);
 
         let element = div()
             .id("main")
@@ -6337,7 +6510,7 @@ impl NoteSec {
                     .size_0()
                 })
             })
-            .children(backlinks_panel)
+            .child(backlinks_panel)
             // Empty space below the blocks: clicking it leaves edit mode.
             .child(
                 div()
@@ -6350,6 +6523,8 @@ impl NoteSec {
             element: element.into_any_element(),
             #[cfg(test)]
             layouts: reading_layouts,
+            #[cfg(test)]
+            backlink_texts,
         }
     }
 }
@@ -6842,17 +7017,30 @@ impl Render for NoteSec {
                 .children(items)
         });
 
-        // --- "((" block-reference picker (same place as the "/" menu) ------
+        // --- "((" and "[[" pickers (same place as the "/" menu) -------------
         let ref_matches = self.ref_matches();
         if slash_menu.is_none() && !ref_matches.is_empty() {
             let selected = self.ref_highlight();
             let items: Vec<AnyElement> = ref_matches
                 .into_iter()
                 .enumerate()
-                .map(|(i, target)| {
-                    let page = &self.pages[target.0];
-                    let block = &page.blocks[target.1];
-                    let text = DisplayBlock::new(&block.content).text.replace('\n', " ");
+                .map(|(i, item)| {
+                    // Main text, and the muted text on the right.
+                    let (text, side) = match &item {
+                        RefItem::Block(page, block) => {
+                            let page = &self.pages[*page];
+                            let content = &page.blocks[*block].content;
+                            let text = DisplayBlock::new(content).text.replace('\n', " ");
+                            (text, page.title.clone())
+                        }
+                        RefItem::Page(page, alias) => (
+                            self.pages[*page].title.clone(),
+                            match alias {
+                                Some(alias) => format!("alias: {alias}"),
+                                None => "page".to_string(),
+                            },
+                        ),
+                    };
                     div()
                         .id(("ref-item", i))
                         .debug_selector(move || format!("ref-item-{i}"))
@@ -6868,7 +7056,7 @@ impl Render for NoteSec {
                         .when(i == selected, |d| d.bg(theme.selected_bg))
                         .hover(|d| d.bg(theme.selected_bg))
                         .on_click(cx.listener(move |this, _e, _window, cx| {
-                            this.insert_block_ref(target, cx);
+                            this.insert_ref(item.clone(), cx);
                         }))
                         .child(
                             div()
@@ -6877,12 +7065,7 @@ impl Render for NoteSec {
                                 .whitespace_nowrap()
                                 .child(text),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(theme.muted)
-                                .child(page.title.clone()),
-                        )
+                        .child(div().flex_none().text_color(theme.muted).child(side))
                         .into_any_element()
                 })
                 .collect();
@@ -6916,6 +7099,10 @@ impl Render for NoteSec {
         #[cfg(test)]
         {
             self.reading_layouts = page_view.layouts;
+        }
+        #[cfg(test)]
+        {
+            self.backlink_texts = page_view.backlink_texts;
         }
         let main = page_view.element;
 
@@ -6973,6 +7160,40 @@ impl Render for NoteSec {
                                 ),
                                 "template".into(),
                             ),
+                            // Global search: the page, then the matching line
+                            // with the match in bold accent.
+                            Target::Match {
+                                page,
+                                block,
+                                start,
+                                end,
+                            } => {
+                                let content = &self.pages[page].blocks[block].content;
+                                let (text, range) = snippet(content, start..end, SNIPPET_CHARS);
+                                let bold = HighlightStyle {
+                                    color: Some(theme.accent.into()),
+                                    font_weight: Some(FontWeight::BOLD),
+                                    ..Default::default()
+                                };
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_color(theme.muted)
+                                            .child(self.pages[page].title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .debug_selector(move || format!("snippet-{i}"))
+                                            .truncate()
+                                            .text_color(theme.text)
+                                            .child(
+                                                StyledText::new(text)
+                                                    .with_highlights([(range, bold)]),
+                                            ),
+                                    )
+                            }
                         };
                         let header = headers[i].map(|title| {
                             div()
@@ -7006,11 +7227,15 @@ impl Render for NoteSec {
             let no_results = rows.is_empty();
             // In template mode: a heading, and a hint if there are no templates.
             let picking_templates = templates.is_some();
+            let global = state.global;
             let empty_message = match templates {
                 Some([]) => format!(
                     "No templates yet: add .md files to {}",
                     self.storage.templates_dir().display()
                 ),
+                _ if global && state.query.text.trim().is_empty() => {
+                    "Type to search the text of every page and journal".to_string()
+                }
                 _ => "No results".to_string(),
             };
 
@@ -7050,6 +7275,16 @@ impl Render for NoteSec {
                                     .pt_1()
                                     .text_color(theme.muted)
                                     .child("Insert template"),
+                            )
+                        })
+                        .when(global, |d| {
+                            d.child(
+                                div()
+                                    .debug_selector(|| "global-search-heading".to_string())
+                                    .px_3()
+                                    .pt_1()
+                                    .text_color(theme.muted)
+                                    .child("Search all pages"),
                             )
                         })
                         .child(
@@ -7199,6 +7434,10 @@ impl Render for NoteSec {
                         .child(hint_row(
                             hint(&ToggleSearch),
                             "search pages, blocks and commands",
+                        ))
+                        .child(hint_row(
+                            hint(&SearchAllPages),
+                            "search the text of every page",
                         ))
                         .child(hint_row(hint(&NewPage), "new page"))
                         .child(hint_row(hint(&ToggleGraph), "graph view"))
@@ -7482,6 +7721,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_move_block_up))
             .on_action(cx.listener(Self::on_move_block_down))
             .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(Self::search_all_pages))
             .on_action(cx.listener(Self::on_new_page))
             .on_action(cx.listener(Self::on_open_today))
             .on_action(cx.listener(Self::on_undo))
@@ -13962,6 +14202,319 @@ mod tests {
                 app.settings.as_ref().map(|s| s.section),
                 Some(SettingsSection::Shortcuts)
             )
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- global search (Ctrl+Shift+F) -----------------------------------------
+
+    fn global_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- hello\n"),
+            ("Recipes", "- pasta\n- bread\n  needs Flour and water\n"),
+            ("Flour", "- types of flour\n"),
+        ]
+    }
+
+    /// The current global search results as (page title, matched text);
+    /// the matched text is `None` for a title hit.
+    fn text_hits(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(String, Option<String>)> {
+        view.update(cx, |app, _| {
+            app.search_results()
+                .iter()
+                .map(|h| match h.target {
+                    Target::Page(p) => (app.pages[p].title.clone(), None),
+                    Target::Match {
+                        page,
+                        block,
+                        start,
+                        end,
+                    } => (
+                        app.pages[page].title.clone(),
+                        Some(app.pages[page].blocks[block].content[start..end].to_string()),
+                    ),
+                    other => panic!("not a global search result: {other:?}"),
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn ctrl_shift_f_finds_text_everywhere_and_selects_the_match(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "global-search", &global_pages(), "Test");
+        // Opening it saves the block being edited, like the palette.
+        click_block(cx, 0);
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("ctrl-shift-f");
+        view.update(cx, |app, _| {
+            assert!(app.search.as_ref().is_some_and(|s| s.global));
+            assert_eq!(app.editing, None);
+        });
+        assert_eq!(file(&dir), "- hello!\n");
+        assert!(has(cx, "global-search-heading"));
+        assert!(text_hits(&view, cx).is_empty(), "nothing before typing");
+
+        // Title match first, then each matching line, ignoring case.
+        cx.simulate_input("flour");
+        assert_eq!(
+            text_hits(&view, cx),
+            vec![
+                ("Flour".to_string(), None),
+                ("Flour".to_string(), Some("flour".to_string())),
+                ("Recipes".to_string(), Some("Flour".to_string())),
+            ]
+        );
+        assert!(has(cx, "snippet-1") && has(cx, "snippet-2"));
+        assert!(!has(cx, "snippet-0"), "a title hit has no snippet");
+
+        // Enter on a line opens its page and selects the match in the block.
+        cx.simulate_keystrokes("down down enter");
+        view.update(cx, |app, _| {
+            assert!(app.search.is_none());
+            assert_eq!(app.pages[app.selected].title, "Recipes");
+            assert_eq!(app.editing, Some(1));
+            let selected = app.editor.selection().unwrap();
+            assert_eq!(&app.editor.text[selected], "Flour");
+        });
+        // It is a real selection: typing replaces it.
+        cx.simulate_input("Rye");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Recipes")).unwrap(),
+            "- pasta\n- bread\n  needs Rye and water\n"
+        );
+
+        // A title hit just opens the page.
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.simulate_input("FLOUR");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Flour");
+            assert_eq!(app.editing, None);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn global_search_opens_closes_and_comes_from_the_palette(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "global-toggle", &global_pages(), "Test");
+        let global = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| app.search.as_ref().map(|s| s.global))
+        };
+        cx.simulate_keystrokes("ctrl-shift-f");
+        assert_eq!(global(&view, cx), Some(true));
+        cx.simulate_keystrokes("ctrl-shift-f");
+        assert_eq!(global(&view, cx), None, "the key closes it again");
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.simulate_input("zzz");
+        assert!(text_hits(&view, cx).is_empty());
+        cx.simulate_keystrokes("escape");
+        assert_eq!(global(&view, cx), None);
+
+        // From the Ctrl-K palette: the key switches over, and so does the
+        // command.
+        cx.simulate_keystrokes("ctrl-k");
+        assert_eq!(global(&view, cx), Some(false));
+        cx.simulate_keystrokes("ctrl-shift-f");
+        assert_eq!(global(&view, cx), Some(true));
+        cx.simulate_keystrokes("escape");
+        run_in_palette(cx, "search all pages");
+        assert_eq!(global(&view, cx), Some(true));
+        assert!(has(cx, "global-search-heading"));
+        cx.simulate_keystrokes("escape");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn global_search_includes_journals(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_with_journal(cx, "global-journal", "- met Ada at the cafe\n");
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.simulate_input("ada");
+        assert_eq!(
+            text_hits(&view, cx),
+            vec![(today_title(), Some("Ada".to_string()))]
+        );
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, today_title());
+            assert_eq!(app.editing, Some(0));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- "Linked from" -------------------------------------------------------
+
+    #[gpui::test]
+    fn linked_from_lists_wikilinks_and_block_references(cx: &mut TestAppContext) {
+        let id = "6f9b2c1e-0000-4000-8000-0000000000aa";
+        let test = format!("- the plan\n  id:: {id}\n");
+        let alpha = format!("- see (({id})) now\n- unrelated\n");
+        let beta = format!("- [[Test]] and (({id}))\n- also [[test]]\n");
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "linked-from",
+            &[
+                ("Test", test.as_str()),
+                ("Alpha", alpha.as_str()),
+                ("Beta", beta.as_str()),
+                ("Gamma", "- nothing here\n"),
+            ],
+            "Test",
+        );
+        assert!(has(cx, "linked-from"));
+        assert!(!has(cx, "linked-from-empty"));
+        // Alpha's block reference, then Beta's two blocks (the one with
+        // both kinds of link is listed once), shown as reading text.
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.backlink_texts,
+                vec!["see the plan now", "[[Test]] and the plan", "also [[test]]"]
+            );
+        });
+        assert!(has(cx, "linked-page-0") && has(cx, "linked-page-1"));
+        assert!(!has(cx, "linked-page-2"));
+        assert!(has(cx, "backlink-2") && !has(cx, "backlink-3"));
+
+        // A page row opens that page...
+        let r = cx.debug_bounds("linked-page-1").unwrap();
+        cx.simulate_click(r.center(), Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Beta")
+        });
+        // ...which nothing links to: the section says so.
+        assert!(has(cx, "linked-from") && has(cx, "linked-from-empty"));
+        view.update(cx, |app, _| assert!(app.backlink_texts.is_empty()));
+
+        // Back on Test, a block-reference row opens the referencing page.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("Test");
+        cx.simulate_keystrokes("enter");
+        let r = cx.debug_bounds("backlink-0").unwrap();
+        cx.simulate_click(r.center(), Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Alpha")
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Pages for the alias tests: JavaScript declares JS and ECMAScript.
+    fn alias_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- \n"),
+            ("JavaScript", "- alias:: JS, ECMAScript\n- the language\n"),
+            ("Jazz", "- music\n"),
+        ]
+    }
+
+    #[gpui::test]
+    fn double_bracket_picks_a_page_by_alias_and_links_its_title(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "alias-picker", &alias_pages(), "Test");
+        let pages_before = view.update(cx, |app, _| app.pages.len());
+        click_block(cx, 0);
+        cx.simulate_input("see [[ecma");
+        assert!(has(cx, "ref-menu"));
+        let js = view.update(cx, |app, _| app.find_page("JavaScript").unwrap());
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.ref_matches(),
+                vec![RefItem::Page(js, Some("ECMAScript".to_string()))]
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(!has(cx, "ref-menu"));
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "see [[JavaScript]]");
+            assert_eq!(app.editor.cursor, app.editor.text.len());
+            assert_eq!(app.editing, Some(0), "Enter picked, no new block");
+        });
+        assert_eq!(file(&dir), "- see [[JavaScript]]\n");
+
+        // Typed inside a "[[]]" already there: the "]]" isn't doubled.
+        cx.simulate_input(" [[]]");
+        cx.simulate_keystrokes("left left");
+        // An empty query lists pages.
+        assert!(has(cx, "ref-menu"));
+        cx.simulate_input("js");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.ref_matches(),
+                vec![RefItem::Page(js, Some("JS".to_string()))]
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "see [[JavaScript]] [[JavaScript]]");
+            assert_eq!(app.editor.cursor, app.editor.text.len());
+        });
+
+        // A title match shows no alias; Esc closes the picker and keeps the
+        // text, and stopping the edit doesn't create a "Ja" page.
+        cx.simulate_input(" [[ja");
+        view.update(cx, |app, _| {
+            let items = app.ref_matches();
+            assert!(items.contains(&RefItem::Page(js, None)));
+            assert_eq!(items.len(), 2, "JavaScript and Jazz");
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "ref-menu"));
+        view.update(cx, |app, _| assert!(app.editor.text.ends_with(" [[ja")));
+        cx.simulate_input("vascript]]");
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, None);
+            assert_eq!(app.pages.len(), pages_before);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn links_to_an_alias_go_to_the_page_and_count_as_backlinks(cx: &mut TestAppContext) {
+        let mut pages = alias_pages();
+        pages[0] = ("Test", "- \n");
+        let (view, cx, dir) = setup_pages(cx, "alias-links", &pages, "Test");
+        let pages_before = view.update(cx, |app, _| app.pages.len());
+        // Typed by hand (picker dismissed), then committed: [[JS]] already
+        // has a page, so no "JS" page is created.
+        click_block(cx, 0);
+        cx.simulate_input("about [[JS");
+        cx.simulate_keystrokes("escape");
+        cx.simulate_input("]] and #ecmascript");
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, None);
+            assert_eq!(app.pages.len(), pages_before);
+            assert!(app.find_page("JS").is_none());
+        });
+
+        // Following the link opens JavaScript, whose "Linked from" lists it.
+        view.update(cx, |app, cx| app.open_page("js", cx));
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "JavaScript");
+            assert_eq!(app.pages.len(), pages_before);
+            assert_eq!(app.backlink_texts, vec!["about [[JS]] and #ecmascript"]);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn global_search_finds_a_page_by_its_alias(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "alias-search", &alias_pages(), "Test");
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.simulate_input("js");
+        assert_eq!(
+            text_hits(&view, cx),
+            vec![
+                ("JavaScript".to_string(), None),
+                ("JavaScript".to_string(), Some("JS".to_string())),
+            ]
+        );
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "JavaScript")
         });
         let _ = std::fs::remove_dir_all(dir);
     }

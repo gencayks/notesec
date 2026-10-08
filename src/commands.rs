@@ -110,6 +110,7 @@ commands! {
     OpenToday => "Open today's journal", ["today", "daily", "journal"], Nothing;
     OpenAgenda => "Open agenda", ["tasks", "todo", "scheduled", "deadline"], Nothing;
     OpenTrash => "Open trash", ["deleted", "restore", "bin", "recycle", "undelete"], Nothing;
+    SearchAllPages => "Search all pages", ["global search", "full text", "find in pages"], Nothing;
     RenamePage => "Rename current page", ["title", "name"], Page;
     DeletePage => "Delete current page", ["remove", "trash"], Page;
     CopyPageTitle => "Copy page title", ["clipboard", "name"], Page;

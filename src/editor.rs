@@ -75,6 +75,21 @@ impl EditorState {
         (!query.contains([')', '\n'])).then_some(start..self.cursor)
     }
 
+    /// The `[[query` being typed right before the cursor, as a byte range
+    /// from the `[[` to the cursor: what the page-link picker filters on
+    /// and replaces. `None` with a selection, while composing, or once the
+    /// query holds a `[`, a `]` or a line break (the link is closed, or
+    /// this isn't one).
+    pub fn link_query(&self) -> Option<Range<usize>> {
+        if self.selection().is_some() || self.marked.is_some() {
+            return None;
+        }
+        let before = self.text.get(..self.cursor)?;
+        let start = before.rfind("[[")?;
+        let query = &before[start + 2..];
+        (!query.contains(['[', ']', '\n'])).then_some(start..self.cursor)
+    }
+
     /// New editor containing `text`, cursor at the end.
     pub fn new(text: &str) -> Self {
         EditorState {
@@ -845,5 +860,26 @@ mod tests {
         assert_eq!(e.text, "ac");
         e.move_end();
         assert!(!e.delete());
+    }
+
+    #[test]
+    fn link_query_finds_an_open_double_bracket() {
+        let at = |text: &str, cursor: usize| {
+            let mut e = EditorState::new(text);
+            e.cursor = cursor;
+            e.link_query()
+        };
+        assert_eq!(at("see [[Jav", 9), Some(4..9));
+        assert_eq!(at("see [[", 6), Some(4..6));
+        assert_eq!(at("[[a]] and [[b", 13), Some(10..13));
+        assert_eq!(at("see [[Jav]]", 11), None, "closed");
+        assert_eq!(at("[[a\nb", 5), None, "line break");
+        assert_eq!(at("see [Jav", 8), None);
+        assert_eq!(at("[[[x", 4), Some(1..4), "the last [[ opens it");
+        // Cursor before the brackets.
+        assert_eq!(at("x [[y", 1), None);
+        let mut e = EditorState::new("[[abc");
+        e.anchor = Some(2);
+        assert_eq!(e.link_query(), None, "selection");
     }
 }
