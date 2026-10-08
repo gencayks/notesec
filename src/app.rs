@@ -10,8 +10,8 @@ use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::model::{backlinks, parse_references, tag_counts, BlockKind, Page};
-use crate::search::{search, Command, Hit, Target};
-use crate::storage::{today_title, Storage};
+use crate::search::{search, search_templates, Command, Hit, Target};
+use crate::storage::{today_title, Storage, Template};
 use crate::ui::{block_row, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
@@ -126,6 +126,13 @@ struct SearchState {
     query: EditorState,
     /// Highlighted result (index into the current results).
     selected: usize,
+    /// The block that was being edited when the palette opened. "Insert
+    /// template" puts the template's blocks after it (see
+    /// `Page::insert_blocks_from`); `None` means append to the page.
+    insert_after: Option<usize>,
+    /// `Some` once "Insert template" was chosen: the palette then lists these
+    /// templates instead of pages, blocks and commands.
+    templates: Option<Vec<Template>>,
 }
 
 const MAX_HISTORY: usize = 100;
@@ -330,13 +337,64 @@ impl NoteSec {
             Command::DecreaseFontSize => self.change_font_size(-1.0, cx),
             Command::ResetFontSize => self.reset_font_size(cx),
             Command::ToggleGraph => self.toggle_graph(cx),
+            Command::InsertTemplate => self.open_template_picker(None, cx),
         }
+    }
+
+    // --- templates -------------------------------------------------------------
+
+    /// Show the palette as a template picker. `insert_after` is the block the
+    /// chosen template goes after (`None`: end of the page).
+    fn open_template_picker(&mut self, insert_after: Option<usize>, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+        self.search = Some(SearchState {
+            query: EditorState::default(),
+            selected: 0,
+            insert_after,
+            templates: Some(self.storage.load_templates()),
+        });
+        cx.notify();
+    }
+
+    /// Insert `template`'s blocks into the selected page after block
+    /// `insert_after` (replacing it if it is an empty leaf), or at the end of
+    /// the page. One undo step; saved right away like other structural edits.
+    fn insert_template(
+        &mut self,
+        template: &Template,
+        insert_after: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_edit(cx);
+        let source = Page::from_markdown(&template.name, false, &template.markdown);
+        if source.blocks.is_empty() {
+            return;
+        }
+        let page = &self.pages[self.selected];
+        // A page that is just one blank bullet (a fresh journal or page) gets
+        // that bullet replaced rather than a template appended below it.
+        let insert_after = insert_after.or_else(|| {
+            (page.blocks.len() == 1 && page.blocks[0].content.trim().is_empty()).then_some(0)
+        });
+        self.record_edit();
+        self.pages[self.selected].insert_blocks_from(insert_after, &source);
+        self.save_page();
+        self.mode = Mode::Notes;
+        cx.notify();
     }
 
     // --- search overlay --------------------------------------------------------
 
     fn search_results(&self) -> Vec<Hit> {
         match &self.search {
+            Some(SearchState {
+                query,
+                templates: Some(templates),
+                ..
+            }) => {
+                let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
+                search_templates(&names, &query.text, MAX_RESULTS)
+            }
             Some(s) => search(&self.pages, &s.query.text, MAX_RESULTS),
             None => Vec::new(),
         }
@@ -355,11 +413,15 @@ impl NoteSec {
             self.close_search(cx);
             return;
         }
-        // Save whatever block is being edited before covering it.
+        // Remember where the cursor was (for "Insert template"), then save
+        // whatever block is being edited before covering it.
+        let insert_after = self.editing;
         self.stop_edit(cx);
         self.search = Some(SearchState {
             query: EditorState::default(),
             selected: 0,
+            insert_after,
+            templates: None,
         });
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -500,6 +562,10 @@ impl NoteSec {
     /// Act on a search result: open its page (and for a block hit, start
     /// editing that block) or run the command.
     fn open_hit(&mut self, hit: &Hit, window: &mut Window, cx: &mut Context<Self>) {
+        let (insert_after, templates) = match self.search.take() {
+            Some(s) => (s.insert_after, s.templates),
+            None => (None, None),
+        };
         self.close_search(cx);
         match hit.target {
             Target::Page(page) => {
@@ -513,7 +579,14 @@ impl NoteSec {
                     self.start_edit(block, window, cx);
                 }
             }
+            // Keeps the palette open, now listing templates.
+            Target::Command(Command::InsertTemplate) => self.open_template_picker(insert_after, cx),
             Target::Command(command) => self.run_command(command, cx),
+            Target::Template(ix) => {
+                if let Some(template) = templates.as_ref().and_then(|t| t.get(ix)) {
+                    self.insert_template(template, insert_after, cx);
+                }
+            }
         }
     }
 
@@ -1993,6 +2066,7 @@ impl Render for NoteSec {
         let overlay = self.search.as_ref().map(|state| {
             let hits = self.search_results();
             let selected = state.selected;
+            let templates = state.templates.as_deref();
             let rows: Vec<AnyElement> =
                 hits.into_iter()
                     .enumerate()
@@ -2024,6 +2098,12 @@ impl Render for NoteSec {
                                 div().text_color(theme.text).child(c.label()),
                                 "command".into(),
                             ),
+                            Target::Template(t) => row(
+                                div().text_color(theme.accent).child(
+                                    templates.map_or(String::new(), |ts| ts[t].name.clone()),
+                                ),
+                                "template".into(),
+                            ),
                         };
                         div()
                             .id(("search-result", i))
@@ -2042,6 +2122,15 @@ impl Render for NoteSec {
                     })
                     .collect();
             let no_results = rows.is_empty();
+            // In template mode: a heading, and a hint if there are no templates.
+            let picking_templates = templates.is_some();
+            let empty_message = match templates {
+                Some([]) => format!(
+                    "No templates yet: add .md files to {}",
+                    self.storage.templates_dir().display()
+                ),
+                _ => "No results".to_string(),
+            };
 
             // Backdrop: dims the app, swallows mouse events, closes on click.
             div()
@@ -2072,6 +2161,15 @@ impl Render for NoteSec {
                         .border_1()
                         .border_color(theme.border)
                         .shadow_lg()
+                        .when(picking_templates, |d| {
+                            d.child(
+                                div()
+                                    .px_3()
+                                    .pt_1()
+                                    .text_color(theme.muted)
+                                    .child("Insert template"),
+                            )
+                        })
                         .child(
                             div()
                                 .debug_selector(|| "search-input".to_string())
@@ -2088,7 +2186,7 @@ impl Render for NoteSec {
                                     .px_3()
                                     .py_1()
                                     .text_color(theme.muted)
-                                    .child("No results"),
+                                    .child(empty_message),
                             )
                         }),
                 )
@@ -2305,7 +2403,10 @@ mod tests {
             assert_eq!(page.title, today);
             assert_eq!(page.blocks[0].content, "morning notes");
             assert_eq!(
-                app.pages.iter().filter(|p| p.is_journal && p.title == today).count(),
+                app.pages
+                    .iter()
+                    .filter(|p| p.is_journal && p.title == today)
+                    .count(),
                 1,
                 "no duplicate journal created"
             );
@@ -2378,6 +2479,98 @@ mod tests {
             assert_eq!(app.mode, Mode::Notes);
             assert_eq!(app.pages[app.selected].title, today_title());
         });
+    }
+
+    /// Open the palette, choose "Insert template", and return the template
+    /// names the picker lists.
+    fn open_template_picker(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("insert template");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            let state = app.search.as_ref().expect("palette stays open");
+            let templates = state.templates.as_ref().expect("in template mode");
+            assert_eq!(state.query.text, "", "query cleared for the picker");
+            app.search_results()
+                .iter()
+                .map(|hit| match hit.target {
+                    Target::Template(ix) => templates[ix].name.clone(),
+                    other => panic!("unexpected hit {other:?}"),
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn insert_template_lists_templates_and_inserts_after_the_edited_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "template-insert", "- one\n- two\n");
+        std::fs::write(
+            dir.join("templates/Meeting.md"),
+            "- Agenda\n  - item\n- Notes\n",
+        )
+        .unwrap();
+        click_block(cx, 0);
+
+        let names = open_template_picker(&view, cx);
+        assert_eq!(names, ["Daily review", "Meeting"]);
+
+        cx.simulate_input("meet");
+        cx.simulate_keystrokes("enter");
+
+        view.update(cx, |app, _| {
+            assert!(app.search.is_none(), "palette closes after inserting");
+            let contents: Vec<&str> = app.pages[app.selected]
+                .blocks
+                .iter()
+                .map(|b| b.content.as_str())
+                .collect();
+            assert_eq!(contents, ["one", "Agenda", "item", "Notes", "two"]);
+        });
+        assert_eq!(file(&dir), "- one\n- Agenda\n  - item\n- Notes\n- two\n");
+
+        // The whole insert is one undo step.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks.len(), 2);
+        });
+        assert_eq!(file(&dir), "- one\n- two\n");
+    }
+
+    #[gpui::test]
+    fn insert_template_without_an_edited_block_appends_to_the_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "template-append", "- one\n  - child\n");
+        // Not editing: the template goes at the end, at the top level.
+        open_template_picker(&view, cx);
+        cx.simulate_keystrokes("enter"); // first (only) template: Daily review
+        assert_eq!(
+            file(&dir),
+            "- one\n  - child\n- Wins\n  - \n- Lessons\n  - \n- Plan for tomorrow\n  - \n"
+        );
+    }
+
+    #[gpui::test]
+    fn insert_template_replaces_a_blank_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "template-blank", "- \n");
+        open_template_picker(&view, cx);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            file(&dir),
+            "- Wins\n  - \n- Lessons\n  - \n- Plan for tomorrow\n  - \n"
+        );
+    }
+
+    #[gpui::test]
+    fn template_picker_with_no_templates_inserts_nothing(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "template-none", "- one\n");
+        std::fs::remove_file(dir.join("templates/Daily review.md")).unwrap();
+
+        assert!(open_template_picker(&view, cx).is_empty());
+        cx.simulate_keystrokes("enter");
+
+        view.update(cx, |app, _| {
+            assert!(app.search.is_some(), "nothing to pick, palette stays open");
+        });
+        assert_eq!(file(&dir), "- one\n");
     }
 
     #[gpui::test]

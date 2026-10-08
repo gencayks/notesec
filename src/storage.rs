@@ -5,6 +5,7 @@
 //! ```text
 //! <graph>/pages/<title>.md
 //! <graph>/journals/YYYY_MM_DD.md      (page title is shown as YYYY-MM-DD)
+//! <graph>/templates/<name>.md         (notesec only; Logseq ignores it)
 //! ```
 //!
 //! The markdown files are the source of truth; nothing is cached elsewhere.
@@ -35,6 +36,20 @@ pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     })
 }
 
+/// The example template written into a new graph's `templates/` folder.
+const DEFAULT_TEMPLATE: (&str, &str) = (
+    "Daily review",
+    include_str!("../assets/templates/Daily review.md"),
+);
+
+/// A page template: a markdown file in `<graph>/templates/`. Its name is the
+/// file name without `.md`; its body uses the same bullet format as pages.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Template {
+    pub name: String,
+    pub markdown: String,
+}
+
 pub struct Storage {
     root: PathBuf,
 }
@@ -44,7 +59,59 @@ impl Storage {
     pub fn open(root: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(root.join("pages"))?;
         fs::create_dir_all(root.join("journals"))?;
-        Ok(Storage { root })
+        let storage = Storage { root };
+        storage.seed_templates()?;
+        Ok(storage)
+    }
+
+    /// Create `templates/` with one example template, but only if the folder
+    /// doesn't exist yet: once it exists the user owns it, so deleting the
+    /// example (or every template) sticks.
+    fn seed_templates(&self) -> io::Result<()> {
+        let dir = self.templates_dir();
+        if dir.exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(&dir)?;
+        let (name, markdown) = DEFAULT_TEMPLATE;
+        write_atomic(&dir.join(format!("{name}.md")), markdown)
+    }
+
+    /// Where templates live: `<graph>/templates/`.
+    pub fn templates_dir(&self) -> PathBuf {
+        self.root.join("templates")
+    }
+
+    /// Every template, sorted by name (ignoring case). Read fresh from disk
+    /// each time so files added while the app runs show up straight away.
+    /// Unreadable files are skipped with a warning.
+    pub fn load_templates(&self) -> Vec<Template> {
+        let Ok(entries) = fs::read_dir(self.templates_dir()) else {
+            return Vec::new();
+        };
+        let mut templates: Vec<Template> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    return None;
+                }
+                let name = path.file_stem()?.to_str()?.to_string();
+                // Skip hidden files, e.g. the temp files of `write_atomic`.
+                if name.starts_with('.') {
+                    return None;
+                }
+                match fs::read_to_string(&path) {
+                    Ok(markdown) => Some(Template { name, markdown }),
+                    Err(err) => {
+                        eprintln!("notesec: skipping template {}: {err}", path.display());
+                        None
+                    }
+                }
+            })
+            .collect();
+        templates.sort_by_key(|t| t.name.to_lowercase());
+        templates
     }
 
     /// Default graph location: `~/notesec`. Override with `NOTESEC_DIR`.
@@ -125,4 +192,60 @@ fn title_from_filename(stem: &str, is_journal: bool) -> String {
 /// Today's date as `YYYY-MM-DD`, in local time.
 pub fn today_title() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("notesec-storage-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn new_graph_gets_the_example_template() {
+        let root = temp_root("seed");
+        let storage = Storage::open(root.clone()).unwrap();
+        let templates = storage.load_templates();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, "Daily review");
+        assert_eq!(templates[0].markdown, DEFAULT_TEMPLATE.1);
+        assert!(root.join("templates/Daily review.md").is_file());
+    }
+
+    #[test]
+    fn deleted_example_template_is_not_recreated() {
+        let root = temp_root("no-reseed");
+        Storage::open(root.clone()).unwrap();
+        fs::remove_file(root.join("templates/Daily review.md")).unwrap();
+        let storage = Storage::open(root).unwrap();
+        assert!(storage.load_templates().is_empty());
+    }
+
+    #[test]
+    fn templates_list_md_files_sorted_by_name() {
+        let root = temp_root("list");
+        let storage = Storage::open(root.clone()).unwrap();
+        let dir = storage.templates_dir();
+        fs::write(dir.join("meeting.md"), "- Agenda\n").unwrap();
+        fs::write(dir.join("Book notes.md"), "- Author\n").unwrap();
+        fs::write(dir.join("notes.txt"), "not a template").unwrap();
+        fs::write(dir.join(".meeting.md.tmp"), "- half written").unwrap();
+        let names: Vec<String> = storage
+            .load_templates()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, ["Book notes", "Daily review", "meeting"]);
+    }
+
+    #[test]
+    fn templates_are_not_loaded_as_pages() {
+        let root = temp_root("not-pages");
+        let storage = Storage::open(root).unwrap();
+        assert!(storage.load_all().is_empty());
+    }
 }

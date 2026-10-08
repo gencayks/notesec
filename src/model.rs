@@ -461,6 +461,59 @@ impl Page {
         true
     }
 
+    /// Copy all of `source`'s blocks into this page (used to insert a
+    /// template) and return the index range they now occupy.
+    ///
+    /// They go right after block `anchor` and its children, as siblings of
+    /// `anchor`; the source's own nesting is kept below that. If `anchor` is an
+    /// empty block with no children, the copy replaces it instead, so inserting
+    /// into a fresh page or journal doesn't leave a stray blank bullet. With no
+    /// anchor (or one past the end) the blocks are appended at the top level.
+    /// The copies get fresh IDs, so the same template can be inserted twice.
+    pub fn insert_blocks_from(&mut self, anchor: Option<usize>, source: &Page) -> Range<usize> {
+        let (parent_id, at) = match anchor.filter(|&a| a < self.blocks.len()) {
+            Some(a) => {
+                let parent = self.blocks[a].parent_id;
+                let end = self.subtree_end(a);
+                if !source.blocks.is_empty()
+                    && end == a + 1
+                    && self.blocks[a].content.trim().is_empty()
+                {
+                    self.blocks.remove(a);
+                    (parent, a)
+                } else {
+                    (parent, end)
+                }
+            }
+            None => (None, self.blocks.len()),
+        };
+        let new_ids: std::collections::HashMap<Uuid, Uuid> = source
+            .blocks
+            .iter()
+            .map(|b| (b.id, Uuid::new_v4()))
+            .collect();
+        let copies: Vec<Block> = source
+            .blocks
+            .iter()
+            .map(|b| Block {
+                id: new_ids[&b.id],
+                content: b.content.clone(),
+                // Top-level source blocks hang off the anchor's parent; nested
+                // ones keep pointing at (the copy of) their own parent.
+                parent_id: match b.parent_id {
+                    Some(p) => new_ids.get(&p).copied(),
+                    None => parent_id,
+                },
+                page_id: self.id.clone(),
+                order: 0,
+            })
+            .collect();
+        let count = copies.len();
+        self.blocks.splice(at..at, copies);
+        self.renumber();
+        at..at + count
+    }
+
     /// Parse Logseq-style markdown into a page.
     pub fn from_markdown(title: &str, is_journal: bool, text: &str) -> Self {
         let mut page = Page::new(title, is_journal);
@@ -568,6 +621,69 @@ fn parse_bullet(line: &str) -> Option<(usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn template() -> Page {
+        Page::from_markdown("T", false, "- Wins\n  - one\n- Plan\n")
+    }
+
+    #[test]
+    fn insert_blocks_after_anchor_keeps_template_nesting() {
+        let mut page = Page::from_markdown("p", false, "- a\n  - a1\n- b\n");
+        let range = page.insert_blocks_from(Some(0), &template());
+        // After `a` and its child, before `b`, as siblings of `a`.
+        assert_eq!(range, 2..5);
+        assert_eq!(
+            page.to_markdown(),
+            "- a\n  - a1\n- Wins\n  - one\n- Plan\n- b\n"
+        );
+        assert!(page.blocks.iter().all(|b| b.page_id == "p"));
+    }
+
+    #[test]
+    fn insert_blocks_under_a_nested_anchor_nests_them_too() {
+        let mut page = Page::from_markdown("p", false, "- a\n  - a1\n- b\n");
+        page.insert_blocks_from(Some(1), &template());
+        assert_eq!(
+            page.to_markdown(),
+            "- a\n  - a1\n  - Wins\n    - one\n  - Plan\n- b\n"
+        );
+        // `order` is renumbered: Wins and Plan are a's 2nd and 3rd children.
+        assert_eq!(page.blocks[2].order, 1);
+        assert_eq!(page.blocks[4].order, 2);
+    }
+
+    #[test]
+    fn insert_blocks_replaces_an_empty_anchor() {
+        let mut page = Page::from_markdown("p", false, "- \n");
+        let range = page.insert_blocks_from(Some(0), &template());
+        assert_eq!(range, 0..3);
+        assert_eq!(page.to_markdown(), "- Wins\n  - one\n- Plan\n");
+    }
+
+    #[test]
+    fn insert_blocks_without_anchor_appends_and_ids_are_fresh() {
+        let source = template();
+        let mut page = Page::from_markdown("p", false, "- a\n");
+        page.insert_blocks_from(None, &source);
+        page.insert_blocks_from(None, &source);
+        assert_eq!(
+            page.to_markdown(),
+            "- a\n- Wins\n  - one\n- Plan\n- Wins\n  - one\n- Plan\n"
+        );
+        let mut ids: Vec<Uuid> = page.blocks.iter().map(|b| b.id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), page.blocks.len(), "every copy has its own id");
+        assert!(source.blocks.iter().all(|b| !ids.contains(&b.id)));
+    }
+
+    #[test]
+    fn insert_empty_source_changes_nothing() {
+        let mut page = Page::from_markdown("p", false, "- \n");
+        let range = page.insert_blocks_from(Some(0), &Page::new("empty", false));
+        assert!(range.is_empty());
+        assert_eq!(page.to_markdown(), "- \n");
+    }
 
     #[test]
     fn round_trip_nested() {

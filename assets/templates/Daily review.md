@@ -1,0 +1,6 @@
+- Wins
+  -
+- Lessons
+  -
+- Plan for tomorrow
+  -
