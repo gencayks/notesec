@@ -7,6 +7,7 @@
 
 use crate::agenda::{day_label, Agenda, AgendaItem};
 use crate::assets::{image_markdown, is_image_path, parse_images, resolve, save_image, ImageRef};
+use crate::backup::{self, BackupError, Git, Repo};
 use crate::code::{split_code, CodeBlock, Part};
 use crate::commands::{binding_hint, format_keystrokes, Command, Needs};
 use crate::config::{Config, ThemeKind};
@@ -88,6 +89,7 @@ actions!(
         OpenAgenda,
         OpenTrash,
         ExportHtml,
+        ToggleGitBackup,
         RenamePage,
         DeletePage,
         CopyPageTitle,
@@ -588,6 +590,18 @@ pub struct NoteSec {
     /// Files being dragged in from outside the app, and whether the pointer
     /// is over the page. Set while they move; used and cleared on release.
     file_drag: Option<(ExternalPaths, bool)>,
+    /// Git auto-backup (decision 39): how git is run, the job getting the
+    /// repository ready (`start_backup`), the debounce timer and the commit
+    /// it starts (`schedule_backup`; replacing it restarts the wait),
+    /// whether changes wait for that commit, and the `Storage::changes`
+    /// count already seen.
+    git: Git,
+    backup_setup: Option<Task<()>>,
+    backup_task: Option<Task<()>>,
+    backup_pending: bool,
+    backup_seen: u64,
+    /// Watching our own notifications, quit and release (for backups).
+    _backup_subscriptions: Vec<Subscription>,
 }
 
 impl NoteSec {
@@ -645,6 +659,17 @@ impl NoteSec {
 
         let mono_font = mono_font(cx);
         let trash = storage.list_trash();
+        let backup_seen = storage.changes();
+        // A page file written since the last notification restarts the
+        // backup timer; quitting or closing the window commits what waits.
+        let backup_subscriptions = vec![
+            cx.observe_self(|this, cx| this.note_storage_changes(cx)),
+            cx.on_app_quit(|this, _cx| {
+                this.flush_backup();
+                std::future::ready(())
+            }),
+            cx.on_release(|this, _cx| this.flush_backup()),
+        ];
 
         let mut app = NoteSec {
             storage,
@@ -689,9 +714,19 @@ impl NoteSec {
             copied_code: None,
             copied_task: None,
             file_drag: None,
+            git: Git::default(),
+            backup_setup: None,
+            backup_task: None,
+            backup_pending: false,
+            backup_seen,
+            _backup_subscriptions: backup_subscriptions,
         };
         // The startup page counts as opened.
         app.record_recent();
+        if app.config.git_backup {
+            // Commits what changed while the app was closed, too.
+            app.start_backup(false, cx);
+        }
         app
     }
 
@@ -808,6 +843,154 @@ impl NoteSec {
         cx.notify();
     }
 
+    // --- git auto-backup (backup.rs, decision 39) -------------------------------
+
+    /// Turn git auto-backup on or off and save that in config.toml. On
+    /// gets the repository ready and commits right away (`start_backup`).
+    fn set_git_backup(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.config.git_backup == on {
+            return;
+        }
+        self.config.git_backup = on;
+        self.save_config();
+        if on {
+            self.start_backup(true, cx);
+        } else {
+            // Nothing more is committed: drop the setup and any waiting
+            // commit (dropping a task cancels it).
+            self.backup_setup = None;
+            self.backup_task = None;
+            self.backup_pending = false;
+            let status = Status {
+                text: "Git backup off".to_string(),
+                error: false,
+            };
+            self.show_status(status, cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_git_backup(&mut self, cx: &mut Context<Self>) {
+        self.set_git_backup(!self.config.git_backup, cx);
+    }
+
+    /// Off the UI thread: find or `git init` the repository
+    /// (`backup::prepare`), then commit what is there. `announce` (the
+    /// toggle, not startup) says where backups go when it worked.
+    fn start_backup(&mut self, announce: bool, cx: &mut Context<Self>) {
+        self.backup_setup = Some(cx.spawn(async move |this, cx| {
+            let Ok((git, root)) = this.update(cx, |this, _| {
+                (this.git.clone(), this.storage.root().to_path_buf())
+            }) else {
+                return;
+            };
+            let result = cx
+                .background_spawn(async move {
+                    let repo = backup::prepare(&git, &root)?;
+                    Ok((repo, backup::commit(&git, &root)))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| this.backup_started(result, announce, cx));
+        }));
+    }
+
+    /// `start_backup` finished. If the repository couldn't be set up (no
+    /// git, the folder ignored by a repository above it, ...), backup is
+    /// turned off again (and saved off, so the switch shows the truth) and
+    /// the status says why.
+    fn backup_started(
+        &mut self,
+        result: Result<(Repo, Result<Option<usize>, BackupError>), BackupError>,
+        announce: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.backup_setup = None;
+        if !self.config.git_backup {
+            return; // turned off meanwhile
+        }
+        let status = match result {
+            Err(err) => {
+                self.config.git_backup = false;
+                self.save_config();
+                Some(Status {
+                    text: format!("Git backup is off: {err}"),
+                    error: true,
+                })
+            }
+            Ok((_, Err(err))) => Some(Status {
+                text: format!("Git backup failed: {err}"),
+                error: true,
+            }),
+            Ok((repo, Ok(_))) => announce.then(|| Status {
+                text: backup_on_message(self.storage.root(), &repo),
+                error: false,
+            }),
+        };
+        if let Some(status) = status {
+            self.show_status(status, cx);
+        }
+        cx.notify();
+    }
+
+    /// After every notification: if a page file changed on disk since the
+    /// last one (`Storage::changes`), restart the backup timer.
+    fn note_storage_changes(&mut self, cx: &mut Context<Self>) {
+        let changes = self.storage.changes();
+        if changes == self.backup_seen {
+            return;
+        }
+        self.backup_seen = changes;
+        if self.config.git_backup {
+            self.schedule_backup(cx);
+        }
+    }
+
+    /// Commit `BACKUP_AFTER` from now, off the UI thread. Called again
+    /// before then, the wait starts over (the old task is dropped).
+    fn schedule_backup(&mut self, cx: &mut Context<Self>) {
+        self.backup_pending = true;
+        self.backup_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(backup::BACKUP_AFTER).await;
+            let Ok((git, root)) = this.update(cx, |this, _| {
+                this.backup_pending = false;
+                (this.git.clone(), this.storage.root().to_path_buf())
+            }) else {
+                return;
+            };
+            let result = cx
+                .background_spawn(async move { backup::commit(&git, &root) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(err) = result {
+                    // Still to do: the next change or quitting tries again.
+                    this.backup_pending = true;
+                    if this.config.git_backup {
+                        let text = format!("Git backup failed: {err}");
+                        this.show_status(Status { text, error: true }, cx);
+                    }
+                }
+            });
+        }));
+    }
+
+    /// On quit or window close: commit now if changes are waiting for the
+    /// timer, else wait for a commit that is running. Blocks the UI
+    /// thread, which is closing anyway.
+    fn flush_backup(&mut self) {
+        if !self.config.git_backup {
+            return;
+        }
+        if self.backup_pending {
+            self.backup_pending = false;
+            self.backup_task = None;
+            if let Err(err) = backup::commit(&self.git, self.storage.root()) {
+                eprintln!("notesec: git backup failed: {err}");
+            }
+        } else {
+            backup::wait_idle();
+        }
+    }
+
     // --- settings panel --------------------------------------------------------
 
     fn open_settings(&mut self, cx: &mut Context<Self>) {
@@ -828,6 +1011,15 @@ impl NoteSec {
     }
 
     /// Ctrl-, opens the panel, or closes it if it is already open.
+    fn on_toggle_git_backup(
+        &mut self,
+        _: &ToggleGitBackup,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_git_backup(cx);
+    }
+
     fn on_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         if self.settings.is_some() {
             self.close_settings(cx);
@@ -3383,6 +3575,29 @@ fn mono_font(cx: &App) -> Option<SharedString> {
 
 /// The tallest an image in a block is drawn, in pixels.
 const IMAGE_MAX_HEIGHT: f32 = 320.0;
+/// What "Git backup on" says about where commits go: a new repository in
+/// the graph folder, the graph's own repository, or (a repository above
+/// the graph) that only the graph folder is committed there.
+fn backup_on_message(graph: &std::path::Path, repo: &Repo) -> String {
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        a == b
+            || a.canonicalize()
+                .ok()
+                .is_some_and(|a| b.canonicalize().ok() == Some(a))
+    };
+    if repo.created {
+        format!("Git backup on: new repository in {}", graph.display())
+    } else if same(&repo.root, graph) {
+        format!("Git backup on: {}", graph.display())
+    } else {
+        format!(
+            "Git backup on: committing {} in the repository at {}",
+            graph.display(),
+            repo.root.display()
+        )
+    }
+}
+
 /// How long a status message (`NoteSec::show_status`) stays on screen.
 const STATUS_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -4006,6 +4221,20 @@ impl NoteSec {
                 .on_click(cx.listener(|this, _e, _window, cx| this.reset_font_size(cx))),
             );
 
+        let backup_on = config.git_backup;
+        let backup_row = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .child(
+                button("git-backup-off", "Off".into(), !backup_on)
+                    .on_click(cx.listener(|this, _e, _window, cx| this.set_git_backup(false, cx))),
+            )
+            .child(
+                button("git-backup-on", "On".into(), backup_on)
+                    .on_click(cx.listener(|this, _e, _window, cx| this.set_git_backup(true, cx))),
+            );
+
         // Font family: "System default", then every installed family.
         let row = |id: ElementId, selector: String, text: String, active: bool| {
             div()
@@ -4122,7 +4351,18 @@ impl NoteSec {
                         d.child(div().text_color(theme.muted).child(format!(
                             "\u{201c}{family}\u{201d} is not installed; using the system font"
                         )))
-                    }),
+                    })
+                    .child(label("Git auto-backup"))
+                    .child(backup_row)
+                    .child(
+                        div()
+                            .debug_selector(|| "git-backup-note".to_string())
+                            .text_color(theme.muted)
+                            .child(format!(
+                                "Local git commits {} s after changes. Never pushes.",
+                                backup::BACKUP_AFTER.as_secs()
+                            )),
+                    ),
             )
             .into_any_element()
     }
@@ -6419,6 +6659,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_decrease_font))
             .on_action(cx.listener(Self::on_reset_font))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_toggle_git_backup))
             .on_action(cx.listener(Self::on_open_agenda))
             .on_action(cx.listener(Self::on_open_trash))
             .on_action(cx.listener(Self::on_export_html))
@@ -11037,6 +11278,8 @@ mod tests {
             ("recycle", Command::OpenTrash),
             ("undelete", Command::OpenTrash),
             ("export html", Command::ExportHtml),
+            ("git backup", Command::ToggleGitBackup),
+            ("autosave", Command::ToggleGitBackup),
             ("html", Command::ExportHtml),
             ("col all", Command::CollapseAll),
             ("exp all", Command::ExpandAll),
@@ -11197,6 +11440,7 @@ mod tests {
         assert_eq!(hint(Command::OpenAgenda), None);
         assert_eq!(hint(Command::OpenTrash), None);
         assert_eq!(hint(Command::ExportHtml), None);
+        assert_eq!(hint(Command::ToggleGitBackup), None);
         assert_eq!(hint(Command::MoveBlockUp).as_deref(), Some("Alt+Up"));
         assert_eq!(hint(Command::MoveBlockDown).as_deref(), Some("Alt+Down"));
         assert_eq!(hint(Command::Paste).as_deref(), Some("Ctrl+V"));
@@ -11690,6 +11934,209 @@ mod tests {
             cx.dispatch_action(ExportHtml);
             assert_eq!(std::fs::read_dir(dir.join("exports")).unwrap().count(), 1);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- git auto-backup --------------------------------------------------------
+
+    /// Commit subjects in `dir`'s repository, newest first (none without one).
+    fn git_log(dir: &std::path::Path) -> Vec<String> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["log", "--format=%s"])
+            .env("GIT_CEILING_DIRECTORIES", std::env::temp_dir())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `setup`, with git run like `backup`'s own tests (no user config).
+    fn setup_backup<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        let (view, cx, dir) = setup(cx, name, "- one\n- two\n");
+        view.update(cx, |app, _| app.git = backup::isolated_git());
+        (view, cx, dir)
+    }
+
+    /// Edit block `ix` and leave it, which saves the page.
+    fn edit_and_leave(cx: &mut VisualTestContext, ix: usize, text: &str) {
+        click_block(cx, ix);
+        cx.simulate_input(text);
+        cx.simulate_keystrokes("escape");
+    }
+
+    fn wait(cx: &mut VisualTestContext, secs: u64) {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(secs));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_settings_toggle_turns_git_backup_on_and_off_and_persists(cx: &mut TestAppContext) {
+        if !backup::git_available() {
+            return;
+        }
+        let (view, cx, dir) = setup_backup(cx, "backup-settings");
+        assert!(!saved_config(&dir).git_backup, "off by default");
+        click_on(cx, "settings-gear");
+        assert!(has(cx, "git-backup-off") && has(cx, "git-backup-note"));
+
+        click_on(cx, "git-backup-on");
+        cx.run_until_parked();
+        assert!(saved_config(&dir).git_backup);
+        assert!(config_text(&dir).contains("git_backup = true"));
+        // A repository with the .gitignore, and everything committed.
+        assert!(dir.join(".git").is_dir());
+        let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(ignore.contains(".trash/") && ignore.contains("exports/"));
+        let log = git_log(&dir);
+        assert_eq!(log.len(), 1);
+        assert!(log[0].starts_with("notesec autosave"), "{log:?}");
+        let expected = format!("Git backup on: new repository in {}", dir.display());
+        assert_eq!(status_text(&view, cx), Some(expected));
+
+        click_on(cx, "git-backup-off");
+        assert!(!saved_config(&dir).git_backup);
+        assert_eq!(status_text(&view, cx).as_deref(), Some("Git backup off"));
+        // Off: changes are not committed.
+        cx.simulate_keystrokes("escape");
+        edit_and_leave(cx, 0, " zqoff");
+        wait(cx, 30);
+        assert!(file(&dir).contains("zqoff"));
+        assert_eq!(git_log(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn saves_are_committed_after_a_quiet_spell(cx: &mut TestAppContext) {
+        if !backup::git_available() {
+            return;
+        }
+        let (view, cx, dir) = setup_backup(cx, "backup-debounce");
+        run_in_palette(cx, "toggle git auto-backup");
+        cx.run_until_parked();
+        assert!(view.update(cx, |app, _| app.config.git_backup));
+        assert_eq!(git_log(&dir).len(), 1);
+
+        // Each save restarts the wait.
+        edit_and_leave(cx, 0, " first");
+        wait(cx, 4);
+        assert_eq!(git_log(&dir).len(), 1);
+        edit_and_leave(cx, 1, " second");
+        wait(cx, 4);
+        assert_eq!(git_log(&dir).len(), 1, "4 s after the last save");
+        wait(cx, 1);
+        let log = git_log(&dir);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0], "notesec autosave: 1 file changed");
+        assert!(!view.update(cx, |app, _| app.backup_pending));
+
+        // Nothing changed: no empty commit, however long it waits.
+        wait(cx, 60);
+        assert_eq!(git_log(&dir).len(), 2);
+        // A rename (the old file goes, the new one comes) is one commit.
+        view.update(cx, |app, cx| {
+            app.rename_page("Test", "Renamed", cx).unwrap()
+        });
+        cx.run_until_parked();
+        wait(cx, 5);
+        assert_eq!(git_log(&dir)[0], "notesec autosave: 2 files changed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn quitting_commits_what_waits_for_the_timer(cx: &mut TestAppContext) {
+        if !backup::git_available() {
+            return;
+        }
+        let (view, cx, dir) = setup_backup(cx, "backup-quit");
+        view.update(cx, |app, cx| app.set_git_backup(true, cx));
+        cx.run_until_parked();
+        edit_and_leave(cx, 0, " zqquit");
+        assert!(view.update(cx, |app, _| app.backup_pending));
+        assert_eq!(git_log(&dir).len(), 1);
+        cx.cx.quit();
+        assert_eq!(git_log(&dir).len(), 2, "committed at quit, without waiting");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn closing_the_window_commits_what_waits_for_the_timer(cx: &mut TestAppContext) {
+        if !backup::git_available() {
+            return;
+        }
+        let (view, cx, dir) = setup_backup(cx, "backup-close");
+        view.update(cx, |app, cx| app.set_git_backup(true, cx));
+        cx.run_until_parked();
+        edit_and_leave(cx, 0, " zqclose");
+        assert_eq!(git_log(&dir).len(), 1);
+        // The window owns the view: closing it releases the view.
+        drop(view);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        assert_eq!(git_log(&dir).len(), 2, "committed when the view went");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn backup_on_at_startup_commits_what_changed_meanwhile(cx: &mut TestAppContext) {
+        if !backup::git_available() {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("notesec-test-backup-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        std::fs::write(dir.join("pages/Outside.md"), "- edited elsewhere\n").unwrap();
+        let config = Config {
+            git_backup: true,
+            ..Config::default()
+        };
+        cx.update(bind_keys);
+        let (view, cx) = cx.add_window_view(|window, cx| NoteSec::new(storage, config, window, cx));
+        view.update(cx, |app, _| app.git = backup::isolated_git());
+        cx.run_until_parked();
+        assert_eq!(git_log(&dir).len(), 1);
+        assert!(dir.join(".gitignore").exists());
+        // Silent when it works: no status at startup.
+        assert_eq!(status_text(&view, cx), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn without_git_backup_stays_off_and_says_why(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "backup-nogit", "- one\n");
+        view.update(cx, |app, _| {
+            app.git = backup::Git::default().with_program("notesec-no-such-git")
+        });
+        click_on(cx, "settings-gear");
+        click_on(cx, "git-backup-on");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert!(!app.config.git_backup);
+            assert!(app.status.as_ref().is_some_and(|s| s.error));
+        });
+        assert_eq!(
+            status_text(&view, cx).as_deref(),
+            Some("Git backup is off: git is not installed")
+        );
+        assert!(has(cx, "status-toast") && settings_open(&view, cx));
+        assert!(!saved_config(&dir).git_backup);
+        assert!(!dir.join(".git").exists());
+        // The app keeps working.
+        cx.simulate_keystrokes("escape");
+        edit_and_leave(cx, 0, " still");
+        assert!(file(&dir).contains("still"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

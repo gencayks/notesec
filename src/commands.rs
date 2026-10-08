@@ -120,6 +120,7 @@ commands! {
     PrevTab => "Previous tab", [], Nothing;
     // App
     OpenSettings => "Open settings", ["preferences", "theme", "font"], Nothing;
+    ToggleGitBackup => "Toggle git auto-backup", ["git", "backup", "version", "history", "autosave"], Nothing;
     ShowShortcuts => "Keyboard shortcuts", ["keys", "keymap", "cheatsheet", "help"], Nothing;
     Quit => "Quit", ["exit", "close app"], Nothing;
 }

@@ -21,6 +21,7 @@
 //! hidden `.trash/` folder is ever loaded as one.
 
 use crate::model::Page;
+use std::cell::Cell;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -62,6 +63,9 @@ pub struct Template {
 
 pub struct Storage {
     root: PathBuf,
+    /// How many times a page file was written, renamed, trashed or
+    /// restored. Git auto-backup watches it to know when to commit.
+    changes: Cell<u64>,
 }
 
 impl Storage {
@@ -69,7 +73,10 @@ impl Storage {
     pub fn open(root: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(root.join("pages"))?;
         fs::create_dir_all(root.join("journals"))?;
-        let storage = Storage { root };
+        let storage = Storage {
+            root,
+            changes: Cell::new(0),
+        };
         storage.seed_templates()?;
         Ok(storage)
     }
@@ -162,8 +169,19 @@ impl Storage {
         pages
     }
 
+    /// The number of page file changes so far (see `changes`). It only
+    /// grows, so a different value means something changed on disk.
+    pub fn changes(&self) -> u64 {
+        self.changes.get()
+    }
+
+    fn changed(&self) {
+        self.changes.set(self.changes.get() + 1);
+    }
+
     /// Write a page to its file (creating it if needed).
     pub fn save(&self, page: &Page) -> io::Result<()> {
+        self.changed();
         write_atomic(&self.path_for(page), &page.to_markdown())
     }
 
@@ -174,6 +192,7 @@ impl Storage {
     /// file (a case-only rename of the same file is allowed). If the old
     /// file is missing, the page is simply written under the new name.
     pub fn rename(&self, page: &Page, new_title: &str) -> io::Result<()> {
+        self.changed();
         let old = self.path_for(page);
         let renamed = Page {
             title: new_title.to_string(),
@@ -214,6 +233,7 @@ impl Storage {
     /// be saved; if its file is missing, that content is written into the
     /// trash instead, so the page can still be restored.
     pub fn trash_at(&self, page: &Page, deleted_at: i64) -> io::Result<TrashEntry> {
+        self.changed();
         let source = self.path_for(page);
         let relative = source
             .strip_prefix(&self.root)
@@ -301,6 +321,7 @@ impl Storage {
     /// from it. Fails with `AlreadyExists` (and changes nothing) if a file
     /// is at that path again; the caller also checks titles ignoring case.
     pub fn restore(&self, entry: &TrashEntry) -> io::Result<Page> {
+        self.changed();
         let file = self.trash_file(entry);
         let target = self.root.join(&entry.relative);
         if target.exists() {
@@ -784,6 +805,29 @@ mod tests {
         assert!(trash.join("notes/pages/Keep.md").exists());
         assert!(trash.join("README.txt").exists() && trash.join("42").exists());
         assert_eq!(storage.empty_trash().unwrap(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn page_file_changes_are_counted() {
+        let root = temp_root("changes");
+        let storage = Storage::open(root.clone()).unwrap();
+        assert_eq!(storage.changes(), 0, "seeding templates doesn't count");
+        let page = Page::from_markdown("Counted", false, "- x\n");
+        storage.save(&page).unwrap();
+        assert_eq!(storage.changes(), 1);
+        storage.rename(&page, "Renamed").unwrap();
+        let renamed = Page::from_markdown("Renamed", false, "- x\n");
+        let entry = storage.trash(&renamed).unwrap();
+        storage.restore(&entry).unwrap();
+        assert_eq!(storage.changes(), 4);
+        // Exports and the trash itself are not page files.
+        storage.write_export(&renamed, "<p>").unwrap();
+        let entry = storage.trash(&renamed).unwrap();
+        let before = storage.changes();
+        storage.delete_forever(&entry).unwrap();
+        storage.empty_trash().unwrap();
+        assert_eq!(storage.changes(), before);
         let _ = fs::remove_dir_all(root);
     }
 

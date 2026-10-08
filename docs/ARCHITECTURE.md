@@ -17,6 +17,7 @@ display.rs     — reading view of a block: hidden markup + offset map (NO ui co
 search.rs      — fuzzy matcher, pure functions (NO ui code here)
 tabs.rs        — open tabs: open/focus/close/cycle rules (NO ui code here)
 export.rs      — a page as one self-contained HTML string (NO ui code here)
+backup.rs      — git auto-backup: runs the `git` program (NO ui code here)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1024,6 +1025,92 @@ that mutate, and data races are essentially impossible.
     `exports/` should go in the graph's `.gitignore`, like `.trash/`. It
     is derived output that one command re-creates, and embedded images
     would bloat the history.
+39. **Git auto-backup: debounced local commits of the graph folder.**
+    *Consent*: `git_backup` in `config.toml`, **off by default**, so
+    nothing touches a folder's git state until the user asks. It is
+    switched in Settings ("Git auto-backup", Off / On buttons
+    `git-backup-off` / `git-backup-on`, with a muted note
+    `git-backup-note`) or by the palette's "Toggle git auto-backup"
+    (`ToggleGitBackup`; keywords git, backup, version, history,
+    autosave; no key; always offered). *How*: `backup.rs` runs the `git`
+    program with `std::process::Command` (no libgit2 / `git2` crate), so
+    it behaves exactly like the user's git, config and hooks included.
+    Each call blocks, so `app.rs` runs them with `cx.background_spawn`
+    and never on the UI thread (except at quit, below). Every command is
+    `git -C <graph> ...`, with stdin closed, `GIT_TERMINAL_PROMPT=0` and
+    `GIT_EDITOR=true` (never waits for input), and `GIT_DIR`,
+    `GIT_WORK_TREE`, `GIT_INDEX_FILE` and friends removed (a stray one
+    would point git at another repository). *Local only*: the commands
+    used are `rev-parse`, `check-ignore`, `init`, `config --get`,
+    `status`, `add` and `commit`. Never push, fetch, remote, `--force`,
+    reset or amend; a test checks no remote ever appears. *Identity*: if
+    git has no `user.name` / `user.email` (`git config --get`), the
+    missing one is passed as `-c user.name=notesec` /
+    `-c user.email=notesec@localhost` for that commit only, so commits
+    never fail for lack of identity and a configured identity is used as
+    is. *Turning it on* (`start_backup`, also at startup when on, which
+    picks up edits made while the app was closed): `backup::prepare`
+    finds the repository (`rev-parse --show-toplevel`) or runs `git init`
+    in the graph folder, then appends to the graph's `.gitignore` the
+    lines it lacks among `.trash/`, `exports/` and `.*.tmp` (the temp
+    files of atomic saves) under a `# notesec: not backed up` comment.
+    The user's own lines are never changed or reordered, and `/.trash`
+    or `.trash` counts as present. Then everything is committed at once.
+    The status says where: "Git backup on: new repository in <graph>",
+    "Git backup on: <graph>", or the repository-above form below.
+    *Repository above the graph* (e.g. the graph is `notes/` inside a
+    dotfiles or project repository): no nested repository is made (the
+    outer one would then see an embedded repository). Instead every
+    status / add / commit is limited to the pathspec `.` run from the
+    graph folder, so only files inside the graph are staged and
+    committed: `git commit -- .` takes just those paths, and anything the
+    user staged elsewhere stays staged and out of our commits (tested).
+    The status names both folders ("committing <graph> in the repository
+    at <root>"), so the user knows their repository gets the commits. If
+    that repository ignores the graph (`check-ignore` on `pages`, e.g. a
+    home-folder repository with `*` in its `.gitignore`), nothing would
+    ever be committed, so it is refused instead. *Debounce*: `Storage`
+    counts page file changes (`changes()`: save, rename, trash, restore;
+    not exports, delete forever or empty trash, which only touch ignored
+    folders). `NoteSec` watches its own notifications (`cx.observe_self`)
+    and, when the count moved, restarts a `BACKUP_AFTER` (5 s) timer
+    (`schedule_backup`; replacing the task cancels the old wait). So one
+    commit follows a burst of edits, 5 s after the last save. That one
+    hook catches every save path (block edits, structure changes, pages
+    created, renamed, deleted or restored, pasted images with their
+    block) without a call at each save site. `config.toml` and
+    `state.toml` (favorites, order, recent) are committed along but don't
+    start a commit themselves: opening a page changes RECENT, and that
+    alone shouldn't make a commit. *No empty commits*: `backup::commit`
+    first runs `git status --porcelain --untracked-files=all -- .` and
+    stops if it is empty. The message is
+    `notesec autosave: N file(s) changed` (N from that status). A global
+    lock keeps two commits (the timer's and quit's) from racing for
+    `index.lock`. *Quit*: `on_app_quit` (Ctrl-Q) and the view's
+    `on_release` (closing the window, which on Linux also quits) both
+    call `flush_backup`. If changes are waiting for the timer, it commits
+    right away on the UI thread, which is closing anyway. GPUI gives quit
+    handlers 200 ms (`SHUTDOWN_TIMEOUT`), and a blocking call inside the
+    handler isn't cut off by it. Otherwise it waits for a commit that is
+    running. Both paths are tested. A block being edited when the app
+    quits isn't saved by the app (as before), so it isn't committed
+    either. *Errors*: never fatal. Without git (or with a repository
+    above that ignores the graph), turning it on fails, the setting goes
+    back to Off and the status says "Git backup is off: git is not
+    installed" in the danger colour. The same happens at startup
+    (saved Off too, so Settings shows the truth and a later config save
+    can't disagree); the user turns it on again once git is there. A
+    failed commit (say a
+    pre-commit hook refused) shows "Git backup failed: <git's first
+    error line>" and stays waiting, so the next change or quit tries
+    again. Successful autosaves are silent. *Not handled*: GPG signing
+    the user turned on (`commit.gpgsign`) applies to these commits too,
+    and if it needs a passphrase prompt, commits fail and say why. We
+    don't override the user's signing choice. *Tests*: real git in temp
+    folders (skipped, not failed, without git), with an isolated config
+    (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM`,
+    `GIT_CEILING_DIRECTORIES`). The UI tests drive the timer with
+    `advance_clock`.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

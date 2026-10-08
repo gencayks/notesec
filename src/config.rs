@@ -4,6 +4,7 @@
 //! theme = "dark"          # or "light"
 //! font_size = 16.0
 //! font_family = "Inter"   # optional; omit to use the system UI font
+//! git_backup = false      # commit the graph folder to local git (decision 39)
 //! ```
 //!
 //! The file is read once at startup. The app rewrites it when you change the
@@ -46,6 +47,9 @@ pub struct Config {
     /// `None` means "use the system UI font".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    /// Git auto-backup (`backup.rs`): commit the graph folder to a local
+    /// git repository after changes. Off unless the user turns it on.
+    pub git_backup: bool,
 }
 
 impl Default for Config {
@@ -54,6 +58,7 @@ impl Default for Config {
             theme: ThemeKind::default(),
             font_size: DEFAULT_FONT_SIZE,
             font_family: None,
+            git_backup: false,
         }
     }
 }
@@ -152,6 +157,7 @@ mod tests {
             theme: ThemeKind::Light,
             font_size: 20.0,
             font_family: Some("Inter".into()),
+            git_backup: true,
         };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), config);
@@ -177,6 +183,7 @@ mod tests {
         let c = Config::load(&dir);
         assert_eq!(c.theme, ThemeKind::Light);
         assert_eq!(c.font_size, DEFAULT_FONT_SIZE);
+        assert!(!c.git_backup, "backup is off unless turned on");
         let _ = fs::remove_dir_all(dir);
     }
 
