@@ -694,6 +694,29 @@ that mutate, and data races are essentially impossible.
     `COPIED_FOR` timer task. Keeping the task in a field means a newer copy
     drops, and so cancels, the old timer. All colours come from `Theme`, so
     both themes work. A press on the button never starts editing.
+28. **Images live in `assets/` and blocks only point at them.** Pasting an
+    image while editing a block (Ctrl+V; an image beats any text on the
+    clipboard) or dropping image files onto the page saves each one as
+    `assets/image-<milliseconds>.png` (the folder is made when first needed;
+    `create_new` plus a `-1`, `-2` suffix means nothing is ever
+    overwritten) and puts `![image](../assets/<file>)` in the block, the way
+    Logseq does, so the markdown stays readable by other tools. PNGs are
+    written byte for byte; other formats go through the `image` crate, which
+    GPUI already builds, so the new dependency compiles nothing extra.
+    Dropped while editing, the reference goes in at the cursor; otherwise
+    each image gets a new top-level block at the end of the page. Either way
+    it is one undo step; the files themselves are kept. Reading view draws
+    images like tables and code: as their own boxes between the prose, at
+    most `IMAGE_MAX_HEIGHT` (320 px) tall and the page width wide, keeping
+    their shape. A missing file, or one GPUI can't decode, shows a dashed
+    "Image not found" or "Image could not be loaded" box, never a crash.
+    Images inside code fences stay text. Drops don't use `on_drop`, which
+    needs a hovered element: after a keypress GPUI treats nothing as hovered
+    until the mouse moves in the window, and files dragged in from a file
+    manager don't move it, so a drop right after typing was lost. Instead
+    `on_drag_move::<ExternalPaths>` remembers the files and whether they're
+    over the page, and a window-level mouse-up listener (painted by a
+    zero-size `canvas`) takes the drag on release.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

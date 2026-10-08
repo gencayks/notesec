@@ -5,6 +5,7 @@
 //! stops (Escape, click elsewhere, switching pages) the text is written back to
 //! the block and the page is saved to disk.
 
+use crate::assets::{image_markdown, is_image_path, parse_images, resolve, save_image, ImageRef};
 use crate::code::{split_code, CodeBlock, Part};
 use crate::config::{Config, ThemeKind};
 use crate::display::DisplayBlock;
@@ -26,10 +27,10 @@ use crate::ui::{
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, Context, DragMoveEvent, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hsla,
-    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, ShapedLine, SharedString, Style, StyledText, Subscription, Task, TextRun,
-    UTF16Selection, UnderlineStyle, Window,
+    EntityInputHandler, ExternalPaths, FocusHandle, FontStyle, FontWeight, GlobalElementId,
+    HighlightStyle, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, ShapedLine, SharedString, Style, StyledText, Subscription,
+    Task, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -298,6 +299,9 @@ pub struct NoteSec {
     /// `copied_task` clears it.
     copied_code: Option<(Uuid, usize)>,
     copied_task: Option<Task<()>>,
+    /// Files being dragged in from outside the app, and whether the pointer
+    /// is over the page. Set while they move; used and cleared on release.
+    file_drag: Option<(ExternalPaths, bool)>,
 }
 
 impl NoteSec {
@@ -389,6 +393,7 @@ impl NoteSec {
             hovered_code: None,
             copied_code: None,
             copied_task: None,
+            file_drag: None,
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -1771,6 +1776,39 @@ impl NoteSec {
         cx.notify();
     }
 
+    /// An image in reading view: as wide as it is up to the page width and
+    /// at most `IMAGE_MAX_HEIGHT` tall, keeping its shape. A file that's
+    /// missing or can't be decoded shows a dashed placeholder instead.
+    fn render_image(&self, ix: usize, n: usize, image: &ImageRef) -> AnyElement {
+        let theme = self.theme;
+        let placeholder = move |text: String| {
+            div()
+                .debug_selector(move || format!("image-{ix}-{n}-missing"))
+                .self_start()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_dashed()
+                .border_color(theme.border)
+                .text_color(theme.muted)
+                .child(text)
+                .into_any_element()
+        };
+        let target = image.target.clone();
+        match resolve(self.storage.root(), &image.target).filter(|path| path.is_file()) {
+            Some(path) => gpui::img(path)
+                .debug_selector(move || format!("image-{ix}-{n}"))
+                .self_start()
+                .max_w_full()
+                .max_h(px(IMAGE_MAX_HEIGHT))
+                .object_fit(gpui::ObjectFit::Contain)
+                .with_fallback(move || placeholder(format!("Image could not be loaded: {target}")))
+                .into_any_element(),
+            None => placeholder(format!("Image not found: {target}")),
+        }
+    }
+
     /// A fenced code block in reading view: monospace on the sidebar colour,
     /// whitespace kept, scrolling sideways when too wide. While the mouse is
     /// over it (or just after a copy) it shows a Copy button in its corner.
@@ -1926,7 +1964,20 @@ impl NoteSec {
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        // An image pasted into a block is saved under `assets/` and the
+        // block gets a reference to it (an image beats any text alongside).
+        let image = item.entries().iter().find_map(|entry| match entry {
+            gpui::ClipboardEntry::Image(image) => Some(image.bytes.clone()),
+            _ => None,
+        });
+        if let (Some(bytes), true) = (image, self.search.is_none() && self.editing.is_some()) {
+            self.add_images(vec![bytes], cx);
+            return;
+        }
+        if let Some(text) = item.text() {
             self.close_slash_as_typing();
             if self.search.is_none() && self.editing.is_some() {
                 self.record_edit();
@@ -1936,6 +1987,85 @@ impl NoteSec {
             self.text_changed();
             cx.notify();
         }
+    }
+
+    /// Image files dropped onto the page: each is copied into `assets/` like
+    /// a pasted image. Other files are ignored, as are files that can't be
+    /// read.
+    fn drop_files(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        let images: Vec<Vec<u8>> = paths
+            .paths()
+            .iter()
+            .filter(|path| is_image_path(path))
+            .filter_map(|path| match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    eprintln!("notesec: could not read {}: {err}", path.display());
+                    None
+                }
+            })
+            .collect();
+        if !images.is_empty() {
+            self.add_images(images, cx);
+        }
+    }
+
+    /// The mouse was released somewhere. If it ends a drag of outside files
+    /// over the page, take the drag and add the images.
+    ///
+    /// This doesn't use `on_drop`: GPUI only drops onto a hovered element,
+    /// and nothing counts as hovered after a keypress until the mouse moves
+    /// in the window. Files dragged in from the file manager move only the
+    /// drag, so a drop right after typing in a block would be lost.
+    fn finish_file_drop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((paths, inside)) = self.file_drag.take() else {
+            return;
+        };
+        if inside && cx.has_active_drag() {
+            cx.stop_active_drag(window);
+            self.drop_files(&paths, cx);
+        }
+        cx.notify();
+    }
+
+    /// Save each image as `assets/image-<timestamp>.png` and reference it:
+    /// at the cursor of the edited block, or else in a new block at the end
+    /// of the page, one per image. One undo step either way (the files stay).
+    fn add_images(&mut self, images: Vec<Vec<u8>>, cx: &mut Context<Self>) {
+        let refs: Vec<String> = images
+            .iter()
+            .filter_map(|bytes| {
+                let millis = chrono::Local::now().timestamp_millis();
+                match save_image(self.storage.root(), bytes, millis) {
+                    Ok(file) => Some(image_markdown(&file)),
+                    Err(err) => {
+                        eprintln!("notesec: could not save the image: {err}");
+                        None
+                    }
+                }
+            })
+            .collect();
+        if refs.is_empty() {
+            return;
+        }
+        if self.search.is_some() {
+            return;
+        }
+        self.close_slash_as_typing();
+        self.text_history_active = false;
+        self.record_edit();
+        if self.editing.is_some() {
+            self.editor.insert(&refs.join(" "));
+            self.sync_content();
+            self.text_changed();
+        } else {
+            let page = &mut self.pages[self.selected];
+            for markdown in refs {
+                page.push_block(markdown);
+            }
+        }
+        self.save_page();
+        cx.notify();
     }
 
     /// Ctrl+Enter: next task state for the edited block (TODO -> DOING ->
@@ -2126,6 +2256,8 @@ fn mono_font(cx: &App) -> Option<SharedString> {
         .map(|font| SharedString::from(*font))
 }
 
+/// The tallest an image in a block is drawn, in pixels.
+const IMAGE_MAX_HEIGHT: f32 = 320.0;
 /// How long a copy button says "Copied".
 const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
@@ -3317,6 +3449,7 @@ impl Render for NoteSec {
             .collect();
         let dragging = cx.has_active_drag();
         let block_drop = if dragging { self.block_drop } else { None };
+        let file_over = dragging && self.file_drag.as_ref().is_some_and(|(_, inside)| *inside);
         let rows: Vec<AnyElement> = page
             .blocks
             .iter()
@@ -3349,14 +3482,16 @@ impl Render for NoteSec {
                         .child(BlockText { app: cx.entity() })
                         .into_any_element(),
                     Some(d) => {
-                        // Code blocks and pipe tables are drawn as their
-                        // own boxes between the prose around them. They
+                        // Code blocks, pipe tables and images are drawn as
+                        // their own boxes between the prose around them. They
                         // aren't mapped back to `content`, so a press on
                         // such a block starts editing at its start.
                         let parts = split_code(&block.content);
                         let rich = parts.iter().any(|part| match part {
                             Part::Code(_) => true,
-                            Part::Text(text) => parse_table(text).is_some(),
+                            Part::Text(text) => {
+                                parse_table(text).is_some() || !parse_images(text).is_empty()
+                            }
                         });
                         let text = if rich {
                             let resolve = |id| {
@@ -3376,7 +3511,40 @@ impl Render for NoteSec {
                                 ))
                             };
                             let mut pieces: Vec<AnyElement> = Vec::new();
-                            let (mut tables, mut codes) = (0, 0);
+                            let (mut tables, mut codes, mut images) = (0, 0, 0);
+                            // Prose with images in it: each image is drawn on
+                            // its own between the text around it, and the line
+                            // breaks next to an image are dropped.
+                            let mut prose =
+                                |pieces: &mut Vec<AnyElement>, text: &str, first: bool| {
+                                    let mut pos = 0;
+                                    let mut first = first;
+                                    let text_piece =
+                                        |pieces: &mut Vec<AnyElement>,
+                                         t: &str,
+                                         first: &mut bool| {
+                                            let t = t.trim_matches('\n');
+                                            if !t.trim().is_empty() {
+                                                pieces.push(styled(t, *first).into_any_element());
+                                            }
+                                            *first = false;
+                                        };
+                                    for image in parse_images(text) {
+                                        text_piece(
+                                            pieces,
+                                            &text[pos..image.range.start],
+                                            &mut first,
+                                        );
+                                        pieces.push(self.render_image(ix, images, &image));
+                                        images += 1;
+                                        pos = image.range.end;
+                                    }
+                                    if pos == 0 {
+                                        pieces.push(styled(text, first).into_any_element());
+                                    } else {
+                                        text_piece(pieces, &text[pos..], &mut first);
+                                    }
+                                };
                             for (p, part) in parts.iter().enumerate() {
                                 let mut rest = match part {
                                     Part::Code(code) => {
@@ -3390,8 +3558,7 @@ impl Render for NoteSec {
                                 let mut first = p == 0;
                                 while let Some(table) = parse_table(&rest) {
                                     if !table.before.is_empty() {
-                                        pieces
-                                            .push(styled(&table.before, first).into_any_element());
+                                        prose(&mut pieces, &table.before, first);
                                     }
                                     let cells = table
                                         .rows
@@ -3413,7 +3580,7 @@ impl Render for NoteSec {
                                     rest = table.after;
                                 }
                                 if !rest.is_empty() {
-                                    pieces.push(styled(&rest, first).into_any_element());
+                                    prose(&mut pieces, &rest, first);
                                 }
                             }
                             div()
@@ -3832,6 +3999,42 @@ impl Render for NoteSec {
             .on_drop(
                 cx.listener(|this, dragged: &DraggedBlock, _, cx| this.drop_block(dragged.id, cx)),
             )
+            // Image files dragged in from outside: a faint wash while they
+            // are over the page; releasing them adds them (`finish_file_drop`).
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    let inside = event.bounds.contains(&event.event.position);
+                    let was_inside = this.file_drag.as_ref().map(|(_, inside)| *inside);
+                    this.file_drag = Some((event.drag(cx).clone(), inside));
+                    if was_inside != Some(inside) {
+                        cx.notify();
+                    }
+                }),
+            )
+            .when(file_over, |d| d.bg(theme.selected_bg))
+            .child({
+                let app = cx.entity();
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let on_up = app.clone();
+                        window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                            if phase == gpui::DispatchPhase::Bubble {
+                                on_up.update(cx, |this, cx| this.finish_file_drop(window, cx));
+                            }
+                        });
+                        // Outside files never press the mouse in this window,
+                        // so a press means any earlier file drag is over.
+                        window.on_mouse_event(move |_: &MouseDownEvent, phase, _, cx| {
+                            if phase == gpui::DispatchPhase::Capture {
+                                app.update(cx, |this, _| this.file_drag = None);
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_0()
+            })
             .children(backlinks_panel)
             // Empty space below the blocks: clicking it leaves edit mode.
             .child(
@@ -7652,6 +7855,233 @@ mod tests {
         cx.executor().advance_clock(COPIED_FOR / 2);
         cx.run_until_parked();
         assert!(!has(cx, "code-0-1-copied"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The `.png` files in `assets/`, sorted.
+    fn assets(dir: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(dir.join("assets"))
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        files
+    }
+
+    /// The asset file a block's image reference points at.
+    fn referenced_file(content: &str) -> String {
+        let images = crate::assets::parse_images(content);
+        assert_eq!(images.len(), 1, "one image in {content:?}");
+        let target = &images[0].target;
+        let file = target.strip_prefix("../assets/").unwrap();
+        assert!(
+            file.starts_with("image-") && file.ends_with(".png"),
+            "{file}"
+        );
+        file.to_string()
+    }
+
+    #[gpui::test]
+    fn pasting_an_image_saves_it_and_references_it(cx: &mut TestAppContext) {
+        let png = crate::assets::tests::tiny_png();
+        let (view, cx, dir) = setup(cx, "paste-image", "- hello\n- next\n");
+        assert!(!dir.join("assets").exists());
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            png.clone(),
+        )));
+        cx.simulate_keystrokes("ctrl-v");
+        let content = view.update(cx, |app, _| app.editor.text.clone());
+        assert!(
+            content.starts_with("hello![image](../assets/image-"),
+            "{content}"
+        );
+        let name = referenced_file(&content);
+        // `assets/` was created and holds exactly the pasted bytes.
+        assert_eq!(assets(&dir), vec![name.clone()]);
+        assert_eq!(std::fs::read(dir.join("assets").join(&name)).unwrap(), png);
+        assert_eq!(file(&dir), format!("- {content}\n- next\n"));
+
+        // Reading view draws the image under the prose, within the cap.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(has(cx, "image-0-0"));
+        assert!(!has(cx, "image-0-0-missing"));
+        let image = bounds_of(cx, "image-0-0");
+        assert!(image.size.height <= px(IMAGE_MAX_HEIGHT));
+        assert!(bounds_of(cx, "block-1").top() >= image.bottom());
+
+        // One undo takes the reference back out; the file stays.
+        click_block(cx, 1);
+        cx.simulate_keystrokes("escape ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks[0].content, "hello")
+        });
+        assert_eq!(assets(&dir), vec![name]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn pasting_text_still_pastes_text(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "paste-text-not-image", "- a\n");
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("bc".into()));
+        cx.simulate_keystrokes("ctrl-v");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "abc"));
+        assert!(!dir.join("assets").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn missing_or_broken_images_render_a_placeholder(cx: &mut TestAppContext) {
+        let md =
+            "- before\n  ![cat](../assets/gone.png)\n  after\n- ![x](../assets/bad.png)\n- next\n";
+        let (view, cx, dir) = setup(cx, "image-missing", md);
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets/bad.png"), b"not an image").unwrap();
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        // Missing: a placeholder, with the text on both sides still shown.
+        assert!(has(cx, "image-0-0-missing"));
+        assert!(!has(cx, "image-0-0"));
+        // Present but undecodable: the fallback placeholder.
+        assert!(has(cx, "image-1-0-missing"));
+        assert!(has(cx, "block-2"));
+        assert!(bounds_of(cx, "block-2").top() >= bounds_of(cx, "image-1-0-missing").bottom());
+        // Editing shows the raw reference, and nothing is rewritten.
+        click_block(cx, 0);
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "before\n![cat](../assets/gone.png)\nafter")
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(file(&dir), md);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn images_inside_code_blocks_are_not_drawn(cx: &mut TestAppContext) {
+        let md = "- ```\n  ![x](../assets/gone.png)\n  ```\n";
+        let (_view, cx, dir) = setup(cx, "image-in-code", md);
+        assert!(has(cx, "code-0-0"));
+        assert!(!has(cx, "image-0-0-missing") && !has(cx, "image-0-0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn drop_files(cx: &mut VisualTestContext, at: gpui::Point<Pixels>, paths: Vec<PathBuf>) {
+        cx.simulate_event(gpui::FileDropEvent::Entered {
+            position: at,
+            paths: ExternalPaths(paths.into_iter().collect()),
+        });
+        cx.simulate_event(gpui::FileDropEvent::Submit { position: at });
+        cx.simulate_event(gpui::FileDropEvent::Exited);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn dropping_image_files_adds_them_as_blocks(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "drop-image", "- a\n  - child\n");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let png = crate::assets::tests::tiny_png();
+        std::fs::write(outside.join("pic.PNG"), &png).unwrap();
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(3, 2)
+            .write_to(&mut bmp, image::ImageFormat::Bmp)
+            .unwrap();
+        std::fs::write(outside.join("photo.bmp"), bmp.into_inner()).unwrap();
+        std::fs::write(outside.join("notes.txt"), "hi").unwrap();
+
+        let at = bounds_of(cx, "block-0").center();
+        drop_files(
+            cx,
+            at,
+            vec![
+                outside.join("pic.PNG"),
+                outside.join("notes.txt"),
+                outside.join("photo.bmp"),
+            ],
+        );
+        // Two images, two new top-level blocks at the end; the text file is
+        // ignored. Both are PNGs now, with different names.
+        let files = assets(&dir);
+        assert_eq!(files.len(), 2, "{files:?}");
+        let blocks = view.update(cx, |app, _| {
+            let page = &app.pages[app.selected];
+            assert_eq!(page.blocks.len(), 4);
+            assert!(page.blocks[2..].iter().all(|b| b.parent_id.is_none()));
+            page.blocks[2..]
+                .iter()
+                .map(|b| b.content.clone())
+                .collect::<Vec<_>>()
+        });
+        let named: Vec<String> = blocks.iter().map(|b| referenced_file(b)).collect();
+        let mut sorted = named.clone();
+        sorted.sort();
+        assert_eq!(sorted, files);
+        assert_eq!(
+            std::fs::read(dir.join("assets").join(&named[0])).unwrap(),
+            png
+        );
+        let converted = std::fs::read(dir.join("assets").join(&named[1])).unwrap();
+        assert_eq!(
+            image::guess_format(&converted).unwrap(),
+            image::ImageFormat::Png
+        );
+        assert_eq!(
+            file(&dir),
+            format!("- a\n  - child\n- {}\n- {}\n", blocks[0], blocks[1])
+        );
+        assert!(has(cx, "image-2-0") && has(cx, "image-3-0"));
+
+        // Dropped while editing: the reference goes in at the cursor.
+        // A keypress just before matters: GPUI then treats nothing as
+        // hovered until the mouse moves in the window.
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end");
+        drop_files(cx, at, vec![outside.join("pic.PNG")]);
+        let content = view.update(cx, |app, _| app.editor.text.clone());
+        assert!(
+            content.starts_with("a![image](../assets/image-"),
+            "{content}"
+        );
+        assert_eq!(assets(&dir).len(), 3);
+
+        // Only non-image files: nothing happens.
+        cx.simulate_keystrokes("escape");
+        let before = file(&dir);
+        drop_files(cx, at, vec![outside.join("notes.txt")]);
+        assert_eq!(file(&dir), before);
+        assert_eq!(assets(&dir).len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn file_drags_that_leave_or_miss_the_page_add_nothing(cx: &mut TestAppContext) {
+        let md = "- a\n- b\n";
+        let (_view, cx, dir) = setup(cx, "drop-miss", md);
+        let pic = dir.join("pic.png");
+        std::fs::write(&pic, crate::assets::tests::tiny_png()).unwrap();
+        let at = bounds_of(cx, "block-0").center();
+        // Dragged over the page, then back out of the window.
+        cx.simulate_event(gpui::FileDropEvent::Entered {
+            position: at,
+            paths: ExternalPaths([pic.clone()].into_iter().collect()),
+        });
+        cx.simulate_event(gpui::FileDropEvent::Exited);
+        // A later click (or block drag) doesn't pick the files up.
+        click_block(cx, 1);
+        cx.simulate_keystrokes("escape");
+        // Dropped on the sidebar, not the page.
+        let sidebar = gpui::point(bounds_of(cx, "sidebar").center().x, at.y);
+        drop_files(cx, sidebar, vec![pic]);
+        assert!(!dir.join("assets").exists());
+        assert_eq!(file(&dir), md);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

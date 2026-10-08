@@ -17,6 +17,9 @@ dirs = "6"
 unicode-segmentation = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+# Converting pasted or dropped images to PNG. Same version and a subset of
+# the features GPUI already builds, so it adds nothing to compile.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 
 # Zed's workspace patches a few crates; patches only apply at the *root* manifest,
 # so we must repeat the ones GPUI needs here.

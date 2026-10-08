@@ -622,6 +622,20 @@ impl Page {
         at
     }
 
+    /// Add a top-level block with `content` at the end of the page and
+    /// return its index.
+    pub fn push_block(&mut self, content: String) -> usize {
+        self.blocks.push(Block {
+            id: Uuid::new_v4(),
+            content,
+            parent_id: None,
+            page_id: self.id.clone(),
+            order: 0,
+        });
+        self.renumber();
+        self.blocks.len() - 1
+    }
+
     /// Enter on a collapsed block: insert a new sibling with `content` right
     /// after the block's whole subtree (as Logseq does) and return its index.
     pub fn insert_after_subtree(&mut self, index: usize, content: String) -> usize {
@@ -1537,5 +1551,17 @@ mod tests {
             .collect();
         assert_eq!(names, ["Real", "tag", "after"]);
         assert_eq!(parse_wikilinks(text).len(), 1);
+    }
+
+    #[test]
+    fn push_block_appends_at_the_top_level() {
+        let mut page = Page::from_markdown("t", false, "- a\n  - b\n");
+        let ix = page.push_block("c".into());
+        assert_eq!(ix, 2);
+        assert_eq!(page.blocks[2].parent_id, None);
+        assert_eq!(page.to_markdown(), "- a\n  - b\n- c\n");
+        let mut empty = Page::new("e", false);
+        assert_eq!(empty.push_block("x".into()), 0);
+        assert_eq!(empty.to_markdown(), "- x\n");
     }
 }
