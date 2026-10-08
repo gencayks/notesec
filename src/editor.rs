@@ -61,6 +61,20 @@ pub struct EditorState {
 }
 
 impl EditorState {
+    /// The `((query` being typed right before the cursor, as a byte range
+    /// from the `((` to the cursor: what the block-reference picker filters
+    /// on and replaces. `None` with a selection, while composing, or once
+    /// the query holds a `)` or a line break.
+    pub fn block_ref_query(&self) -> Option<Range<usize>> {
+        if self.selection().is_some() || self.marked.is_some() {
+            return None;
+        }
+        let before = self.text.get(..self.cursor)?;
+        let start = before.rfind("((")?;
+        let query = &before[start + 2..];
+        (!query.contains([')', '\n'])).then_some(start..self.cursor)
+    }
+
     /// New editor containing `text`, cursor at the end.
     pub fn new(text: &str) -> Self {
         EditorState {
@@ -794,6 +808,22 @@ mod tests {
         let mut e = EditorState::new("😀");
         e.toggle_emphasis(Emphasis::Bold);
         assert_eq!((e.text.as_str(), e.cursor), ("😀****", "😀**".len()));
+    }
+
+    #[test]
+    fn block_ref_query_is_the_open_double_paren_before_the_cursor() {
+        let mut e = EditorState::new("see ((wee");
+        assert_eq!(e.block_ref_query(), Some(4..9));
+        e.cursor = 6;
+        assert_eq!(e.block_ref_query(), Some(4..6));
+        e.cursor = 5;
+        assert_eq!(e.block_ref_query(), None);
+        // Closed, broken by a newline, or with a selection: no picker.
+        assert_eq!(EditorState::new("((a)) b").block_ref_query(), None);
+        assert_eq!(EditorState::new("((a\nb").block_ref_query(), None);
+        let mut e = EditorState::new("((ab");
+        e.anchor = Some(2);
+        assert_eq!(e.block_ref_query(), None);
     }
 
     #[test]

@@ -14,8 +14,45 @@
 //! tree structure is encoded by each block's `parent_id`, so rendering a block's
 //! indent is just "count how many ancestors it has".
 
+use std::collections::HashSet;
 use std::ops::Range;
 use uuid::Uuid;
+
+/// Every well-formed block reference `((<uuid>))` in `text`, in order, with
+/// the byte range of the whole reference (parentheses included).
+pub fn parse_block_refs(text: &str) -> Vec<(Range<usize>, Uuid)> {
+    let mut refs = Vec::new();
+    let mut from = 0;
+    while let Some(start) = text[from..].find("((").map(|i| from + i) {
+        let inner = start + 2;
+        let parsed = text[inner..]
+            .find("))")
+            .and_then(|len| Some((Uuid::parse_str(&text[inner..inner + len]).ok()?, len)));
+        match parsed {
+            Some((id, len)) => {
+                let end = inner + len + 2;
+                refs.push((start..end, id));
+                from = end;
+            }
+            None => from = start + 1,
+        }
+    }
+    refs
+}
+
+/// Where the block with `id` is: `(page index, block index)`.
+pub fn find_block(pages: &[Page], id: Uuid) -> Option<(usize, usize)> {
+    pages
+        .iter()
+        .enumerate()
+        .find_map(|(p, page)| page.blocks.iter().position(|b| b.id == id).map(|b| (p, b)))
+}
+
+/// The `id:: <uuid>` property line that keeps a referenced block's id
+/// stable on disk, if `line` (already trimmed) is one.
+fn id_property(line: &str) -> Option<Uuid> {
+    Uuid::parse_str(line.strip_prefix("id::")?.trim()).ok()
+}
 
 /// A reference to a page found inside a block's text: either a
 /// `[[wikilink]]` or a `#tag`. Both point at the page named `target`.
@@ -401,6 +438,10 @@ pub struct Page {
     pub blocks: Vec<Block>,
     /// True for daily journal pages (`YYYY-MM-DD`).
     pub is_journal: bool,
+    /// Blocks whose id is written to the file (as an `id::` line under the
+    /// bullet) because something references them. Every other block gets a
+    /// fresh id on each load, which keeps the markdown clean.
+    pub saved_ids: HashSet<Uuid>,
 }
 
 impl Page {
@@ -410,6 +451,7 @@ impl Page {
             title: title.to_string(),
             blocks: Vec::new(),
             is_journal,
+            saved_ids: HashSet::new(),
         }
     }
 
@@ -731,6 +773,24 @@ impl Page {
                 if line.trim().is_empty() {
                     continue;
                 }
+                // `id:: <uuid>`: the stable id of a referenced block (the
+                // block on top of the stack, which has no children yet).
+                if let (Some(id), Some(last)) = (id_property(line.trim()), page.blocks.last()) {
+                    let duplicate = page.blocks.iter().any(|b| b.id == id);
+                    if !duplicate && page.saved_ids.insert(id) {
+                        let old = last.id;
+                        if let Some(top) = stack.last_mut().filter(|(_, top)| *top == old) {
+                            top.1 = id;
+                        }
+                        if let Some(count) = child_counts.remove(&Some(old)) {
+                            child_counts.insert(Some(id), count);
+                        }
+                        if let Some(last) = page.blocks.last_mut() {
+                            last.id = id;
+                        }
+                    }
+                    continue;
+                }
                 match page.blocks.last_mut() {
                     Some(last) => {
                         last.content.push('\n');
@@ -785,6 +845,14 @@ impl Page {
             out.push_str("- ");
             out.push_str(lines.next().unwrap_or(""));
             out.push('\n');
+            // A referenced block's id goes right under its first line, as
+            // a Logseq property.
+            if self.saved_ids.contains(&block.id) {
+                out.push_str(&indent);
+                out.push_str("  id:: ");
+                out.push_str(&block.id.to_string());
+                out.push('\n');
+            }
             // Continuation lines are indented to line up under the bullet text.
             for extra in lines {
                 out.push_str(&indent);
@@ -822,6 +890,52 @@ fn parse_bullet(line: &str) -> Option<(usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_refs_are_found_and_bad_ones_skipped() {
+        let id = Uuid::new_v4();
+        let text = format!("see (({id})) and ((nope)) or (( (({id}))");
+        let refs = parse_block_refs(&text);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(&text[refs[0].0.clone()], format!("(({id}))"));
+        assert_eq!(refs[0].1, id);
+        assert_eq!(&text[refs[1].0.clone()], format!("(({id}))"));
+    }
+
+    #[test]
+    fn referenced_block_ids_survive_save_and_load() {
+        let mut page = Page::from_markdown("P", false, "- a\n  - child\n- b\n");
+        let a = page.blocks[0].id;
+        let child = page.blocks[1].id;
+        page.saved_ids.insert(a);
+        let md = page.to_markdown();
+        assert_eq!(md, format!("- a\n  id:: {a}\n  - child\n- b\n"));
+
+        let loaded = Page::from_markdown("P", false, &md);
+        assert_eq!(loaded.blocks[0].id, a);
+        assert_eq!(loaded.blocks[0].content, "a");
+        // The child still hangs off the block, under its saved id.
+        assert_eq!(loaded.blocks[1].parent_id, Some(a));
+        // Unreferenced blocks are not written with ids and get new ones.
+        assert_ne!(loaded.blocks[1].id, child);
+        assert!(loaded.saved_ids.contains(&a));
+        // Byte for byte the same file again.
+        assert_eq!(loaded.to_markdown(), md);
+    }
+
+    #[test]
+    fn a_multiline_block_keeps_its_id_line_and_text() {
+        let id = Uuid::new_v4();
+        let md = format!("- first\n  id:: {id}\n  second\n");
+        let page = Page::from_markdown("P", false, &md);
+        assert_eq!(page.blocks[0].id, id);
+        assert_eq!(page.blocks[0].content, "first\nsecond");
+        assert_eq!(page.to_markdown(), md);
+        // A duplicated id line is just dropped, never two blocks with one id.
+        let dup = format!("- a\n  id:: {id}\n- b\n  id:: {id}\n");
+        let page = Page::from_markdown("P", false, &dup);
+        assert_ne!(page.blocks[0].id, page.blocks[1].id);
+    }
 
     fn template() -> Page {
         Page::from_markdown("T", false, "- Wins\n  - one\n- Plan\n")

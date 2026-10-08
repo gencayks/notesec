@@ -10,9 +10,10 @@ use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::model::{
-    backlinks, cycle_task, parse_references, tag_counts, BlockKind, Page, TaskState,
+    backlinks, cycle_task, find_block, parse_block_refs, parse_references, tag_counts, BlockKind,
+    Page, TaskState,
 };
-use crate::search::{search, search_templates, Command, Hit, Target};
+use crate::search::{search, search_blocks, search_templates, Command, Hit, Target};
 use crate::state::UiState;
 use crate::storage::{today_title, Storage, Template};
 use crate::tabs::{TabTarget, Tabs};
@@ -247,11 +248,18 @@ pub struct NoteSec {
     slash: Option<SlashState>,
     /// `Some` while the settings panel is open.
     settings: Option<SettingsState>,
+    /// The `((` block-reference picker's highlighted entry, with the
+    /// `((query` range it was chosen in (typing changes the range, which
+    /// starts again from the top). The picker itself shows whenever
+    /// `block_ref_query` finds a query; see `ref_query`.
+    ref_selected: (Range<usize>, usize),
+    /// Esc closed the picker for the `((` at this offset.
+    ref_dismissed: Option<usize>,
     /// True between a mouse-down in the edited block and the mouse-up: mouse
     /// moves in between extend the selection.
     selecting: bool,
     /// Ids of folded blocks (their descendants are hidden). UI-only: not
-    /// saved, and block ids are regenerated on load anyway.
+    /// saved, and most block ids are regenerated on load anyway.
     collapsed: HashSet<Uuid>,
     /// While a block is being dragged by its bullet: where it would land.
     /// Only meaningful while GPUI has an active drag.
@@ -350,6 +358,8 @@ impl NoteSec {
             selecting: false,
             collapsed: HashSet::new(),
             block_drop: None,
+            ref_selected: (0..0, 0),
+            ref_dismissed: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             text_history_active: false,
@@ -876,6 +886,98 @@ impl NoteSec {
         cx.notify();
     }
 
+    // --- "((" block-reference picker ----------------------------------------
+
+    /// The `((query` range the picker is open for, if it is: while editing a
+    /// block (and no other menu or overlay is up), unless Esc closed it.
+    fn ref_query(&self) -> Option<Range<usize>> {
+        self.editing?;
+        if self.search.is_some() || self.slash.is_some() || self.settings.is_some() {
+            return None;
+        }
+        let range = self.editor.block_ref_query()?;
+        (self.ref_dismissed != Some(range.start)).then_some(range)
+    }
+
+    /// Blocks the open picker lists, as `(page, block)`; empty when closed.
+    fn ref_matches(&self) -> Vec<(usize, usize)> {
+        let Some(range) = self.ref_query() else {
+            return Vec::new();
+        };
+        let query = &self.editor.text[range.start + 2..range.end];
+        let editing_id = self
+            .editing
+            .map(|ix| self.pages[self.selected].blocks[ix].id);
+        search_blocks(&self.pages, query, editing_id, 8)
+    }
+
+    /// The picker's highlighted entry, for the current query.
+    fn ref_highlight(&self) -> usize {
+        match self.ref_query() {
+            Some(range) if self.ref_selected.0 == range => self.ref_selected.1,
+            _ => 0,
+        }
+    }
+
+    /// True while the picker is open with something to pick, which is when
+    /// it takes Up, Down, Enter and Esc.
+    fn ref_menu_open(&self) -> bool {
+        !self.ref_matches().is_empty()
+    }
+
+    fn move_ref_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.ref_matches().len();
+        if let (Some(range), true) = (self.ref_query(), count > 0) {
+            let selected = (self.ref_highlight() as isize + delta).clamp(0, count as isize - 1);
+            self.ref_selected = (range, selected as usize);
+        }
+        cx.notify();
+    }
+
+    /// Replace the typed `((query` with a reference to block `target`
+    /// (`(page, block)`): `((<its id>))`, cursor after it. One undo step;
+    /// saved right away, which also writes the target's id to its page (see
+    /// `save_page`).
+    fn insert_block_ref(&mut self, target: (usize, usize), cx: &mut Context<Self>) {
+        let Some(range) = self.ref_query() else {
+            return;
+        };
+        let Some(id) = self
+            .pages
+            .get(target.0)
+            .and_then(|page| page.blocks.get(target.1))
+            .map(|b| b.id)
+        else {
+            return;
+        };
+        self.text_history_active = false;
+        let before = self.history_state();
+        self.editor.replace_range(range, &format!("(({id}))"));
+        self.record_state(before);
+        self.sync_content();
+        self.save_page();
+        cx.notify();
+    }
+
+    /// Click on a block reference: go to the referenced block's page and
+    /// edit that block.
+    fn open_block_ref(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((page, _)) = find_block(&self.pages, id) else {
+            return;
+        };
+        let title = self.pages[page].title.clone();
+        self.navigate(&title, Nav::Replace, cx);
+        // Navigating saves first, which can reorder pages: find it again.
+        if let Some(ix) = self.pages[self.selected]
+            .blocks
+            .iter()
+            .position(|b| b.id == id)
+        {
+            self.reveal(ix);
+            self.start_edit(ix, window, cx);
+        }
+    }
+
     // --- persistence helpers -------------------------------------------------
 
     /// Save the selected page, then create any pages its `[[links]]` point to.
@@ -883,12 +985,43 @@ impl NoteSec {
     /// Doing link-target creation here (rather than per keystroke) means typing
     /// `[[Ne` never creates a half-named page: links are only acted on once the
     /// block is committed.
+    ///
+    /// Blocks this page references with `((id))` get their id written to
+    /// their own page first (once), so the reference still finds them after
+    /// a restart.
     fn save_page(&mut self) {
+        self.keep_referenced_ids();
         let page = &self.pages[self.selected];
         if let Err(err) = self.storage.save(page) {
             eprintln!("notesec: failed to save {}: {err}", page.title);
         }
         self.ensure_link_targets();
+    }
+
+    /// Mark every block the selected page references as one whose id is
+    /// saved, and save the other pages that changed because of it.
+    fn keep_referenced_ids(&mut self) {
+        let ids: Vec<Uuid> = self.pages[self.selected]
+            .blocks
+            .iter()
+            .flat_map(|b| parse_block_refs(&b.content))
+            .map(|(_, id)| id)
+            .collect();
+        let mut changed = Vec::new();
+        for id in ids {
+            if let Some((page, _)) = find_block(&self.pages, id) {
+                if self.pages[page].saved_ids.insert(id) && page != self.selected {
+                    changed.push(page);
+                }
+            }
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        for page in changed {
+            if let Err(err) = self.storage.save(&self.pages[page]) {
+                eprintln!("notesec: failed to save {}: {err}", self.pages[page].title);
+            }
+        }
     }
 
     /// Index of the page called `title`. Matching ignores case, like Logseq.
@@ -1263,6 +1396,10 @@ impl NoteSec {
             }
             return;
         }
+        if let Some(&target) = self.ref_matches().get(self.ref_highlight()) {
+            self.insert_block_ref(target, cx);
+            return;
+        }
         let Some(ix) = self.editing else { return };
         self.text_history_active = false;
         self.record_edit();
@@ -1565,6 +1702,10 @@ impl NoteSec {
             self.move_slash_selection(-1, cx);
             return;
         }
+        if self.ref_menu_open() {
+            self.move_ref_selection(-1, cx);
+            return;
+        }
         if let Some(prev) = self.editing.and_then(|ix| self.visible_neighbor(ix, false)) {
             self.move_edit(prev, cx);
         }
@@ -1579,6 +1720,10 @@ impl NoteSec {
             self.move_slash_selection(1, cx);
             return;
         }
+        if self.ref_menu_open() {
+            self.move_ref_selection(1, cx);
+            return;
+        }
         if let Some(next) = self.editing.and_then(|ix| self.visible_neighbor(ix, true)) {
             self.move_edit(next, cx);
         }
@@ -1591,6 +1736,9 @@ impl NoteSec {
             self.close_search(cx);
         } else if self.slash.is_some() {
             self.dismiss_slash(cx);
+        } else if let (Some(range), true) = (self.ref_query(), self.ref_menu_open()) {
+            self.ref_dismissed = Some(range.start);
+            cx.notify();
         } else if self.editor.selection().is_some() {
             // First Esc only drops the selection; the next one stops editing.
             self.editor.clear_selection();
@@ -1676,12 +1824,15 @@ fn reading_highlights(
     display: &DisplayBlock,
     link_style: HighlightStyle,
     tag_style: HighlightStyle,
+    ref_style: HighlightStyle,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     display
         .segments()
         .into_iter()
         .map(|(range, format)| {
-            let mut style = if format.tag {
+            let mut style = if format.block_ref {
+                ref_style
+            } else if format.tag {
                 tag_style
             } else if format.link {
                 link_style
@@ -1800,6 +1951,10 @@ impl EntityInputHandler for NoteSec {
             .or(self.active_editor().marked.clone())
             .unwrap_or(self.active_editor().selected_range());
         let in_block = self.search.is_none() && self.editing.is_some();
+        // Typing another "(" may start a new "((": show the picker again.
+        if new_text.contains('(') {
+            self.ref_dismissed = None;
+        }
         // "/" typed into an empty block, or over a selection, opens the
         // block-type menu. The "/" is inserted without replacing anything
         // (after the selection), and its typing records no history: the menu
@@ -2333,6 +2488,19 @@ impl Render for NoteSec {
             ..Default::default()
         };
 
+        // Block references show the referenced text on a faint accent wash
+        // with a wavy muted underline, so they read as quoted, not as your
+        // own words.
+        let ref_style = HighlightStyle {
+            background_color: Some(Hsla::from(theme.accent).opacity(0.10)),
+            underline: Some(UnderlineStyle {
+                color: Some(theme.muted.into()),
+                thickness: px(1.0),
+                wavy: true,
+            }),
+            ..Default::default()
+        };
+
         // --- Sidebar: one clickable row per page ---------------------------
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = self.mode == Mode::Notes && ix == self.selected;
@@ -2683,6 +2851,69 @@ impl Render for NoteSec {
                 .children(items)
         });
 
+        // --- "((" block-reference picker (same place as the "/" menu) ------
+        let ref_matches = self.ref_matches();
+        if slash_menu.is_none() && !ref_matches.is_empty() {
+            let selected = self.ref_highlight();
+            let items: Vec<AnyElement> = ref_matches
+                .into_iter()
+                .enumerate()
+                .map(|(i, target)| {
+                    let page = &self.pages[target.0];
+                    let block = &page.blocks[target.1];
+                    let text = DisplayBlock::new(&block.content).text.replace('\n', " ");
+                    div()
+                        .id(("ref-item", i))
+                        .debug_selector(move || format!("ref-item-{i}"))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .gap_4()
+                        .cursor_pointer()
+                        .text_color(theme.text)
+                        .when(i == selected, |d| d.bg(theme.selected_bg))
+                        .hover(|d| d.bg(theme.selected_bg))
+                        .on_click(cx.listener(move |this, _e, _window, cx| {
+                            this.insert_block_ref(target, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(text),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.muted)
+                                .child(page.title.clone()),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            slash_menu = Some(
+                div()
+                    .id("ref-menu")
+                    .debug_selector(|| "ref-menu".to_string())
+                    .occlude()
+                    .w(px(420.0))
+                    .flex()
+                    .flex_col()
+                    .p_1()
+                    .rounded_lg()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_lg()
+                    .text_size(px(font_size))
+                    .children(items),
+            );
+        }
+
         // --- Main pane: title + blocks --------------------------------------
         let page = &self.pages[self.selected];
         #[cfg(test)]
@@ -2712,7 +2943,12 @@ impl Render for NoteSec {
                 // (`# `, `> `) and paired `**`/`*` markers and styles the row
                 // instead; the editor shows the raw markdown. `display` also
                 // maps shown offsets back to `content` offsets.
-                let display = (!is_editing).then(|| Rc::new(DisplayBlock::new(&block.content)));
+                let display = (!is_editing).then(|| {
+                    Rc::new(DisplayBlock::with_refs(&block.content, |id| {
+                        find_block(&self.pages, id)
+                            .map(|(p, b)| self.pages[p].blocks[b].content.clone())
+                    }))
+                });
                 let kind = match &display {
                     Some(d) => d.kind,
                     None => BlockKind::parse(&self.editor.text).0,
@@ -2726,7 +2962,7 @@ impl Render for NoteSec {
                         .child(BlockText { app: cx.entity() })
                         .into_any_element(),
                     Some(d) => {
-                        let highlights = reading_highlights(d, link_style, tag_style);
+                        let highlights = reading_highlights(d, link_style, tag_style, ref_style);
                         // `with_highlights` resolves against the inherited text
                         // style, so heading size/weight and quote styling (and
                         // the theme's text colour) apply to the unhighlighted
@@ -2789,11 +3025,29 @@ impl Render for NoteSec {
                             .cloned()
                     }
                 };
+                let block_ref_at = {
+                    let (layout, display) = (text_layout.clone(), display.clone());
+                    move |position: gpui::Point<Pixels>| {
+                        let (layout, display) = (layout.as_ref()?, display.as_ref()?);
+                        let char_ix = layout.index_for_position(position).ok()?;
+                        display
+                            .block_refs
+                            .iter()
+                            .find(|r| r.range.contains(&char_ix))
+                            .map(|r| r.id)
+                    }
+                };
                 let on_press = {
-                    let (layout, display, link_at) =
-                        (text_layout.clone(), display.clone(), link_at.clone());
+                    let (layout, display, link_at, block_ref_at) = (
+                        text_layout.clone(),
+                        display.clone(),
+                        link_at.clone(),
+                        block_ref_at.clone(),
+                    );
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        if link_at(event.position).is_some() {
+                        if link_at(event.position).is_some()
+                            || block_ref_at(event.position).is_some()
+                        {
                             return;
                         }
                         let offset = layout.as_ref().map_or(0, |layout| {
@@ -2810,14 +3064,16 @@ impl Render for NoteSec {
                         cx.notify();
                     })
                 };
-                let on_click = cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                let on_click = cx.listener(move |this, event: &ClickEvent, window, cx| {
                     // The press already started editing unless it was on a
-                    // link; only links act on click.
+                    // link or a block reference; only those act on click.
                     if this.editing == Some(ix) {
                         return;
                     }
                     if let Some(link) = link_at(event.position()) {
                         this.open_page(&link.target, cx);
+                    } else if let Some(id) = block_ref_at(event.position()) {
+                        this.open_block_ref(id, window, cx);
                     }
                 });
                 // Blocks with children get a fold arrow; a folded one also
@@ -5101,15 +5357,15 @@ mod tests {
         };
         let bold = Some(FontWeight::BOLD);
         let italic = Some(FontStyle::Italic);
-        let h = reading_highlights(&DisplayBlock::new("a **bold** and *it*"), link, tag);
+        let h = reading_highlights(&DisplayBlock::new("a **bold** and *it*"), link, tag, link);
         assert_eq!(h.len(), 2);
         assert_eq!((h[0].0.clone(), h[0].1.font_weight), (2..6, bold));
         assert_eq!((h[1].0.clone(), h[1].1.font_style), (11..13, italic));
-        let h = reading_highlights(&DisplayBlock::new("## ***Big*** [[Page]]"), link, tag);
+        let h = reading_highlights(&DisplayBlock::new("## ***Big*** [[Page]]"), link, tag, link);
         assert_eq!(h[0].0, 0..3);
         assert_eq!((h[0].1.font_weight, h[0].1.font_style), (bold, italic));
         assert_eq!((h[1].0.clone(), h[1].1), (4..12, link));
-        let h = reading_highlights(&DisplayBlock::new("**see [[Page]] #tag**"), link, tag);
+        let h = reading_highlights(&DisplayBlock::new("**see [[Page]] #tag**"), link, tag, link);
         let ranges: Vec<_> = h.iter().map(|(r, _)| r.clone()).collect();
         assert_eq!(ranges, vec![0..4, 4..12, 12..13, 13..17]);
         assert!(h.iter().all(|(_, s)| s.font_weight == bold));
@@ -6363,6 +6619,143 @@ mod tests {
         assert_eq!(contents, ["b", "c", "a", "a1"]);
         assert_eq!(page.blocks[3].parent_id, Some(page.blocks[2].id));
         assert_eq!(page.to_markdown(), "- b\n- c\n- a\n  - a1\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn double_paren_picks_a_block_and_inserts_its_reference(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "block-ref-insert",
+            &[
+                ("Test", "- alpha one\n- \n"),
+                ("Other", "- beta source\n- beta two\n"),
+            ],
+            "Test",
+        );
+        click_block(cx, 1);
+        cx.simulate_input("((bet");
+        assert!(has(cx, "ref-menu"));
+        assert!(has(cx, "ref-item-0") && has(cx, "ref-item-1"));
+        // The edited block itself is never offered; "alpha" doesn't match.
+        assert!(!has(cx, "ref-item-2"));
+
+        cx.simulate_keystrokes("down enter");
+        let (id, other) = view.update(cx, |app, _| {
+            let other = app.find_page("Other").unwrap();
+            (app.pages[other].blocks[1].id, other)
+        });
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, format!("(({id}))"));
+            assert_eq!(app.editor.cursor, app.editor.text.len());
+            assert!(app.pages[other].saved_ids.contains(&id));
+        });
+        assert!(!has(cx, "ref-menu"));
+        assert_eq!(file(&dir), format!("- alpha one\n- (({id}))\n"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Other.md")).unwrap(),
+            format!("- beta source\n- beta two\n  id:: {id}\n")
+        );
+
+        // One undo step back to the typed query.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "((bet"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_block_ref_picker_and_keeps_the_text(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "block-ref-esc", "- source\n- \n");
+        click_block(cx, 1);
+        cx.simulate_input("((so");
+        assert!(has(cx, "ref-menu"));
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "ref-menu"));
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.text, "((so");
+        });
+        // Still closed while typing on; Enter is a normal Enter again.
+        cx.simulate_input("u");
+        assert!(!has(cx, "ref-menu"));
+        // A new "((" opens it again.
+        cx.simulate_input(" ((");
+        assert!(has(cx, "ref-menu"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn block_reference_shows_the_source_text_and_click_jumps_there(cx: &mut TestAppContext) {
+        let id = Uuid::new_v4();
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "block-ref-render",
+            &[
+                ("Test", &format!("- see (({id})) here\n")),
+                (
+                    "Other",
+                    &format!("- first\n- the **source** text\n  id:: {id}\n"),
+                ),
+            ],
+            "Test",
+        );
+        let shown = view.update(cx, |app, _| {
+            let (_, layout) = app.reading_layouts.iter().find(|(r, _)| *r == 0).unwrap();
+            layout.text()
+        });
+        assert_eq!(shown, "see the source text here");
+        // The file still holds the reference, not the copied text.
+        assert_eq!(file(&dir), format!("- see (({id})) here\n"));
+
+        // Clicking the referenced text opens the source block for editing.
+        let at = reading_point(&view, cx, 0, "see the so".len());
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Other");
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.text, "the **source** text");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn missing_block_reference_shows_as_written(cx: &mut TestAppContext) {
+        let id = Uuid::new_v4();
+        let (view, cx, dir) = setup(cx, "block-ref-missing", &format!("- see (({id}))\n"));
+        let shown = view.update(cx, |app, _| {
+            let (_, layout) = app.reading_layouts.iter().find(|(r, _)| *r == 0).unwrap();
+            layout.text()
+        });
+        assert_eq!(shown, format!("see (({id}))"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn block_reference_survives_save_and_load(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "block-ref-persist",
+            &[("Test", "- \n"), ("Other", "- keep me\n")],
+            "Test",
+        );
+        click_block(cx, 0);
+        cx.simulate_input("((keep");
+        cx.simulate_keystrokes("enter escape");
+        let id = view.update(cx, |app, _| {
+            app.pages[app.find_page("Other").unwrap()].blocks[0].id
+        });
+
+        // As on the next start: everything read back from disk.
+        let pages = Storage::open(dir.clone()).unwrap().load_all();
+        let test = pages.iter().find(|p| p.title == "Test").unwrap();
+        assert_eq!(test.blocks[0].content, format!("(({id}))"));
+        let (p, b) = find_block(&pages, id).expect("the referenced block keeps its id");
+        assert_eq!(pages[p].title, "Other");
+        assert_eq!(pages[p].blocks[b].content, "keep me");
+        let resolved = DisplayBlock::with_refs(&test.blocks[0].content, |id| {
+            find_block(&pages, id).map(|(p, b)| pages[p].blocks[b].content.clone())
+        });
+        assert_eq!(resolved.text, "keep me");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

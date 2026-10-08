@@ -8,6 +8,7 @@
 //! This module is pure (no UI, no I/O), so it is easy to unit-test.
 
 use crate::model::Page;
+use uuid::Uuid;
 
 /// Only the first this-many characters of a block are searched. Keeps the cost
 /// of one keystroke bounded even if a block holds a pasted wall of text.
@@ -232,6 +233,34 @@ pub fn search(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
     hits.sort_by(|a, b| b.score.cmp(&a.score));
     hits.truncate(limit);
     hits
+}
+
+/// Blocks for the `((` reference picker, as `(page, block)` indices: every
+/// non-empty block whose text fuzzy-matches `query`, best first (ties keep
+/// page and document order), except the block `exclude` (the one being
+/// edited, which can't usefully reference itself).
+pub fn search_blocks(
+    pages: &[Page],
+    query: &str,
+    exclude: Option<Uuid>,
+    limit: usize,
+) -> Vec<(usize, usize)> {
+    let mut hits: Vec<(i32, usize, usize)> = Vec::new();
+    for (page_ix, page) in pages.iter().enumerate() {
+        for (block_ix, block) in page.blocks.iter().enumerate() {
+            if block.content.trim().is_empty() || Some(block.id) == exclude {
+                continue;
+            }
+            if let Some(score) = fuzzy_score(query, &block.content) {
+                hits.push((score, page_ix, block_ix));
+            }
+        }
+    }
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.into_iter()
+        .take(limit)
+        .map(|(_, page, block)| (page, block))
+        .collect()
 }
 
 /// Filter template names for the palette's "Insert template" step. An empty

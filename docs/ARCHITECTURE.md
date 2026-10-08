@@ -627,6 +627,28 @@ that mutate, and data races are essentially impossible.
     Dropping anywhere on the page moves the block to the line; leaving the
     page hides the line and makes the drop a no-op.
 
+24. **Block references use the block's UUID, written to the file only
+    when something references it**: every block already gets a `Uuid` when
+    it is created or loaded, but unreferenced ones get a fresh one on each
+    load, which keeps the markdown free of ids. Once a block is referenced
+    its id goes under its first line as Logseq's `id:: <uuid>` property
+    (`Page::saved_ids`; `save_page` adds the targets of every `((id))` on
+    the page and saves their pages too), and loading gives the block that
+    id again, so the reference survives a restart. A duplicate id line is
+    dropped rather than giving two blocks one id. Typing `((` in a block
+    opens a picker under it that fuzzy-matches every other non-empty block
+    (`search_blocks`); it is derived from the text (`block_ref_query`: a
+    `((` before the cursor with no `)` or line break after it), so typing,
+    deleting and moving the cursor need no extra state, only the highlight
+    and an Esc flag. Enter or a click replaces `((query` with `((<uuid>))`
+    as one undo step. In reading view `DisplayBlock::with_refs` shows the
+    referenced block's own reading text in place of the reference, one level
+    deep (references inside it stay as written, so cycles can't recurse),
+    on a faint accent wash with a wavy underline; the shown text maps back
+    to the start or end of the reference in `content`, so the editor and the
+    file only ever hold `((uuid))`. Clicking it opens the source page and
+    edits that block. A reference to a missing block shows as written.
+
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
 code you've already seen above — that's the advantage of learning from your own
