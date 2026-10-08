@@ -585,6 +585,7 @@ impl NoteSec {
             Command::InsertTemplate => self.open_template_picker(None, cx),
             Command::OpenSettings => self.open_settings(cx),
             Command::SortPagesAz => self.sort_pages_az(cx),
+            Command::ToggleLocalGraph => self.toggle_local_graph(cx),
         }
     }
 
@@ -1520,6 +1521,15 @@ impl NoteSec {
         self.stop_edit(cx);
         self.tabs.open(TabTarget::Graph);
         self.apply_tab(cx);
+    }
+
+    /// "Toggle local graph" (palette): show the graph tab and switch it
+    /// between the whole graph and the current page's neighbourhood.
+    fn toggle_local_graph(&mut self, cx: &mut Context<Self>) {
+        self.show_graph(cx);
+        if let Some(graph) = self.graph.clone() {
+            graph.update(cx, |g, cx| g.toggle_scope(cx));
+        }
     }
 
     /// Create the graph view, or give it the current pages.
@@ -3962,6 +3972,7 @@ impl Render for NoteSec {
 mod tests {
     use super::*;
     use crate::config::ThemeKind;
+    use crate::graph_view::Scope;
     use crate::state::MAX_RECENT;
     use gpui::{
         Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
@@ -4980,6 +4991,79 @@ mod tests {
             graph.update(cx, |g, _| g.is_pinned("Zed")),
             "dragged node is still pinned"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn graph_titles(graph: &Entity<GraphView>, cx: &mut VisualTestContext) -> Vec<String> {
+        let mut titles = graph.update(cx, |g, _| g.node_titles());
+        titles.sort();
+        titles
+    }
+
+    #[gpui::test]
+    fn local_graph_toggle_shows_neighbours_and_nodes_still_open_pages(cx: &mut TestAppContext) {
+        let pages = [
+            ("Test", "- links to [[Alpha]] about #topic\n"),
+            ("Alpha", "- back to [[Test]] and [[Zed]]\n"),
+            ("Zed", "- leaf\n"),
+            ("topic", "- tag page\n"),
+            ("Island", "- alone\n"),
+        ];
+        let (view, cx, dir) = setup_pages(cx, "graph-local", &pages, "Test");
+        let today = today_title();
+        let mut all = vec!["Alpha", "Island", "Test", "Zed", "topic", today.as_str()]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        all.sort();
+        let (graph, _) = open_graph(&view, cx);
+        assert_eq!(graph_titles(&graph, cx), all, "global by default");
+
+        // Local: the open page, the page it links to and its tag.
+        click_on(cx, "graph-mode-local");
+        assert_eq!(graph.update(cx, |g, _| g.scope()), Scope::Local);
+        assert_eq!(graph_titles(&graph, cx), vec!["Alpha", "Test", "topic"]);
+        // Two hops reach Zed (via Alpha); one hop again drops it.
+        click_on(cx, "graph-local-depth");
+        assert_eq!(
+            graph_titles(&graph, cx),
+            vec!["Alpha", "Test", "Zed", "topic"]
+        );
+        click_on(cx, "graph-local-depth");
+        assert_eq!(graph_titles(&graph, cx), vec!["Alpha", "Test", "topic"]);
+
+        // Clicking a node still opens its page (in a page tab).
+        let canvas = cx.debug_bounds("graph-canvas").expect("canvas drawn");
+        let alpha = node_pos(&graph, canvas, "Alpha", cx);
+        cx.simulate_click(alpha, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Notes);
+            assert_eq!(app.pages[app.selected].title, "Alpha");
+        });
+
+        // Back in the graph: still local, now around Alpha (incoming link
+        // from Test, outgoing to Zed).
+        let (graph, _) = open_graph_again(&view, cx);
+        assert_eq!(graph.update(cx, |g, _| g.scope()), Scope::Local);
+        assert_eq!(graph_titles(&graph, cx), vec!["Alpha", "Test", "Zed"]);
+
+        click_on(cx, "graph-mode-global");
+        assert_eq!(graph_titles(&graph, cx), all, "Global shows everything");
+
+        // The palette command shows the graph and switches it to local.
+        cx.simulate_keystrokes("ctrl-g");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Notes));
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("local graph");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.search_results()[0].target,
+                Target::Command(Command::ToggleLocalGraph)
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+        assert_eq!(graph.update(cx, |g, _| g.scope()), Scope::Local);
         let _ = std::fs::remove_dir_all(dir);
     }
 

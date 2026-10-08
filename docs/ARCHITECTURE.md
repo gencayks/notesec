@@ -678,6 +678,37 @@ that mutate, and data races are essentially impossible.
     (`UiState::forget`). *Sort pages A-Z* (a palette command and an item
     in the page menu, disabled while already alphabetical) clears
     `page_order`. Reordering isn't an undo step (like favorites).
+31. **Local graph: a filtered `Graph`, same physics and drawing.** The
+    graph view's toolbar has a `Global | Local` switch
+    (`graph-mode-global` / `graph-mode-local`). Local shows the current page
+    and every page one link away, in either direction: pages it links to,
+    pages linking to it, and its tags. A "2 hops" chip (local only,
+    `graph-local-depth`) reaches one ring further, which is the same
+    breadth-first search one step longer, so it costs nothing. Tags became
+    graph edges for this, in both modes: `Graph` now reads references with
+    `parse_references` (`[[links]]` and `#tags`, a tag pointing at the page
+    named like it, which the app creates anyway) instead of wikilinks only,
+    so local and global agree on what a neighbour is. The filtering is pure
+    and in `graph.rs`: `Graph::local_subgraph(center, hops)` keeps the
+    nodes within `hops` edges and only the edges between kept nodes, with
+    positions, pins and backlink counts unchanged (node size still means
+    "linked from many pages" in the whole graph); `Graph::build_local`
+    builds the graph with the journal filter (a journal centre is kept even
+    with journals hidden, but no other journal, so none bridges two hops)
+    and cuts it down. The result is an ordinary `Graph`, so `GraphView`
+    runs the same simulation, camera and painting on it; `rebuild` picks
+    global or local and `Graph::preserve_layout` (split out of the old
+    `build_preserving`) keeps the positions of nodes that stay, so
+    switching doesn't scramble the layout. The *current page* is the one
+    the graph already highlights: the page last shown in a page tab
+    (`selected`), passed in by `refresh` whenever the graph tab is focused.
+    After clicking a node (which opens the page in a page tab, the graph
+    tab stays, decision 20), coming back to the graph shows the local graph
+    of that page. Switching scope or depth, and a new centre in local mode,
+    refit the camera. The mode lives in the `GraphView`, which the app
+    keeps for the session, so it survives leaving and reopening the graph
+    but not a restart (not saved; it is a way of looking, not a setting).
+    The palette's "Toggle local graph" shows the graph and flips the mode.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

@@ -111,10 +111,12 @@ pub enum Command {
     OpenSettings,
     /// Drops the sidebar's custom page order (back to alphabetical).
     SortPagesAz,
+    /// Shows the graph, switched between global and local.
+    ToggleLocalGraph,
 }
 
 impl Command {
-    pub const ALL: [Command; 8] = [
+    pub const ALL: [Command; 9] = [
         Command::ToggleTheme,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
@@ -123,6 +125,7 @@ impl Command {
         Command::InsertTemplate,
         Command::OpenSettings,
         Command::SortPagesAz,
+        Command::ToggleLocalGraph,
     ];
 
     pub fn label(self) -> &'static str {
@@ -135,6 +138,7 @@ impl Command {
             Command::InsertTemplate => "Insert template",
             Command::OpenSettings => "Open settings",
             Command::SortPagesAz => "Sort pages A-Z",
+            Command::ToggleLocalGraph => "Toggle local graph",
         }
     }
 
@@ -145,6 +149,7 @@ impl Command {
         match self {
             Command::OpenSettings => &["preferences", "theme", "font"],
             Command::SortPagesAz => &["alphabetical", "order"],
+            Command::ToggleLocalGraph => &["global graph", "neighbours"],
             _ => &[],
         }
     }
