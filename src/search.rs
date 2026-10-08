@@ -109,10 +109,12 @@ pub enum Command {
     InsertTemplate,
     /// Opens the settings panel.
     OpenSettings,
+    /// Drops the sidebar's custom page order (back to alphabetical).
+    SortPagesAz,
 }
 
 impl Command {
-    pub const ALL: [Command; 7] = [
+    pub const ALL: [Command; 8] = [
         Command::ToggleTheme,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
@@ -120,6 +122,7 @@ impl Command {
         Command::ToggleGraph,
         Command::InsertTemplate,
         Command::OpenSettings,
+        Command::SortPagesAz,
     ];
 
     pub fn label(self) -> &'static str {
@@ -131,6 +134,7 @@ impl Command {
             Command::ToggleGraph => "Toggle graph view",
             Command::InsertTemplate => "Insert template",
             Command::OpenSettings => "Open settings",
+            Command::SortPagesAz => "Sort pages A-Z",
         }
     }
 
@@ -140,6 +144,7 @@ impl Command {
     pub fn keywords(self) -> &'static [&'static str] {
         match self {
             Command::OpenSettings => &["preferences", "theme", "font"],
+            Command::SortPagesAz => &["alphabetical", "order"],
             _ => &[],
         }
     }
@@ -351,6 +356,13 @@ mod tests {
     fn insert_template_is_a_command() {
         let hits = search(&pages(), "insert template", 10);
         assert_eq!(hits[0].target, Target::Command(Command::InsertTemplate));
+    }
+
+    #[test]
+    fn sort_pages_command_is_found_by_label_and_keywords() {
+        let top = |q: &str| search(&pages(), q, 10)[0].target;
+        assert_eq!(top("sort pages"), Target::Command(Command::SortPagesAz));
+        assert_eq!(top("alphabetical"), Target::Command(Command::SortPagesAz));
     }
 
     #[test]

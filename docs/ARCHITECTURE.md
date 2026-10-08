@@ -329,8 +329,8 @@ too, and "nothing is focused" is a real bug class.
   Missing keys fall back to defaults, so old config files never break.
 
 - **`state.rs` — UI state, not settings.** Favorite and recent page titles
-  in `state.toml`, with the same load/save rules as `config.rs` (see
-  decision 21).
+  and the sidebar's custom page order in `state.toml`, with the same
+  load/save rules as `config.rs` (see decisions 21 and 30).
 
 - **`main.rs` — boring on purpose.** Declare modules, open storage, load config,
   open an 1100x700 window, hand control to GPUI's event loop. If `main` is long,
@@ -639,6 +639,45 @@ that mutate, and data races are essentially impossible.
     because a snapshot holds whole pages under their titles and restoring
     one saves them all, so it would write the old file back. *Copy page
     title* writes the title with `cx.write_to_clipboard`.
+30. **Drag to reorder pages; the order lives in `state.toml`.** Only
+    regular pages can be dragged: journals stay above them, newest first,
+    since a date order is the useful one for a diary and mixing the two
+    would make "where is today" depend on dragging. A row is a GPUI drag
+    source (`on_drag` with a `DraggedPage { title }` value and a small
+    preview view that follows the pointer); every page row and a short
+    end-of-list zone (`page-drop-end`) listen with
+    `on_drag_move::<DraggedPage>`. The upper half of a row means "before
+    this page", the lower half "before the next one" (after the last row,
+    or in the end zone: at the very end); each zone also covers half the
+    gap next to it. GPUI calls every zone's drag-move handler on every
+    move, so a zone only clears the drop position it set itself (Zed's
+    project panel does the same). The position shows as an accent line in
+    the gap above the target (`page-drop-indicator`); none is shown where
+    dropping would change nothing. The drop itself is one `on_drop` on the
+    whole sidebar list, which moves the page to the position shown; a drag
+    released anywhere else just ends (GPUI drops it on mouse-up), and
+    `render` forgets a stale position once no drag is active. Clicking
+    still opens a page: GPUI only starts a drag past a 2px move, and a
+    drag never becomes a click. The order is `page_order` (titles) in
+    `state.toml`, as UI state like favorites, not a setting: a drop saves
+    the whole order of regular pages. Absent or empty means alphabetical,
+    so nothing changes until you drag. `sort_pages(pages, order)` is the
+    one place that orders pages (listed pages by position, matched ignoring
+    case, then unlisted ones alphabetically; stale entries are ignored),
+    and `NoteSec::sort_pages` applies it keeping `selected` on the same
+    page. Startup, adding a page, rename, a drop, "Sort pages A-Z" and
+    undo/redo (a snapshot may hold the old order) all go through it; tabs,
+    favorites and recent hold titles, so indices moving doesn't touch them.
+    *New pages* (Ctrl-N, a followed `[[link]]`, the Today journal aside)
+    are appended to `page_order` while a custom order exists, so they show
+    up at the end of the list where you just made them, rather than at an
+    alphabetical spot inside an order you chose by hand. Pages that appear
+    otherwise (a file added outside the app) also come after the listed
+    ones, alphabetically among themselves. Rename keeps the page's place
+    (`UiState::rename` edits the entry in place); delete drops it
+    (`UiState::forget`). *Sort pages A-Z* (a palette command and an item
+    in the page menu, disabled while already alphabetical) clears
+    `page_order`. Reordering isn't an undo step (like favorites).
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

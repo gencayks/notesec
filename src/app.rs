@@ -19,13 +19,13 @@ use crate::tabs::{TabTarget, Tabs};
 use crate::ui::{block_row, favorite_star, fold_arrow, fold_badge, task_checkbox, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
-    Bounds, ClickEvent, ClipboardItem, Context, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hsla,
-    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
-    UnderlineStyle, Window,
+    Bounds, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, FontStyle, FontWeight, GlobalElementId,
+    HighlightStyle, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, ShapedLine, SharedString, Style, StyledText, Subscription,
+    TextRun, UTF16Selection, UnderlineStyle, Window,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use uuid::Uuid;
@@ -204,6 +204,55 @@ enum MenuStep {
     ConfirmDelete { error: Option<String> },
 }
 
+/// What a sidebar page row carries while it is dragged (`on_drag`): the
+/// page, by title.
+struct DraggedPage {
+    title: String,
+}
+
+/// The floating copy of a page row that follows the pointer during a drag.
+struct PageDragPreview {
+    title: SharedString,
+    theme: Theme,
+    font_size: f32,
+    font_family: Option<SharedString>,
+}
+
+impl Render for PageDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .when_some(self.font_family.clone(), |d, family| d.font_family(family))
+            .text_size(px(self.font_size))
+            .w(px(220.0))
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(theme.sidebar_bg)
+            .border_1()
+            .border_color(theme.accent)
+            .text_color(theme.text)
+            .shadow_md()
+            .opacity(0.9)
+            .child(self.title.clone())
+    }
+}
+
+/// Where a dragged page would land if dropped now.
+#[derive(Clone, Debug, PartialEq)]
+struct PageDrop {
+    /// The drop zone that set this: a page row (by title) or `None` for the
+    /// end-of-list zone. Only that zone clears it when the pointer leaves
+    /// (every zone hears every drag move; Zed's project panel idiom).
+    zone: Option<String>,
+    /// Insert before this page; `None` means at the end of the list.
+    before: Option<String>,
+}
+
+/// Half the gap between sidebar rows (`gap_1`): each row's drop zone
+/// reaches this far past its edges, so the gaps are covered too.
+const ROW_GAP_HALF: f32 = 2.0;
+
 /// The "/" block-type menu while it is open (see `editor::SlashMenu`).
 struct SlashState {
     menu: SlashMenu,
@@ -222,7 +271,8 @@ struct HistoryState {
 
 pub struct NoteSec {
     storage: Storage,
-    /// All pages, kept sorted for the sidebar (journals first, newest first).
+    /// All pages in sidebar order (see `sort_pages`): journals first,
+    /// newest first, then the rest in the custom or alphabetical order.
     pages: Vec<Page>,
     /// Index into `pages` of the page shown in the main pane.
     selected: usize,
@@ -252,6 +302,9 @@ pub struct NoteSec {
     /// `Some` while a page's context menu (or its rename / delete step) is
     /// open.
     page_menu: Option<PageMenu>,
+    /// Where the page being dragged in the sidebar would land. Only
+    /// meaningful while a drag is active; `render` clears it otherwise.
+    page_drop: Option<PageDrop>,
     /// True between a mouse-down in the edited block and the mouse-up: mouse
     /// moves in between extend the selection.
     selecting: bool,
@@ -315,7 +368,8 @@ impl NoteSec {
             pages.push(welcome);
         }
 
-        sort_pages(&mut pages);
+        let state = UiState::load(storage.root());
+        sort_pages(&mut pages, &state.page_order);
         // Open on today's journal.
         let selected = pages
             .iter()
@@ -333,8 +387,6 @@ impl NoteSec {
             .as_deref()
             .and_then(|family| installed_font(family, cx));
 
-        let state = UiState::load(storage.root());
-
         let mut app = NoteSec {
             storage,
             pages,
@@ -350,6 +402,7 @@ impl NoteSec {
             slash: None,
             settings: None,
             page_menu: None,
+            page_drop: None,
             selecting: false,
             collapsed: HashSet::new(),
             undo_stack: Vec::new(),
@@ -531,6 +584,7 @@ impl NoteSec {
             Command::ToggleGraph => self.toggle_graph(cx),
             Command::InsertTemplate => self.open_template_picker(None, cx),
             Command::OpenSettings => self.open_settings(cx),
+            Command::SortPagesAz => self.sort_pages_az(cx),
         }
     }
 
@@ -673,6 +727,8 @@ impl NoteSec {
     ) {
         self.pages = state.pages;
         self.selected = state.selected.min(self.pages.len().saturating_sub(1));
+        // The snapshot may predate a drag or "Sort pages A-Z".
+        self.sort_pages();
         self.editing = state.editing.filter(|&ix| {
             self.selected < self.pages.len() && ix < self.pages[self.selected].blocks.len()
         });
@@ -745,8 +801,7 @@ impl NoteSec {
         if let Err(err) = self.storage.save(&page) {
             eprintln!("notesec: failed to create page {title}: {err}");
         }
-        self.pages.push(page);
-        sort_pages(&mut self.pages);
+        self.add_page(page);
         let ix = self.find_page(&title).unwrap_or(0);
         self.show_page(ix, cx);
         self.start_edit(0, window, cx);
@@ -944,12 +999,34 @@ impl NoteSec {
     }
 
     /// Add a page, keeping the sidebar sorted and `selected` pointing at the
-    /// same page as before (sorting can shift indices).
+    /// same page as before (sorting can shift indices). With a custom order
+    /// the new page goes at the end of it.
     fn add_page(&mut self, page: Page) {
-        let current = self.pages[self.selected].title.clone();
+        if !page.is_journal && !self.state.page_order.is_empty() {
+            self.state.page_order.push(page.title.clone());
+            self.save_state();
+        }
         self.pages.push(page);
-        sort_pages(&mut self.pages);
-        self.selected = self.find_page(&current).unwrap_or(0);
+        self.sort_pages();
+    }
+
+    /// Put `pages` in sidebar order (`sort_pages`, with the custom order
+    /// from `state.toml`), keeping `selected` on the same page. Every
+    /// re-sort goes through here: startup aside, that is adding, renaming,
+    /// dropping a dragged page, "Sort pages A-Z" and undo/redo.
+    fn sort_pages(&mut self) {
+        let current = self
+            .pages
+            .get(self.selected)
+            .map(|p| (p.title.clone(), p.is_journal));
+        sort_pages(&mut self.pages, &self.state.page_order);
+        if let Some((title, is_journal)) = current {
+            self.selected = self
+                .pages
+                .iter()
+                .position(|p| p.title == title && p.is_journal == is_journal)
+                .unwrap_or(0);
+        }
     }
 
     /// Create (and save) a page for every `[[link]]` on the selected page that
@@ -1243,26 +1320,14 @@ impl NoteSec {
             .rename(&self.pages[ix], &new)
             .map_err(|err| format!("Could not rename the file: {err}"))?;
 
-        let current = &self.pages[self.selected];
-        let current = (
-            if self.selected == ix {
-                new.clone()
-            } else {
-                current.title.clone()
-            },
-            current.is_journal,
-        );
         self.pages[ix].rename(&new);
-        sort_pages(&mut self.pages);
-        self.selected = self
-            .pages
-            .iter()
-            .position(|p| p.title == current.0 && p.is_journal == current.1)
-            .unwrap_or(0);
-        self.tabs.rename(&old, &new);
+        // Favorites, recent and the custom order follow (in place) before
+        // re-sorting, so the page keeps its spot in a custom order.
         if self.state.rename(&old, &new) {
             self.save_state();
         }
+        self.sort_pages();
+        self.tabs.rename(&old, &new);
         self.forget_history();
         if self.mode == Mode::Graph {
             self.refresh_graph(cx);
@@ -1353,6 +1418,98 @@ impl NoteSec {
             cx.write_to_clipboard(ClipboardItem::new_string(menu.title.clone()));
         }
         self.close_page_menu(cx);
+    }
+
+    // --- custom page order: drag to reorder, "Sort pages A-Z" -----------------
+
+    /// Titles of the regular (non-journal) pages, in sidebar order.
+    fn regular_titles(&self) -> Vec<String> {
+        self.pages
+            .iter()
+            .filter(|p| !p.is_journal)
+            .map(|p| p.title.clone())
+            .collect()
+    }
+
+    /// The order of the regular pages after moving `dragged` to just before
+    /// `before` (`None`: to the end), or `None` if that changes nothing or
+    /// either page is unknown (journals aren't in this list).
+    fn reordered(&self, dragged: &str, before: Option<&str>) -> Option<Vec<String>> {
+        let mut order = self.regular_titles();
+        let from = order.iter().position(|t| t == dragged)?;
+        let to = match before {
+            Some(before) => order.iter().position(|t| t == before)?,
+            None => order.len(),
+        };
+        // Removing the page first shifts the places after it up by one.
+        let to = if to > from { to - 1 } else { to };
+        if to == from {
+            return None;
+        }
+        let title = order.remove(from);
+        order.insert(to, title);
+        Some(order)
+    }
+
+    /// A page is dragged over the drop zone `zone` (a page row by title, or
+    /// `None` for the end-of-list zone). In the zone's upper half the page
+    /// would go before `upper`, in its lower half before `lower` (`None`:
+    /// at the end). Every zone hears every move, so a zone only clears the
+    /// drop position it set itself.
+    fn drag_over_zone(
+        &mut self,
+        event: &DragMoveEvent<DraggedPage>,
+        zone: Option<String>,
+        upper: Option<String>,
+        lower: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let position = event.event.position;
+        if !event.bounds.dilate(px(ROW_GAP_HALF)).contains(&position) {
+            if self.page_drop.as_ref().is_some_and(|d| d.zone == zone) {
+                self.page_drop = None;
+                cx.notify();
+            }
+            return;
+        }
+        let before = if position.y < event.bounds.center().y {
+            upper
+        } else {
+            lower
+        };
+        let dragged = event.drag(cx).title.clone();
+        // No indicator where dropping would leave the order as it is.
+        let drop = self
+            .reordered(&dragged, before.as_deref())
+            .map(|_| PageDrop { zone, before });
+        if self.page_drop != drop {
+            self.page_drop = drop;
+            cx.notify();
+        }
+    }
+
+    /// A dragged page was released over the sidebar: move it to the drop
+    /// position shown, and save that as the custom order.
+    fn drop_page(&mut self, dragged: &str, cx: &mut Context<Self>) {
+        if let Some(drop) = self.page_drop.take() {
+            if let Some(order) = self.reordered(dragged, drop.before.as_deref()) {
+                self.state.page_order = order;
+                self.save_state();
+                self.sort_pages();
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Sort pages A-Z" (palette or page menu): forget the custom order.
+    fn sort_pages_az(&mut self, cx: &mut Context<Self>) {
+        self.close_page_menu(cx);
+        if !self.state.page_order.is_empty() {
+            self.state.page_order.clear();
+            self.save_state();
+            self.sort_pages();
+        }
+        cx.notify();
     }
 
     // --- graph view ------------------------------------------------------------
@@ -1918,14 +2075,29 @@ fn create_journal(storage: &Storage, title: &str) -> Page {
     page
 }
 
-/// Journals first (newest first, since `YYYY-MM-DD` sorts lexically), then
-/// regular pages alphabetically.
-fn sort_pages(pages: &mut [Page]) {
+/// Sidebar order. Journals first, newest first (`YYYY-MM-DD` sorts
+/// lexically); they always keep date order. Then regular pages: those named
+/// in `order` (the custom order from `state.toml`, matched ignoring case)
+/// in that order, then any others alphabetically. An empty `order` is
+/// plain alphabetical; entries without a page are ignored.
+fn sort_pages(pages: &mut [Page], order: &[String]) {
+    let mut rank = HashMap::new();
+    for (i, title) in order.iter().enumerate() {
+        rank.entry(title.to_lowercase()).or_insert(i);
+    }
+    // Listed pages by their position, then the rest alphabetically.
+    let key = |p: &Page| {
+        let title = p.title.to_lowercase();
+        match rank.get(&title) {
+            Some(&r) => (0, r, String::new()),
+            None => (1, 0, title),
+        }
+    };
     pages.sort_by(|a, b| match (a.is_journal, b.is_journal) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         (true, true) => b.title.cmp(&a.title),
-        (false, false) => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+        (false, false) => key(a).cmp(&key(b)),
     });
 }
 
@@ -2649,6 +2821,7 @@ impl NoteSec {
                 };
                 let can_rename = self.can_rename(&menu.title);
                 let can_delete = self.can_delete();
+                let custom_order = !self.state.page_order.is_empty();
                 panel()
                     .id("page-menu")
                     .debug_selector(|| "page-menu".to_string())
@@ -2668,6 +2841,18 @@ impl NoteSec {
                     .child(
                         item("page-menu-copy", "Copy page title", true).on_click(
                             cx.listener(|this, _e, _window, cx| this.copy_page_title(cx)),
+                        ),
+                    )
+                    // Only useful once pages were dragged out of A-Z order.
+                    .child(div().my_1().h(px(1.0)).bg(theme.border))
+                    .child(
+                        item("page-menu-sort", "Sort pages A-Z", custom_order).when(
+                            custom_order,
+                            |d| {
+                                d.on_click(
+                                    cx.listener(|this, _e, _window, cx| this.sort_pages_az(cx)),
+                                )
+                            },
                         ),
                     )
                     .into_any_element()
@@ -2701,6 +2886,11 @@ impl NoteSec {
 
 impl Render for NoteSec {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A drag released outside the sidebar just ends (GPUI drops it), so
+        // forget where it would have landed.
+        if !cx.has_active_drag() {
+            self.page_drop = None;
+        }
         let theme = self.theme;
         let font_size = self.config.font_size;
         // Style for `[[wikilinks]]` in display mode: accent colour + underline.
@@ -2722,12 +2912,35 @@ impl Render for NoteSec {
         };
 
         // --- Sidebar: one clickable row per page ---------------------------
+        // The accent line showing where a dragged page would land: above the
+        // row it is drawn in, in the gap between rows.
+        let drop_line = move || {
+            div()
+                .debug_selector(|| "page-drop-indicator".to_string())
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(-3.0))
+                .h(px(2.0))
+                .rounded_sm()
+                .bg(theme.accent)
+        };
+        let drop_before = self.page_drop.as_ref().map(|d| d.before.clone());
+        let preview_font = self.font_family.clone();
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = self.mode == Mode::Notes && ix == self.selected;
             let is_favorite = self.state.is_favorite(&page.title);
             let title = page.title.clone();
             let star_title = page.title.clone();
             let menu_title = page.title.clone();
+            let drop_here = drop_before == Some(Some(page.title.clone()));
+            // Regular pages can be dragged to reorder them; journals keep
+            // their date order. Journals come first, so whatever follows a
+            // regular page is regular too.
+            let drag = (!page.is_journal).then(|| {
+                let next = self.pages.get(ix + 1).map(|p| p.title.clone());
+                (page.title.clone(), next, preview_font.clone())
+            });
             div()
                 // Interactive elements need a stable id; (name, index) is the idiom.
                 .id(("page", ix))
@@ -2770,6 +2983,28 @@ impl Render for NoteSec {
                         this.open_page_menu(menu_title.clone(), event.position, cx)
                     }),
                 )
+                .when_some(drag, |d, (zone, next, font_family)| {
+                    let dragged = DraggedPage {
+                        title: zone.clone(),
+                    };
+                    d.on_drag(dragged, move |page: &DraggedPage, _offset, _window, cx| {
+                        let font_family = font_family.clone();
+                        cx.new(|_| PageDragPreview {
+                            title: page.title.clone().into(),
+                            theme,
+                            font_size,
+                            font_family,
+                        })
+                    })
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<DraggedPage>, _window, cx| {
+                            let zone = Some(zone.clone());
+                            this.drag_over_zone(event, zone.clone(), zone, next.clone(), cx)
+                        },
+                    ))
+                })
+                .relative()
+                .when(drop_here, |d| d.child(drop_line()))
                 .child(div().flex_1().overflow_hidden().child(page.title.clone()))
                 .child(
                     favorite_star(&theme, is_favorite)
@@ -2986,9 +3221,27 @@ impl Render for NoteSec {
             .child("Settings")
             .child(div().text_color(theme.muted).child("Ctrl-,"));
 
+        // Below the last page: dropping here moves a page to the very end.
+        let drop_end = div()
+            .id("page-drop-end")
+            .debug_selector(|| "page-drop-end".to_string())
+            .relative()
+            .h(px(12.0))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedPage>, _window, cx| {
+                    this.drag_over_zone(event, None, None, None, cx)
+                }),
+            )
+            .when(drop_before == Some(None), |d| d.child(drop_line()));
+
         let sidebar_list = div()
             .id("sidebar")
             .debug_selector(|| "sidebar".to_string())
+            // A page dragged anywhere in the list lands where the indicator
+            // is (nowhere if none is shown).
+            .on_drop(cx.listener(|this, dragged: &DraggedPage, _window, cx| {
+                this.drop_page(&dragged.title, cx)
+            }))
             .flex_1()
             .min_h_0()
             .flex()
@@ -3006,6 +3259,7 @@ impl Render for NoteSec {
             })
             .child(pages_header)
             .children(sidebar_items)
+            .child(drop_end)
             .when(has_tags, |d| {
                 d.child(
                     div()
@@ -6806,6 +7060,338 @@ mod tests {
                 .as_deref(),
             Some("Alpha")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- drag to reorder pages ---------------------------------------------
+
+    fn reorder_pages() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("Alpha", "- a\n"),
+            ("Beta", "- b\n"),
+            ("Gamma", "- g\n"),
+            ("Delta", "- d\n"),
+        ]
+    }
+
+    fn bounds_of(cx: &mut VisualTestContext, selector: &str) -> Bounds<Pixels> {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        cx.debug_bounds(selector).expect(selector)
+    }
+
+    /// Press on `from`'s element and drag (left button held) to `to`
+    /// without releasing. The first move, past GPUI's 2px threshold, starts
+    /// the drag; the drop zones hear the moves after it.
+    fn start_drag(cx: &mut VisualTestContext, from: &str, to: Point<Pixels>) {
+        let start = bounds_of(cx, from).center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            start + point(px(0.), px(5.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn release(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// Just inside the top (`upper`) or bottom edge of `selector`'s element.
+    fn edge_of(cx: &mut VisualTestContext, selector: &str, upper: bool) -> Point<Pixels> {
+        let b = bounds_of(cx, selector);
+        if upper {
+            point(b.center().x, b.top() + px(3.))
+        } else {
+            point(b.center().x, b.bottom() - px(3.))
+        }
+    }
+
+    fn drag_page_to(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        title: &str,
+        to: Point<Pixels>,
+    ) {
+        let row = page_row(view, cx, "page", title);
+        start_drag(cx, &row, to);
+        release(cx, to);
+    }
+
+    fn titles(list: &[&str]) -> Vec<String> {
+        list.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn sort_pages_puts_journals_first_then_the_custom_order_then_the_rest() {
+        let mut pages: Vec<Page> = [
+            ("beta", false),
+            ("2026-10-07", true),
+            ("Mid", false),
+            ("Alpha", false),
+            ("2026-10-08", true),
+            ("Zed", false),
+        ]
+        .into_iter()
+        .map(|(title, journal)| Page::new(title, journal))
+        .collect();
+        let order_of =
+            |pages: &[Page]| -> Vec<String> { pages.iter().map(|p| p.title.clone()).collect() };
+
+        // No custom order: alphabetical, ignoring case.
+        sort_pages(&mut pages, &[]);
+        assert_eq!(
+            order_of(&pages),
+            titles(&["2026-10-08", "2026-10-07", "Alpha", "beta", "Mid", "Zed"])
+        );
+
+        // Listed pages first, matched ignoring case (the first entry wins);
+        // a stale entry is skipped; unlisted pages follow alphabetically.
+        let order = titles(&["zed", "Gone", "alpha", "ZED"]);
+        sort_pages(&mut pages, &order);
+        assert_eq!(
+            order_of(&pages),
+            titles(&["2026-10-08", "2026-10-07", "Zed", "Alpha", "beta", "Mid"])
+        );
+
+        // Journals never take part, even if listed.
+        sort_pages(&mut pages, &titles(&["2026-10-07", "Mid"]));
+        assert_eq!(
+            order_of(&pages),
+            titles(&["2026-10-08", "2026-10-07", "Mid", "Alpha", "beta", "Zed"])
+        );
+    }
+
+    #[gpui::test]
+    fn dragging_a_page_reorders_it_and_the_order_survives_a_restart(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-reorder", &reorder_pages(), "Beta");
+        assert_eq!(
+            non_journal_titles(&view, cx),
+            titles(&["Alpha", "Beta", "Delta", "Gamma"])
+        );
+
+        // Drag Gamma over the upper half of Alpha: the indicator shows in
+        // the gap above Alpha.
+        let gamma = page_row(&view, cx, "page", "Gamma");
+        let alpha = page_row(&view, cx, "page", "Alpha");
+        let to = edge_of(cx, &alpha, true);
+        start_drag(cx, &gamma, to);
+        let line = bounds_of(cx, "page-drop-indicator");
+        let alpha_top = bounds_of(cx, &alpha).top();
+        assert!(line.bottom() <= alpha_top && line.top() >= alpha_top - px(4.));
+        release(cx, to);
+
+        assert!(!has(cx, "page-drop-indicator"), "gone after the drop");
+        let order = titles(&["Gamma", "Alpha", "Beta", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.page_order, order);
+            assert_eq!(UiState::load(&dir).page_order, order);
+            // The selection and the tab still show Beta (indices moved);
+            // the drag did not click Gamma open.
+            assert_eq!(app.pages[app.selected].title, "Beta");
+            assert_eq!(app.tabs.tabs, vec![TabTarget::Page("Beta".into())]);
+            // Journals stay first.
+            assert!(app.pages[0].is_journal);
+        });
+        // The row now rendered first among the pages is Gamma.
+        let first = page_row(&view, cx, "page", "Gamma");
+        let second = page_row(&view, cx, "page", "Alpha");
+        assert!(bounds_of(cx, &first).top() < bounds_of(cx, &second).top());
+
+        let storage = Storage::open(dir.clone()).unwrap();
+        let (view2, cx2) = cx
+            .cx
+            .add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
+        cx2.run_until_parked();
+        assert_eq!(non_journal_titles(&view2, cx2), order);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn pages_drop_below_a_row_at_the_very_end_but_not_onto_journals(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-end", &reorder_pages(), "Beta");
+
+        // Lower half of Beta: after it.
+        let beta = page_row(&view, cx, "page", "Beta");
+        let to = edge_of(cx, &beta, false);
+        drag_page_to(&view, cx, "Alpha", to);
+        assert_eq!(
+            non_journal_titles(&view, cx),
+            titles(&["Beta", "Alpha", "Delta", "Gamma"])
+        );
+
+        // The end zone below the last page: to the very end, with the
+        // indicator drawn there.
+        let beta = page_row(&view, cx, "page", "Beta");
+        let end = bounds_of(cx, "page-drop-end").center();
+        start_drag(cx, &beta, end);
+        let line = bounds_of(cx, "page-drop-indicator");
+        assert!(line.bottom() <= bounds_of(cx, "page-drop-end").top());
+        release(cx, end);
+        assert_eq!(
+            non_journal_titles(&view, cx),
+            titles(&["Alpha", "Delta", "Gamma", "Beta"])
+        );
+
+        // Lower half of the last row (Beta): also the end.
+        let beta = page_row(&view, cx, "page", "Beta");
+        let to = edge_of(cx, &beta, false);
+        drag_page_to(&view, cx, "Alpha", to);
+        let order = titles(&["Delta", "Gamma", "Beta", "Alpha"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // Dropping a page where it already is shows no indicator and
+        // changes nothing.
+        let delta = page_row(&view, cx, "page", "Delta");
+        let to = edge_of(cx, &delta, false);
+        start_drag(cx, &delta, to);
+        assert!(!has(cx, "page-drop-indicator"));
+        release(cx, to);
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // Journals can't be dragged, and aren't drop targets.
+        let journal = page_row(&view, cx, "page", &today_title());
+        let gamma = page_row(&view, cx, "page", "Gamma");
+        let to = edge_of(cx, &gamma, true);
+        start_drag(cx, &journal, to);
+        assert!(!has(cx, "page-drop-indicator"));
+        release(cx, to);
+        let to = edge_of(cx, &journal, false);
+        drag_page_to(&view, cx, "Alpha", to);
+        assert_eq!(non_journal_titles(&view, cx), order);
+        view.update(cx, |app, _| {
+            assert!(app.pages[0].is_journal);
+            assert_eq!(UiState::load(&dir).page_order, order);
+        });
+
+        // Released outside the sidebar (no move there first, as when the
+        // pointer leaves the window): the drag just ends.
+        let main = bounds_of(cx, "block-0").center();
+        let row = page_row(&view, cx, "page", "Beta");
+        let delta = page_row(&view, cx, "page", "Delta");
+        let to = edge_of(cx, &delta, true);
+        start_drag(cx, &row, to);
+        assert!(has(cx, "page-drop-indicator"));
+        release(cx, main);
+        assert!(!has(cx, "page-drop-indicator"));
+        assert_eq!(non_journal_titles(&view, cx), order);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn new_pages_go_at_the_end_of_a_custom_order(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-new", &reorder_pages(), "Beta");
+        // Without a custom order a new page is placed alphabetically.
+        view.update(cx, |app, cx| app.open_page("Aardvark", cx));
+        assert_eq!(
+            non_journal_titles(&view, cx),
+            titles(&["Aardvark", "Alpha", "Beta", "Delta", "Gamma"])
+        );
+        view.update(cx, |app, _| assert!(app.state.page_order.is_empty()));
+
+        let alpha = page_row(&view, cx, "page", "Alpha");
+        let to = edge_of(cx, &alpha, true);
+        drag_page_to(&view, cx, "Gamma", to);
+        let order = titles(&["Aardvark", "Gamma", "Alpha", "Beta", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // Ctrl-N, then a page created by following a link: each at the end.
+        cx.simulate_keystrokes("ctrl-n");
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, cx| app.open_page("Apple", cx));
+        let mut expected = order.clone();
+        expected.extend(titles(&["Untitled", "Apple"]));
+        assert_eq!(non_journal_titles(&view, cx), expected);
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Apple");
+            assert_eq!(app.state.page_order, expected);
+            assert_eq!(UiState::load(&dir).page_order, expected);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn sort_a_z_from_the_palette_or_page_menu_restores_alphabetical_order(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-sort", &reorder_pages(), "Beta");
+        let alphabetical = titles(&["Alpha", "Beta", "Delta", "Gamma"]);
+        let reorder = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            let alpha = page_row(view, cx, "page", "Alpha");
+            let to = edge_of(cx, &alpha, true);
+            drag_page_to(view, cx, "Delta", to);
+            assert_eq!(
+                non_journal_titles(view, cx),
+                titles(&["Delta", "Alpha", "Beta", "Gamma"])
+            );
+        };
+
+        reorder(&view, cx);
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("sort pages");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.search_results()[0].target,
+                Target::Command(Command::SortPagesAz)
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(non_journal_titles(&view, cx), alphabetical);
+        view.update(cx, |app, _| {
+            assert!(app.state.page_order.is_empty());
+            assert!(UiState::load(&dir).page_order.is_empty());
+            assert_eq!(app.pages[app.selected].title, "Beta");
+        });
+
+        // From the page menu; it is disabled while already alphabetical.
+        right_click_page(&view, cx, "Gamma");
+        click_on(cx, "page-menu-sort");
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Gamma"), "disabled");
+        cx.simulate_keystrokes("escape");
+        reorder(&view, cx);
+        right_click_page(&view, cx, "Gamma");
+        click_on(cx, "page-menu-sort");
+        assert_eq!(menu_title(&view, cx), None);
+        assert_eq!(non_journal_titles(&view, cx), alphabetical);
+        assert!(UiState::load(&dir).page_order.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn rename_delete_and_undo_keep_the_custom_order(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-rename", &reorder_pages(), "Beta");
+        // An edit before the reorder leaves an undo snapshot in A-Z order.
+        click_block(cx, 0);
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("escape");
+        let alpha = page_row(&view, cx, "page", "Alpha");
+        let to = edge_of(cx, &alpha, true);
+        drag_page_to(&view, cx, "Gamma", to);
+        let order = titles(&["Gamma", "Alpha", "Beta", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // Undo restores the text but not the old order.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Beta");
+            assert_eq!(app.pages[app.selected].blocks[0].content, "b");
+        });
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // A renamed page keeps its place (no longer alphabetical).
+        view.update(cx, |app, cx| app.rename_page("Alpha", "Zulu", cx))
+            .unwrap();
+        let order = titles(&["Gamma", "Zulu", "Beta", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+        view.update(cx, |app, cx| app.delete_page("Beta", cx))
+            .unwrap();
+        let order = titles(&["Gamma", "Zulu", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.page_order, order);
+            assert_eq!(UiState::load(&dir).page_order, order);
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 }
