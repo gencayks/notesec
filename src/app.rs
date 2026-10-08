@@ -14,6 +14,7 @@ use crate::model::{
 };
 use crate::search::{search, search_templates, Command, Hit, Target};
 use crate::storage::{today_title, Storage, Template};
+use crate::tabs::{TabTarget, Tabs};
 use crate::ui::{block_row, fold_arrow, fold_badge, task_checkbox, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
@@ -53,6 +54,9 @@ actions!(
         Bold,
         Italic,
         CycleTask,
+        CloseTab,
+        NextTab,
+        PrevTab,
         ToggleSearch,
         NewPage,
         OpenToday,
@@ -108,6 +112,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-+", IncreaseFont, None),
         KeyBinding::new("ctrl--", DecreaseFont, None),
         KeyBinding::new("ctrl-0", ResetFont, None),
+        KeyBinding::new("ctrl-w", CloseTab, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -120,6 +127,18 @@ enum Mode {
     Notes,
     /// The page graph.
     Graph,
+    /// No tab is open: an empty state with hints.
+    Empty,
+}
+
+/// How a navigation shows its page (see `NoteSec::navigate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nav {
+    /// In the active tab, replacing its page (in-page links, backlinks).
+    Replace,
+    /// In the tab already showing that page, else a new tab (sidebar,
+    /// search, Today, new page).
+    Tab,
 }
 
 /// How many results the search overlay shows.
@@ -194,6 +213,9 @@ pub struct NoteSec {
     redo_stack: Vec<HistoryState>,
     text_history_active: bool,
     mode: Mode,
+    /// Open tabs. The active one decides `mode` and, for a page tab,
+    /// `selected` (see `apply_tab`).
+    tabs: Tabs,
     /// The graph view, created the first time it is opened and then kept so it
     /// remembers node positions between visits.
     graph: Option<Entity<GraphView>>,
@@ -251,6 +273,9 @@ impl NoteSec {
             .position(|p| p.is_journal && p.title == today)
             .unwrap_or(0);
 
+        // Start with one tab on that page.
+        let first_tab = Tabs::new(TabTarget::Page(pages[selected].title.clone()));
+
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
@@ -283,6 +308,7 @@ impl NoteSec {
             redo_stack: Vec::new(),
             text_history_active: false,
             mode: Mode::Notes,
+            tabs: first_tab,
             graph: None,
             _graph_subscription: None,
             last_layout: None,
@@ -389,8 +415,7 @@ impl NoteSec {
         self.record_edit();
         self.pages[self.selected].insert_blocks_from(insert_after, &source);
         self.save_page();
-        self.mode = Mode::Notes;
-        cx.notify();
+        self.show_selected(Nav::Tab, cx);
     }
 
     // --- search overlay --------------------------------------------------------
@@ -494,6 +519,19 @@ impl NoteSec {
             self.reveal(ix);
         }
         self.save_all_pages();
+        // Tabs on pages that the restored state doesn't have are closed. The
+        // restored page is brought to the front when a page is on screen or
+        // a block is being edited (never edit a page that isn't shown).
+        let pages = &self.pages;
+        self.tabs.retain(|t| match t {
+            TabTarget::Page(title) => pages.iter().any(|p| p.title == *title),
+            TabTarget::Graph => true,
+        });
+        if self.editing.is_some() || matches!(self.tabs.active_target(), Some(TabTarget::Page(_))) {
+            self.show_selected(Nav::Tab, cx);
+        } else {
+            self.apply_tab(cx);
+        }
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -539,7 +577,7 @@ impl NoteSec {
         self.pages.push(page);
         sort_pages(&mut self.pages);
         self.selected = self.find_page(&title).unwrap_or(0);
-        self.mode = Mode::Notes;
+        self.show_selected(Nav::Tab, cx);
         self.start_edit(0, window, cx);
     }
 
@@ -581,11 +619,11 @@ impl NoteSec {
         match hit.target {
             Target::Page(page) => {
                 let title = self.pages[page].title.clone();
-                self.open_page(&title, cx);
+                self.navigate(&title, Nav::Tab, cx);
             }
             Target::Block(page, block) => {
                 let title = self.pages[page].title.clone();
-                self.open_page(&title, cx);
+                self.navigate(&title, Nav::Tab, cx);
                 if block < self.pages[self.selected].blocks.len() {
                     self.start_edit(block, window, cx);
                 }
@@ -763,8 +801,16 @@ impl NoteSec {
         }
     }
 
-    /// Navigate to the page called `title`, creating it if needed.
+    /// In-page navigation (a `[[link]]` or `#tag` in a block, a backlink, a
+    /// graph node): show the page called `title` in the active tab, creating
+    /// the page if needed. See `navigate`.
     fn open_page(&mut self, title: &str, cx: &mut Context<Self>) {
+        self.navigate(title, Nav::Replace, cx);
+    }
+
+    /// Show the page called `title`, creating it if needed, in a tab as
+    /// `nav` says.
+    fn navigate(&mut self, title: &str, nav: Nav, cx: &mut Context<Self>) {
         // Leave edit mode first so the block being edited is saved (which may
         // itself create pages and reorder the sidebar).
         self.stop_edit(cx);
@@ -780,8 +826,80 @@ impl NoteSec {
             }
         };
         self.selected = ix;
+        self.show_selected(nav, cx);
+    }
+
+    /// Put page `selected` on screen in a tab as `nav` says. `Replace` only
+    /// replaces a page tab: from the graph tab (or with no tabs) it opens or
+    /// focuses a page tab instead, so the graph tab stays.
+    fn show_selected(&mut self, nav: Nav, cx: &mut Context<Self>) {
+        let target = TabTarget::Page(self.pages[self.selected].title.clone());
+        match (nav, self.tabs.active_target()) {
+            (Nav::Replace, Some(TabTarget::Page(_))) => self.tabs.replace_active(target),
+            _ => self.tabs.open(target),
+        }
         self.mode = Mode::Notes;
         cx.notify();
+    }
+
+    /// Make `mode` and `selected` match the active tab.
+    fn apply_tab(&mut self, cx: &mut Context<Self>) {
+        match self.tabs.active_target().cloned() {
+            Some(TabTarget::Page(title)) => {
+                if let Some(ix) = self.find_page(&title) {
+                    self.selected = ix;
+                }
+                self.mode = Mode::Notes;
+            }
+            Some(TabTarget::Graph) => {
+                self.refresh_graph(cx);
+                self.mode = Mode::Graph;
+            }
+            None => self.mode = Mode::Empty,
+        }
+        cx.notify();
+    }
+
+    /// Focus tab `ix` (clicking it). The block being edited is saved and
+    /// editing ends, as with any navigation.
+    fn activate_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+        self.tabs.select(ix);
+        self.apply_tab(cx);
+    }
+
+    /// Close tab `ix` (its × or Ctrl+W), saving the block being edited
+    /// first. Closing the last tab shows the empty state.
+    fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+        self.tabs.close(ix);
+        self.apply_tab(cx);
+    }
+
+    /// Ctrl+W. Ignored while the search palette is open (it is modal).
+    fn on_close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_none() {
+            if let Some(ix) = self.tabs.active {
+                self.close_tab(ix, cx);
+            }
+        }
+    }
+
+    fn cycle_tabs(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            return;
+        }
+        self.stop_edit(cx);
+        self.tabs.cycle(forward);
+        self.apply_tab(cx);
+    }
+
+    fn on_next_tab(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tabs(true, cx);
+    }
+
+    fn on_prev_tab(&mut self, _: &PrevTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tabs(false, cx);
     }
 
     /// Index of the journal page for `title` (`YYYY-MM-DD`). Only journals
@@ -806,16 +924,21 @@ impl NoteSec {
             self.add_page(page);
         }
         self.selected = self.find_journal(&today).unwrap_or(0);
-        self.mode = Mode::Notes;
-        cx.notify();
+        self.show_selected(Nav::Tab, cx);
     }
 
     // --- graph view ------------------------------------------------------------
 
-    /// Switch to the graph view, creating it on first use.
+    /// Open (or focus) the graph tab, creating the graph on first use.
     fn show_graph(&mut self, cx: &mut Context<Self>) {
         // Save the block being edited so the graph sees up-to-date links.
         self.stop_edit(cx);
+        self.tabs.open(TabTarget::Graph);
+        self.apply_tab(cx);
+    }
+
+    /// Create the graph view, or give it the current pages.
+    fn refresh_graph(&mut self, cx: &mut Context<Self>) {
         let current = self.pages[self.selected].title.clone();
         let pages = self.pages.clone();
         if let Some(graph) = self.graph.clone() {
@@ -824,7 +947,8 @@ impl NoteSec {
             let (theme, size, reduce_motion) =
                 (self.theme, self.config.font_size, cx.reduce_motion());
             let graph = cx.new(|_| GraphView::new(pages, current, theme, size, reduce_motion));
-            // Clicking a node asks us to open that page.
+            // Clicking a node asks us to open that page. From the graph tab
+            // that opens or focuses a page tab (see `show_selected`).
             self._graph_subscription = Some(cx.subscribe(
                 &graph,
                 |this, _graph, event: &GraphEvent, cx| {
@@ -834,14 +958,15 @@ impl NoteSec {
             ));
             self.graph = Some(graph);
         }
-        self.mode = Mode::Graph;
-        cx.notify();
     }
 
+    /// Ctrl-G / "Graph view": open or focus the graph tab; from the graph
+    /// tab itself, close it.
     fn toggle_graph(&mut self, cx: &mut Context<Self>) {
         if self.mode == Mode::Graph {
-            self.mode = Mode::Notes;
-            cx.notify();
+            if let Some(ix) = self.tabs.active {
+                self.close_tab(ix, cx);
+            }
         } else {
             self.show_graph(cx);
         }
@@ -1738,7 +1863,7 @@ impl Render for NoteSec {
 
         // --- Sidebar: one clickable row per page ---------------------------
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
-            let is_selected = ix == self.selected;
+            let is_selected = self.mode == Mode::Notes && ix == self.selected;
             div()
                 // Interactive elements need a stable id; (name, index) is the idiom.
                 .id(("page", ix))
@@ -1754,11 +1879,12 @@ impl Render for NoteSec {
                 .when(is_selected, |d| d.bg(theme.selected_bg))
                 .hover(|d| d.bg(theme.selected_bg))
                 // `cx.listener` turns a closure over `&mut Self` into a GPUI handler.
+                .debug_selector(move || format!("page-{ix}"))
+                // Opens the page in its tab, or a new tab.
                 .on_click(cx.listener(move |this, _event, _window, cx| {
                     this.stop_edit(cx); // save the block being edited first
                     this.selected = ix;
-                    this.mode = Mode::Notes;
-                    cx.notify(); // ask GPUI to re-render this view
+                    this.show_selected(Nav::Tab, cx); // also asks GPUI to re-render
                 }))
                 .child(page.title.clone())
         });
@@ -1784,7 +1910,7 @@ impl Render for NoteSec {
                     .text_color(theme.text)
                     .hover(|d| d.bg(theme.selected_bg))
                     .on_click(cx.listener(move |this, _e, _window, cx| {
-                        this.open_page(&target, cx);
+                        this.navigate(&target, Nav::Tab, cx);
                     }))
                     .child(format!("#{name}"))
                     .child(div().text_color(theme.muted).child(count.to_string()))
@@ -2345,11 +2471,137 @@ impl Render for NoteSec {
                 )
         });
 
-        // The main area shows either the page or the graph.
-        let content: AnyElement = match (&self.mode, &self.graph) {
+        // --- Tab bar: one tab per open page (or the graph) -------------------
+        let tab_items: Vec<AnyElement> = self
+            .tabs
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                let active = self.tabs.active == Some(i);
+                let label = match tab {
+                    TabTarget::Page(title) => title.clone(),
+                    TabTarget::Graph => "Graph".to_string(),
+                };
+                div()
+                    .id(("tab", i))
+                    .debug_selector(move || format!("tab-{i}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .pl_3()
+                    .pr_1()
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .text_color(if active { theme.accent } else { theme.muted })
+                    .when(active, |d| d.bg(theme.bg))
+                    .hover(|d| d.text_color(theme.text))
+                    .on_click(cx.listener(move |this, _e, _window, cx| this.activate_tab(i, cx)))
+                    .child(div().max_w(px(200.0)).truncate().child(label))
+                    .child(
+                        // The ×: closes on press, before the tab's own click
+                        // could focus it.
+                        div()
+                            .debug_selector(move || format!("tab-close-{i}"))
+                            .px_1()
+                            .rounded_sm()
+                            .text_color(theme.muted)
+                            .hover(|d| d.bg(theme.selected_bg).text_color(theme.text))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.close_tab(i, cx);
+                                }),
+                            )
+                            .child("×"),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let tab_bar = div()
+            .id("tab-bar")
+            .flex_shrink_0()
+            .h(px(font_size * 2.2))
+            .flex()
+            .flex_row()
+            .overflow_x_scroll()
+            .bg(theme.sidebar_bg)
+            .border_b_1()
+            .border_color(theme.border)
+            .children(tab_items);
+
+        // No tabs: say so and offer the usual ways to open one.
+        let empty_state = || {
+            let hint = |keys: &'static str, what: &'static str| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().w(px(70.0)).text_color(theme.accent).child(keys))
+                    .child(what)
+            };
+            div()
+                .id("empty-state")
+                .debug_selector(|| "empty-state".to_string())
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .text_color(theme.muted)
+                .child(
+                    div()
+                        .text_size(px(font_size * 1.4))
+                        .text_color(theme.text)
+                        .child("No open tabs"),
+                )
+                .child(
+                    div()
+                        .id("empty-today")
+                        .debug_selector(|| "empty-today".to_string())
+                        .px_4()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(theme.selected_bg)
+                        .text_color(theme.accent)
+                        .on_click(cx.listener(|this, _e, _window, cx| this.open_today(cx)))
+                        .child("Open today's journal"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(hint("Ctrl-J", "today's journal"))
+                        .child(hint("Ctrl-K", "search pages and blocks"))
+                        .child(hint("Ctrl-N", "new page"))
+                        .child(hint("Ctrl-G", "graph view"))
+                        .child(hint("", "or pick a page in the sidebar")),
+                )
+        };
+
+        // The main area: the tab bar, then the page, the graph or the empty
+        // state.
+        let view: AnyElement = match (&self.mode, &self.graph) {
             (Mode::Graph, Some(graph)) => graph.clone().into_any_element(),
+            (Mode::Empty, _) => empty_state().into_any_element(),
             _ => main.into_any_element(),
         };
+        let content = div()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(tab_bar)
+            .child(view);
 
         let is_editing = self.editing.is_some() || self.search.is_some();
         div()
@@ -2397,6 +2649,9 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_toggle_theme))
             .on_action(cx.listener(Self::on_toggle_graph))
+            .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(Self::on_next_tab))
+            .on_action(cx.listener(Self::on_prev_tab))
             .on_action(cx.listener(Self::on_increase_font))
             .on_action(cx.listener(Self::on_decrease_font))
             .on_action(cx.listener(Self::on_reset_font))
@@ -2446,6 +2701,8 @@ mod tests {
             cx.add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
         view.update(cx, |app, cx| {
             app.selected = app.pages.iter().position(|p| p.title == selected).unwrap();
+            // As if the app had started on that page: one tab showing it.
+            app.tabs = Tabs::new(TabTarget::Page(selected.to_string()));
             cx.notify();
         });
         cx.run_until_parked();
@@ -4509,6 +4766,219 @@ mod tests {
             assert_eq!(app.pages[app.selected].title, "Test")
         });
         assert_eq!(shown(cx, 3), [0, 1, 2]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The open tabs as labels, and the active index.
+    fn tab_state(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+    ) -> (Vec<String>, Option<usize>) {
+        view.update(cx, |app, _| {
+            let labels = app
+                .tabs
+                .tabs
+                .iter()
+                .map(|t| match t {
+                    TabTarget::Page(title) => title.clone(),
+                    TabTarget::Graph => "Graph".to_string(),
+                })
+                .collect();
+            (labels, app.tabs.active)
+        })
+    }
+
+    fn tabs_are(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        labels: &[&str],
+        active: usize,
+    ) {
+        let (got, got_active) = tab_state(view, cx);
+        assert_eq!(
+            (got, got_active),
+            (labels.iter().map(|l| l.to_string()).collect(), Some(active))
+        );
+        // The screen agrees: one tab element per tab, and the active page.
+        for i in 0..labels.len() {
+            assert!(has(cx, &format!("tab-{i}")), "tab-{i} drawn");
+        }
+        assert!(!has(cx, &format!("tab-{}", labels.len())));
+        view.update(cx, |app, _| match labels[active] {
+            "Graph" => assert_eq!(app.mode, Mode::Graph),
+            title => {
+                assert_eq!(app.mode, Mode::Notes);
+                assert_eq!(app.pages[app.selected].title, title);
+            }
+        });
+    }
+
+    fn click_sidebar_page(view: &Entity<NoteSec>, cx: &mut VisualTestContext, title: &str) {
+        let ix = view.update(cx, |app, _| app.find_page(title).unwrap());
+        click_on(cx, &format!("page-{ix}"));
+    }
+
+    fn tab_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- see [[Alpha]]\n"),
+            ("Alpha", "- alpha\n"),
+            ("Beta", "- beta\n"),
+        ]
+    }
+
+    #[gpui::test]
+    fn sidebar_opens_focuses_and_x_closes_tabs(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "tabs-open", &tab_pages(), "Test");
+        tabs_are(&view, cx, &["Test"], 0);
+        // A sidebar click opens a new tab...
+        click_sidebar_page(&view, cx, "Alpha");
+        tabs_are(&view, cx, &["Test", "Alpha"], 1);
+        // ...or focuses the tab already showing that page.
+        click_sidebar_page(&view, cx, "Test");
+        tabs_are(&view, cx, &["Test", "Alpha"], 0);
+        // Clicking a tab focuses it.
+        click_on(cx, "tab-1");
+        tabs_are(&view, cx, &["Test", "Alpha"], 1);
+        // The x of an inactive tab closes it and keeps the active one.
+        click_on(cx, "tab-close-0");
+        tabs_are(&view, cx, &["Alpha"], 0);
+        // The x of the last tab leaves the empty state.
+        click_on(cx, "tab-close-0");
+        assert_eq!(tab_state(&view, cx), (vec![], None));
+        assert!(has(cx, "empty-state"));
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Empty));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn ctrl_w_saves_the_edit_and_closes_the_tab(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "tabs-ctrl-w", &tab_pages(), "Test");
+        click_sidebar_page(&view, cx, "Alpha");
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("!");
+        // Ctrl+W while editing: saves, ends editing, closes the tab; it
+        // never edits the text.
+        cx.simulate_keystrokes("ctrl-w");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        let alpha = view.update(cx, |app, _| app.find_page("Alpha").unwrap());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[alpha].blocks[0].content, "alpha!");
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Alpha.md")).unwrap(),
+            "- alpha!\n"
+        );
+        tabs_are(&view, cx, &["Test"], 0);
+
+        // Closing the last tab shows the empty state; Ctrl+W there is a no-op.
+        cx.simulate_keystrokes("ctrl-w");
+        assert!(has(cx, "empty-state"));
+        cx.simulate_keystrokes("ctrl-w");
+        assert_eq!(tab_state(&view, cx), (vec![], None));
+        // The empty state offers today's journal.
+        click_on(cx, "empty-today");
+        let today = today_title();
+        tabs_are(&view, cx, &[today.as_str()], 0);
+        // Ctrl+N from the empty state also opens a tab.
+        cx.simulate_keystrokes("ctrl-w ctrl-n");
+        tabs_are(&view, cx, &["Untitled"], 0);
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_cycles_tabs(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "tabs-cycle", &tab_pages(), "Test");
+        click_sidebar_page(&view, cx, "Alpha");
+        click_sidebar_page(&view, cx, "Beta");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 2);
+        cx.simulate_keystrokes("ctrl-tab");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 0);
+        cx.simulate_keystrokes("ctrl-tab");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 1);
+        cx.simulate_keystrokes("ctrl-shift-tab ctrl-shift-tab");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 2);
+
+        // While editing: the edit is saved and editing ends.
+        click_block(cx, 0);
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("ctrl-tab");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Beta.md")).unwrap(),
+            "- betax\n"
+        );
+        // Ctrl-J opens or focuses today's journal in a tab, like the sidebar.
+        cx.simulate_keystrokes("ctrl-j");
+        let today = today_title();
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta", today.as_str()], 3);
+        cx.simulate_keystrokes("ctrl-tab ctrl-j");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta", today.as_str()], 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn links_replace_the_tab_and_search_opens_one(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "tabs-links", &tab_pages(), "Test");
+        // An in-page link replaces the current tab's page, like a browser.
+        // Test shows "see [[Alpha]]"; "A" is at display offset 6.
+        let at = reading_point(&view, cx, 0, 6);
+        cx.simulate_click(at, Modifiers::none());
+        tabs_are(&view, cx, &["Alpha"], 0);
+        // A search hit opens (or focuses) a tab.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("beta");
+        cx.simulate_keystrokes("enter");
+        tabs_are(&view, cx, &["Alpha", "Beta"], 1);
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("alpha");
+        cx.simulate_keystrokes("enter");
+        tabs_are(&view, cx, &["Alpha", "Beta"], 0);
+        // Tab shortcuts do nothing while the palette is open.
+        cx.simulate_keystrokes("ctrl-k ctrl-w ctrl-tab");
+        view.update(cx, |app, _| assert!(app.search.is_some()));
+        cx.simulate_keystrokes("escape");
+        tabs_are(&view, cx, &["Alpha", "Beta"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn graph_lives_in_a_tab(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "tabs-graph", &graph_pages(), "Test");
+        let (graph, canvas) = open_graph(&view, cx);
+        tabs_are(&view, cx, &["Test", "Graph"], 1);
+        // A node click from the graph tab opens a page tab; the graph stays.
+        let zed = node_pos(&graph, canvas, "Zed", cx);
+        cx.simulate_click(zed, Modifiers::none());
+        tabs_are(&view, cx, &["Test", "Graph", "Zed"], 2);
+        // Ctrl-G focuses the existing graph tab, and from it closes it.
+        cx.simulate_keystrokes("ctrl-g");
+        tabs_are(&view, cx, &["Test", "Graph", "Zed"], 1);
+        assert!(has(cx, "graph-canvas"));
+        cx.simulate_keystrokes("ctrl-g");
+        tabs_are(&view, cx, &["Test", "Zed"], 1);
+        // Cycling back onto a graph tab shows the graph.
+        cx.simulate_keystrokes("ctrl-g ctrl-tab ctrl-shift-tab");
+        tabs_are(&view, cx, &["Test", "Zed", "Graph"], 2);
+        assert!(has(cx, "graph-canvas"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn undo_closes_tabs_of_pages_it_removes(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "tabs-undo", &tab_pages(), "Test");
+        // An edit on Test (undo point), then a new page in its own tab.
+        click_block(cx, 0);
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("escape ctrl-n");
+        tabs_are(&view, cx, &["Test", "Untitled"], 1);
+        // Undo goes back to before the page existed: its tab is closed and
+        // the edited page is shown in its tab.
+        cx.simulate_keystrokes("escape ctrl-z");
+        view.update(cx, |app, _| assert!(app.find_page("Untitled").is_none()));
+        tabs_are(&view, cx, &["Test"], 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

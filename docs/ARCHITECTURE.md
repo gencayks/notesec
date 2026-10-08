@@ -15,6 +15,7 @@ storage.rs     — files on disk: load/save markdown (NO ui code here)
 editor.rs      — text-editing state machine (NO ui code here)
 display.rs     — reading view of a block: hidden markup + offset map (NO ui code)
 search.rs      — fuzzy matcher, pure functions (NO ui code here)
+tabs.rs        — open tabs: open/focus/close/cycle rules (NO ui code here)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -508,6 +509,46 @@ that mutate, and data races are essentially impossible.
     replaced instead of leaving a stray empty bullet. The template's own
     nesting is kept, every copy gets fresh IDs, and the whole insert is one
     undo step.
+20. **Tabs: a list of page titles (or the graph), like browser tabs** —
+    `Tabs` (`tabs.rs`) holds `TabTarget::Page(title)` / `TabTarget::Graph`
+    plus the active index. Titles, not indices, because `pages` is re-sorted
+    when pages are added. The active tab drives what's on screen
+    (`apply_tab` sets `mode` and `selected`); no tabs means `Mode::Empty`, an
+    empty state with an "Open today's journal" button and the Ctrl-J / Ctrl-K
+    / Ctrl-N / Ctrl-G hints. Startup opens one tab on today's journal.
+    Tabs are not saved across restarts.
+    *Navigation rules* (`Nav::Tab` vs `Nav::Replace`):
+    - Sidebar page or tag, Today button / Ctrl-J, Ctrl-K search hits
+      (page or block), new page (Ctrl-N / "+ New page"), the empty state's
+      button, and inserting a template: focus the tab already showing that
+      page (the active one first), else open a new tab at the end.
+    - `[[link]]` / `#tag` clicks in a block, backlink clicks: replace the
+      active tab's page (like following a link in a browser), so two tabs
+      may show the same page.
+    - Graph node clicks: the graph tab stays; the page opens in (or
+      focuses) a page tab. In general `Replace` from the graph tab, or with
+      no tabs, behaves like `Tab`.
+    - Ctrl-G / "Graph view" / the palette command: focus the graph tab or
+      open one; from the graph tab itself it closes that tab (the old
+      toggle back to notes). The `GraphView` entity is kept, so node
+      positions survive closing and reopening.
+    *Tab keys*: Ctrl+W closes the active tab, × closes any tab (on press, so
+    the tab isn't focused first), Ctrl+Tab / Ctrl+Shift+Tab cycle with
+    wrap-around. They are global bindings; nothing else used them, and plain
+    Tab / Shift-Tab (indent) in the editor context don't match them because
+    modifiers must match exactly. GPUI's Linux backend maps both `Tab` and
+    `ISO_Left_Tab` (what Shift+Tab sends on X11) to "tab", and Zed's own Linux
+    keymap uses ctrl-tab, ctrl-shift-tab and ctrl-w, so they arrive. They do
+    nothing while the Ctrl-K palette is open (it's modal). Closing the
+    active tab focuses the tab that takes its place, else the one to its
+    left; closing another tab keeps the active one.
+    *Per-tab state* is just the page. Every tab switch, close or cycle saves
+    the block being edited and ends editing (Ctrl+W never deletes text).
+    Folds stay global per block, scroll position isn't kept per tab.
+    *Missing pages*: there is no rename or delete, but undo/redo can restore
+    a page list without a page created later; tabs on pages that no longer
+    exist are closed, and the restored page is brought into a tab when a page
+    was on screen or a block is being edited.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

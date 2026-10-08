@@ -7,6 +7,7 @@ mod graph_view;
 mod model;
 mod search;
 mod storage;
+mod tabs;
 mod ui;
 
 use app::NoteSec;
