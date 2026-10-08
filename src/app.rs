@@ -20,6 +20,7 @@ use gpui::{
     Style, StyledText, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use std::ops::Range;
+use std::rc::Rc;
 
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace.
@@ -765,6 +766,10 @@ impl NoteSec {
         self.editor = EditorState::new(&content);
         self.slash = None;
         self.selecting = false;
+        // The last layout belongs to the previous block until the next paint;
+        // without it, mouse positions fall back to the cursor.
+        self.last_layout = None;
+        self.last_bounds = None;
         if cursor_at_start {
             self.editor.cursor = 0;
         }
@@ -1659,8 +1664,11 @@ impl Render for NoteSec {
                 } else {
                     BlockKind::parse(&block.content)
                 };
-                let links = parse_references(body);
-                // Layout of this row's text, kept so a click can be mapped to
+                let links = Rc::new(parse_references(body));
+                // Bytes of `content` hidden in display mode (the type prefix),
+                // to map a display position back to an editor offset.
+                let hidden = block.content.len() - body.len();
+                // Layout of this row's text, kept so a press can be mapped to
                 // the character (and so the link) under the mouse.
                 let mut text_layout = None;
                 let content: AnyElement = if is_editing {
@@ -1668,8 +1676,6 @@ impl Render for NoteSec {
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::on_text_mouse_down))
                         .child(BlockText { app: cx.entity() })
                         .into_any_element()
-                } else if links.is_empty() {
-                    div().child(body.to_string()).into_any_element()
                 } else {
                     let highlights = links.iter().map(|l| {
                         let style = if l.is_tag { tag_style } else { link_style };
@@ -1682,18 +1688,44 @@ impl Render for NoteSec {
                     text_layout = Some(text.layout().clone());
                     div().child(text).into_any_element()
                 };
-                // One click handler per row: follow the link under the mouse,
-                // or else start editing the block. Deciding in one place avoids
-                // the link click also triggering edit mode.
-                let on_click = cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    let link = text_layout.as_ref().and_then(|layout| {
+                // A press on a row that isn't being edited starts editing it
+                // with the cursor under the mouse, and a drag from there
+                // selects (the root's mouse-move handler extends it). A press
+                // on a link does nothing here: the click handler navigates.
+                let link_at = {
+                    let (layout, links) = (text_layout.clone(), links.clone());
+                    move |position: gpui::Point<Pixels>| {
+                        let layout = layout.as_ref()?;
                         // `Ok` only when the mouse is over an actual glyph.
-                        let char_ix = layout.index_for_position(event.position()).ok()?;
-                        links.iter().find(|l| l.range.contains(&char_ix))
-                    });
-                    match link {
-                        Some(link) => this.open_page(&link.target, cx),
-                        None => this.start_edit(ix, window, cx),
+                        let char_ix = layout.index_for_position(position).ok()?;
+                        links.iter().find(|l| l.range.contains(&char_ix)).cloned()
+                    }
+                };
+                let on_press = {
+                    let (layout, link_at) = (text_layout.clone(), link_at.clone());
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if link_at(event.position).is_some() {
+                            return;
+                        }
+                        let offset = layout.as_ref().map_or(0, |layout| {
+                            match layout.index_for_position(event.position) {
+                                Ok(i) | Err(i) => i,
+                            }
+                        });
+                        this.start_edit(ix, window, cx);
+                        this.editor.set_cursor(hidden + offset);
+                        this.selecting = true;
+                        cx.notify();
+                    })
+                };
+                let on_click = cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                    // The press already started editing unless it was on a
+                    // link; only links act on click.
+                    if this.editing == Some(ix) {
+                        return;
+                    }
+                    if let Some(link) = link_at(event.position()) {
+                        this.open_page(&link.target, cx);
                     }
                 });
                 let row = block_row(&theme, depth, font_size, kind, content)
@@ -1702,7 +1734,10 @@ impl Render for NoteSec {
                     // normal builds.
                     .debug_selector(|| format!("block-{ix}"))
                     .cursor_text()
-                    .when(!is_editing, |d| d.on_click(on_click));
+                    .when(!is_editing, |d| {
+                        d.on_mouse_down(MouseButton::Left, on_press)
+                            .on_click(on_click)
+                    });
                 let menu = if is_editing { slash_menu.take() } else { None };
                 match menu {
                     // The menu hangs off a zero-height strip right under the
@@ -3258,6 +3293,86 @@ mod tests {
         });
         cx.simulate_keystrokes("ctrl-z");
         view.update(cx, |app, _| assert_eq!(app.editor.text, "hello world"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A point just inside the start of block `ix`'s text (past the bullet).
+    fn row_text_start(cx: &mut VisualTestContext, ix: usize) -> Point<Pixels> {
+        let selector: &'static str = Box::leak(format!("block-{ix}").into_boxed_str());
+        let row = cx.debug_bounds(selector).expect("row rendered");
+        // The row is: bullet (6px) + gap (8px) + text.
+        point(row.left() + px(15.), row.center().y)
+    }
+
+    #[gpui::test]
+    fn drag_from_unedited_block_starts_editing_and_selects(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "drag-unedited", "- one\n- hello world\n");
+        click_block(cx, 0);
+
+        // Press at the start of block 1, which is not being edited.
+        let start = row_text_start(cx, 1);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, 0);
+            assert_eq!(app.editor.selection(), None);
+        });
+        // Dragging selects, following the mouse.
+        let to = text_point(&view, cx, 5);
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        assert_eq!(selection(&view, cx), Some(0..5));
+        let to = text_point(&view, cx, 8);
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        assert_eq!(selection(&view, cx), Some(0..8));
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(1)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn click_on_unedited_block_places_the_cursor(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "click-unedited", "- # Big\n- plain\n");
+        // Clicking the start of the text puts the cursor there; past the end
+        // of the text puts it at the end.
+        let at = row_text_start(cx, 1);
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, 0);
+            assert_eq!(app.editor.selection(), None);
+        });
+        // On a heading the hidden `# ` prefix is accounted for.
+        let at = row_text_start(cx, 0);
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.editor.text, "# Big");
+            assert_eq!(app.editor.cursor, 2);
+        });
+        click_block(cx, 1);
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 5));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn link_click_navigates_without_editing_or_selecting(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "link-press", "- [[Foo]] tail\n- other\n");
+        click_block(cx, 1);
+        let row = cx.debug_bounds("block-0").expect("row rendered");
+        // x + 24 is on `[[Foo]]` (see `clicking_a_link_navigates...`).
+        let on_link = point(row.left() + px(24.), row.center().y);
+        cx.simulate_mouse_down(on_link, MouseButton::Left, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1), "a press on a link doesn't edit");
+            assert!(!app.selecting);
+        });
+        cx.simulate_mouse_up(on_link, MouseButton::Left, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Foo");
+            assert_eq!(app.editing, None);
+            assert!(!app.selecting);
+        });
+        assert_eq!(file(&dir), "- [[Foo]] tail\n- other\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 

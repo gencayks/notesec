@@ -379,9 +379,12 @@ that mutate, and data races are essentially impossible.
 12. **Selection = anchor + cursor, within one block** — `EditorState.anchor`
     is the fixed end and `cursor` the moving end (byte offsets on grapheme
     boundaries, so mouse positions are snapped back to a whole character).
-    Mouse drag in the block being edited selects (clicking a block that is
-    not being edited still just starts editing it); a click without a drag
-    clears the selection; Shift+Left/Right/Home/End extend or shrink it.
+    Pressing on any block puts the cursor under the mouse (a block that is
+    not being edited starts editing first; its hidden type prefix is
+    accounted for) and dragging from there selects; a click without a drag
+    clears the selection. A press on a `[[link]]` or `#tag` in a block that
+    is not being edited never edits or selects: its click navigates.
+    Shift+Left/Right/Home/End extend or shrink the selection.
     Plain Left/Right collapse it to its start/end. Typing, pasting,
     Backspace, Delete, and Enter replace or remove the selected text first.
     Replacing a selection is always its own undo step, and undo snapshots
