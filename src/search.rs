@@ -7,6 +7,7 @@
 //!
 //! This module is pure (no UI, no I/O), so it is easy to unit-test.
 
+use crate::commands::Command;
 use crate::model::Page;
 
 /// Only the first this-many characters of a block are searched. Keeps the cost
@@ -96,69 +97,7 @@ fn subsequence_only(q: &[char], t: &[char]) -> Option<i32> {
     (qi == q.len()).then_some(0)
 }
 
-/// An action the palette can run, listed alongside pages and blocks when the
-/// query matches its label (try typing "theme" or "font").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Command {
-    ToggleTheme,
-    IncreaseFontSize,
-    DecreaseFontSize,
-    ResetFontSize,
-    ToggleGraph,
-    /// Switches the palette to a list of templates (see `search_templates`).
-    InsertTemplate,
-    /// Opens the settings panel.
-    OpenSettings,
-    /// Drops the sidebar's custom page order (back to alphabetical).
-    SortPagesAz,
-    /// Shows the graph, switched between global and local.
-    ToggleLocalGraph,
-    /// Opens (or focuses) the agenda tab.
-    OpenAgenda,
-}
-
 impl Command {
-    pub const ALL: [Command; 10] = [
-        Command::ToggleTheme,
-        Command::IncreaseFontSize,
-        Command::DecreaseFontSize,
-        Command::ResetFontSize,
-        Command::ToggleGraph,
-        Command::InsertTemplate,
-        Command::OpenSettings,
-        Command::SortPagesAz,
-        Command::ToggleLocalGraph,
-        Command::OpenAgenda,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Command::ToggleTheme => "Toggle dark/light theme",
-            Command::IncreaseFontSize => "Increase font size",
-            Command::DecreaseFontSize => "Decrease font size",
-            Command::ResetFontSize => "Reset font size",
-            Command::ToggleGraph => "Toggle graph view",
-            Command::InsertTemplate => "Insert template",
-            Command::OpenSettings => "Open settings",
-            Command::SortPagesAz => "Sort pages A-Z",
-            Command::ToggleLocalGraph => "Toggle local graph",
-            Command::OpenAgenda => "Open agenda",
-        }
-    }
-
-    /// Other words that find the command. They rank below label matches
-    /// (see `KEYWORD_PENALTY`), so "theme" still puts "Toggle dark/light
-    /// theme" first and "Open settings" after it.
-    pub fn keywords(self) -> &'static [&'static str] {
-        match self {
-            Command::OpenSettings => &["preferences", "theme", "font"],
-            Command::SortPagesAz => &["alphabetical", "order"],
-            Command::ToggleLocalGraph => &["global graph", "neighbours"],
-            Command::OpenAgenda => &["tasks", "todo", "scheduled", "deadline"],
-            _ => &[],
-        }
-    }
-
     /// How well `query` matches this command: its label, or failing that
     /// (or if better) one of its keywords at a penalty.
     fn score(self, query: &str) -> Option<i32> {
@@ -185,6 +124,12 @@ pub enum Target {
     Template(usize),
 }
 
+impl Target {
+    pub fn is_command(&self) -> bool {
+        matches!(self, Target::Command(_))
+    }
+}
+
 /// One search result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
@@ -200,23 +145,34 @@ const COMMAND_BONUS: i32 = 20;
 /// Taken off a command's score when only one of its keywords matched.
 const KEYWORD_PENALTY: i32 = 40;
 
-/// Search all pages. Returns at most `limit` hits, best first.
+/// Search all pages and the given `commands` (the ones that make sense
+/// right now; see `commands::Needs`).
 ///
-/// With an empty query every page is listed (in the given order) so the
-/// palette is useful as a page switcher before you type anything.
-pub fn search(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
+/// With an empty query every page is listed (at most `limit`, in the given
+/// order) so the palette is useful as a page switcher before you type
+/// anything, followed by every command (not limited) so it doubles as a
+/// list of what the app can do.
+///
+/// Otherwise the best `limit` hits are kept and returned in two groups,
+/// pages and blocks, and commands (the palette puts a header over each),
+/// best first within each group; the group holding the best hit comes
+/// first, so Enter still runs the top match.
+pub fn search(pages: &[Page], commands: &[Command], query: &str, limit: usize) -> Vec<Hit> {
     let query = query.trim();
     if query.is_empty() {
-        return (0..pages.len().min(limit))
-            .map(|page| Hit {
-                target: Target::Page(page),
-                score: 0,
-            })
-            .collect();
+        let pages = (0..pages.len().min(limit)).map(|page| Hit {
+            target: Target::Page(page),
+            score: 0,
+        });
+        let commands = commands.iter().map(|&command| Hit {
+            target: Target::Command(command),
+            score: 0,
+        });
+        return pages.chain(commands).collect();
     }
 
     let mut hits = Vec::new();
-    for command in Command::ALL {
+    for &command in commands {
         if let Some(score) = command.score(query) {
             hits.push(Hit {
                 target: Target::Command(command),
@@ -246,6 +202,9 @@ pub fn search(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
     // Stable sort: equal scores keep page/document order.
     hits.sort_by(|a, b| b.score.cmp(&a.score));
     hits.truncate(limit);
+    // Group (stable, so each group stays best first).
+    let commands_first = hits.first().is_some_and(|h| h.target.is_command());
+    hits.sort_by_key(|h| h.target.is_command() != commands_first);
     hits
 }
 
@@ -332,7 +291,7 @@ mod tests {
 
     #[test]
     fn title_hit_outranks_block_hit() {
-        let hits = search(&pages(), "needle", 10);
+        let hits = search(&pages(), Command::ALL, "needle", 10);
         assert_eq!(hits[0].target, Target::Page(1));
         assert_eq!(hits[1].target, Target::Block(0, 1));
         assert_eq!(hits.len(), 2);
@@ -340,49 +299,55 @@ mod tests {
 
     #[test]
     fn commands_match_by_label() {
-        let hits = search(&pages(), "theme", 10);
+        let hits = search(&pages(), Command::ALL, "theme", 10);
         assert_eq!(hits[0].target, Target::Command(Command::ToggleTheme));
         // Several commands share the word "font".
-        let font: Vec<Target> = search(&pages(), "font", 10)
+        let font: Vec<Target> = search(&pages(), Command::ALL, "font", 10)
             .into_iter()
             .map(|h| h.target)
             .collect();
-        assert!(font.contains(&Target::Command(Command::IncreaseFontSize)));
-        assert!(font.contains(&Target::Command(Command::ResetFontSize)));
+        assert!(font.contains(&Target::Command(Command::IncreaseFont)));
+        assert!(font.contains(&Target::Command(Command::ResetFont)));
         // An empty query lists only pages, never commands.
-        assert!(search(&pages(), "", 10)
-            .iter()
-            .all(|h| matches!(h.target, Target::Page(_))));
+        // An empty query lists the pages first, then every command.
+        let empty = search(&pages(), Command::ALL, "", 10);
+        assert_eq!(empty[0].target, Target::Page(0));
+        assert_eq!(
+            empty.iter().filter(|h| h.target.is_command()).count(),
+            Command::ALL.len()
+        );
     }
 
     #[test]
-    fn empty_query_lists_pages_and_limit_applies() {
-        let hits = search(&pages(), "  ", 2);
+    fn empty_query_lists_pages_and_limit_applies_to_pages() {
+        let hits = search(&pages(), &[], "  ", 2);
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| matches!(h.target, Target::Page(_))));
+        let hits = search(&pages(), Command::ALL, "  ", 2);
+        assert_eq!(hits.len(), 2 + Command::ALL.len());
     }
 
     #[test]
     fn insert_template_is_a_command() {
-        let hits = search(&pages(), "insert template", 10);
+        let hits = search(&pages(), Command::ALL, "insert template", 10);
         assert_eq!(hits[0].target, Target::Command(Command::InsertTemplate));
     }
 
     #[test]
     fn sort_pages_command_is_found_by_label_and_keywords() {
-        let top = |q: &str| search(&pages(), q, 10)[0].target;
+        let top = |q: &str| search(&pages(), Command::ALL, q, 10)[0].target;
         assert_eq!(top("sort pages"), Target::Command(Command::SortPagesAz));
         assert_eq!(top("alphabetical"), Target::Command(Command::SortPagesAz));
     }
 
     #[test]
     fn settings_command_is_found_by_its_keywords() {
-        let top = |q: &str| search(&pages(), q, 10)[0].target;
+        let top = |q: &str| search(&pages(), Command::ALL, q, 10)[0].target;
         assert_eq!(top("settings"), Target::Command(Command::OpenSettings));
         assert_eq!(top("open settings"), Target::Command(Command::OpenSettings));
         assert_eq!(top("preferences"), Target::Command(Command::OpenSettings));
         for q in ["theme", "font"] {
-            let targets: Vec<Target> = search(&pages(), q, 10)
+            let targets: Vec<Target> = search(&pages(), Command::ALL, q, 10)
                 .into_iter()
                 .map(|h| h.target)
                 .collect();
@@ -419,6 +384,57 @@ mod tests {
 
     #[test]
     fn no_match_is_empty() {
-        assert!(search(&pages(), "qqqq", 10).is_empty());
+        assert!(search(&pages(), Command::ALL, "qqqq", 10).is_empty());
+    }
+
+    #[test]
+    fn empty_query_lists_every_command_after_the_pages() {
+        let hits = search(&pages(), Command::ALL, "", 12);
+        let (pages, commands): (Vec<_>, Vec<_>) =
+            hits.into_iter().partition(|h| !h.target.is_command());
+        assert_eq!(pages.len(), 3);
+        assert_eq!(commands.len(), Command::ALL.len());
+    }
+
+    #[test]
+    fn fuzzy_query_groups_commands_when_they_rank_best() {
+        let hits = search(&pages(), Command::ALL, "agnd", 12);
+        assert_eq!(hits[0].target, Target::Command(Command::OpenAgenda));
+        // Commands and pages/blocks each come as one group, whichever
+        // holds the best hit first.
+        for (query, commands_first) in [
+            ("zed", false),
+            ("toggle", true),
+            ("needle", false),
+            ("e", true),
+        ] {
+            let hits = search(&pages(), Command::ALL, query, 12);
+            assert_eq!(hits[0].target.is_command(), commands_first, "{query}");
+            let switches = hits
+                .windows(2)
+                .filter(|w| w[0].target.is_command() != w[1].target.is_command())
+                .count();
+            assert!(switches <= 1, "{query}");
+        }
+        // "col all" finds Collapse all (subsequence across the label).
+        assert_eq!(
+            search(&pages(), Command::ALL, "col all", 12)[0].target,
+            Target::Command(Command::CollapseAll)
+        );
+        assert_eq!(
+            search(&pages(), Command::ALL, "shrt", 12)[0].target,
+            Target::Command(Command::ShowShortcuts)
+        );
+    }
+
+    #[test]
+    fn only_the_commands_offered_are_found() {
+        let offered = [Command::OpenAgenda];
+        let targets: Vec<Target> = search(&pages(), &offered, "", 20)
+            .into_iter()
+            .map(|h| h.target)
+            .collect();
+        assert!(targets.contains(&Target::Command(Command::OpenAgenda)));
+        assert!(!targets.contains(&Target::Command(Command::NewPage)));
     }
 }

@@ -195,13 +195,13 @@ impl GraphView {
         cx.notify();
     }
 
-    fn toggle_journals(&mut self, cx: &mut Context<Self>) {
+    pub fn toggle_journals(&mut self, cx: &mut Context<Self>) {
         self.include_journals = !self.include_journals;
         self.auto_fit = true;
         self.rebuild(cx);
     }
 
-    fn fit(&mut self, cx: &mut Context<Self>) {
+    pub fn fit(&mut self, cx: &mut Context<Self>) {
         self.auto_fit = true;
         cx.notify();
     }
@@ -219,6 +219,11 @@ impl GraphView {
     #[cfg(test)]
     pub(crate) fn node_titles(&self) -> Vec<String> {
         self.graph.nodes.iter().map(|n| n.title.clone()).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn includes_journals(&self) -> bool {
+        self.include_journals
     }
 
     #[cfg(test)]

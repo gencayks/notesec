@@ -6,6 +6,7 @@
 //! the block and the page is saved to disk.
 
 use crate::agenda::{day_label, Agenda, AgendaItem};
+use crate::commands::{binding_hint, format_keystrokes, Command, Needs};
 use crate::config::{Config, ThemeKind};
 use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
@@ -13,7 +14,7 @@ use crate::graph_view::{GraphEvent, GraphView};
 use crate::model::{
     backlinks, cycle_task, parse_references, tag_counts, BlockKind, Page, TaskState,
 };
-use crate::search::{search, search_templates, Command, Hit, Target};
+use crate::search::{search, search_templates, Hit, Target};
 use crate::state::UiState;
 use crate::storage::{today_title, validate_title, Storage, Template};
 use crate::tabs::{TabTarget, Tabs};
@@ -23,8 +24,8 @@ use gpui::{
     Bounds, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, FontStyle, FontWeight, GlobalElementId,
     HighlightStyle, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, ShapedLine, SharedString, Style, StyledText, Subscription,
-    TextRun, UTF16Selection, UnderlineStyle, Window,
+    MouseUpEvent, PaintQuad, Pixels, ScrollHandle, ShapedLine, SharedString, Style, StyledText,
+    Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -32,7 +33,8 @@ use std::rc::Rc;
 use uuid::Uuid;
 
 // Actions are named, typed commands that key bindings map onto. The macro
-// declares one unit struct per name inside the `notesec` namespace.
+// declares one unit struct per name inside the `notesec` namespace. Palette
+// commands (`commands.rs`) dispatch these too.
 actions!(
     notesec,
     [
@@ -71,63 +73,189 @@ actions!(
         ResetFont,
         OpenSettings,
         Quit,
+        // Palette commands without a key of their own (except
+        // ShowShortcuts, Ctrl+/).
+        OpenAgenda,
+        RenamePage,
+        DeletePage,
+        CopyPageTitle,
+        ToggleFavorite,
+        SortPagesAz,
+        InsertTemplate,
+        CollapseAll,
+        ExpandAll,
+        ToggleLocalGraph,
+        FitGraph,
+        ToggleGraphJournals,
+        ShowShortcuts,
     ]
 );
 
-/// Register keyboard shortcuts. The `"BlockEditor"` context is only active
-/// while a block is being edited (see `render`), so these keys do nothing
-/// otherwise.
+/// The headings of the keyboard shortcuts dialog, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyGroup {
+    Navigation,
+    Editing,
+    View,
+    Tabs,
+    App,
+}
+
+impl KeyGroup {
+    pub const ALL: [KeyGroup; 5] = [
+        KeyGroup::Navigation,
+        KeyGroup::Editing,
+        KeyGroup::View,
+        KeyGroup::Tabs,
+        KeyGroup::App,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyGroup::Navigation => "Navigation",
+            KeyGroup::Editing => "Editing",
+            KeyGroup::View => "View",
+            KeyGroup::Tabs => "Tabs",
+            KeyGroup::App => "App",
+        }
+    }
+}
+
+/// One key binding and how the shortcuts dialog describes it. `bind_keys`
+/// registers exactly these and the dialog lists exactly these, so the two
+/// can't drift; the palette reads its hints back from the keymap.
+pub struct Shortcut {
+    pub binding: KeyBinding,
+    pub group: KeyGroup,
+    /// Rows with the same group and description are merged in the dialog
+    /// ("Ctrl+= / Ctrl++").
+    pub description: &'static str,
+}
+
+/// The whole keymap. One line per binding; an action's main binding comes
+/// first (it is the one shown next to its palette command).
+#[rustfmt::skip]
+pub fn shortcuts() -> Vec<Shortcut> {
+    use KeyGroup::*;
+    fn s<A: gpui::Action>(
+        keys: &str,
+        action: A,
+        context: Option<&str>,
+        group: KeyGroup,
+        description: &'static str,
+    ) -> Shortcut {
+        Shortcut {
+            binding: KeyBinding::new(keys, action, context),
+            group,
+            description,
+        }
+    }
+    // The "BlockEditor" context only exists while a block (or the palette's
+    // query box, or the rename field) is being edited, so these keys do
+    // nothing otherwise.
+    let ed = Some("BlockEditor");
+    vec![
+        // Global (no context): work whether or not a block is being edited.
+        s("ctrl-k",         ToggleSearch,  None, Navigation, "Search pages, blocks and commands"),
+        s("ctrl-j",         OpenToday,     None, Navigation, "Open today's journal"),
+        s("ctrl-n",         NewPage,       None, Navigation, "New page"),
+        s("up",             Up,            ed,   Navigation, "Block above / below (or palette result)"),
+        s("down",           Down,          ed,   Navigation, "Block above / below (or palette result)"),
+        s("enter",          Enter,         ed,   Editing,    "New block at the cursor (palette: open the result)"),
+        s("tab",            Tab,           ed,   Editing,    "Indent the block"),
+        s("shift-tab",      ShiftTab,      ed,   Editing,    "Outdent the block"),
+        s("backspace",      Backspace,     ed,   Editing,    "Delete back; on an empty block, remove it"),
+        s("delete",         Delete,        ed,   Editing,    "Delete forward"),
+        s("left",           Left,          ed,   Editing,    "Move the cursor"),
+        s("right",          Right,         ed,   Editing,    "Move the cursor"),
+        s("home",           Home,          ed,   Editing,    "Start / end of the block"),
+        s("end",            End,           ed,   Editing,    "Start / end of the block"),
+        s("shift-left",     SelectLeft,    ed,   Editing,    "Extend the selection"),
+        s("shift-right",    SelectRight,   ed,   Editing,    "Extend the selection"),
+        s("shift-home",     SelectHome,    ed,   Editing,    "Extend the selection"),
+        s("shift-end",      SelectEnd,     ed,   Editing,    "Extend the selection"),
+        s("ctrl-v",         Paste,         ed,   Editing,    "Paste"),
+        s("ctrl-b",         Bold,          ed,   Editing,    "Bold"),
+        s("ctrl-i",         Italic,        ed,   Editing,    "Italic"),
+        s("ctrl-enter",     CycleTask,     ed,   Editing,    "Cycle task: TODO, DOING, DONE, none"),
+        s("escape",         Escape,        ed,   Editing,    "Stop editing (or close the palette)"),
+        s("ctrl-z",         Undo,          None, Editing,    "Undo"),
+        s("ctrl-shift-z",   Redo,          None, Editing,    "Redo"),
+        s("ctrl-y",         Redo,          None, Editing,    "Redo"),
+        s("ctrl-g",         ToggleGraph,   None, View,       "Toggle graph view"),
+        s("ctrl-shift-t",   ToggleTheme,   None, View,       "Switch theme"),
+        // `=` and `+` share a key on US layouts; bind both so Ctrl-+ works
+        // with or without Shift.
+        s("ctrl-=",         IncreaseFont,  None, View,       "Increase font size"),
+        s("ctrl-+",         IncreaseFont,  None, View,       "Increase font size"),
+        s("ctrl--",         DecreaseFont,  None, View,       "Decrease font size"),
+        s("ctrl-0",         ResetFont,     None, View,       "Reset font size"),
+        s("ctrl-w",         CloseTab,      None, Tabs,       "Close tab"),
+        s("ctrl-tab",       NextTab,       None, Tabs,       "Next tab"),
+        s("ctrl-shift-tab", PrevTab,       None, Tabs,       "Previous tab"),
+        s("ctrl-,",         OpenSettings,  None, App,        "Open / close settings"),
+        s("ctrl-/",         ShowShortcuts, None, App,        "Keyboard shortcuts (this list)"),
+        s("ctrl-q",         Quit,          None, App,        "Quit"),
+        // While the settings panel, a page menu (or its delete
+        // confirmation) or this list is open, the root's key context is
+        // that instead, so Esc closes it. (Renaming uses "BlockEditor":
+        // it types.)
+        s("escape",         Escape,        Some("Settings"),  App, "Close a dialog or menu"),
+        s("escape",         Escape,        Some("PageMenu"),  App, "Close a dialog or menu"),
+        s("escape",         Escape,        Some("Shortcuts"), App, "Close a dialog or menu"),
+    ]
+}
+
+/// The shortcuts dialog's content: for each group (in order, empty ones
+/// left out), one row per description with every key bound to it.
+pub fn cheatsheet(shortcuts: &[Shortcut]) -> Vec<(KeyGroup, Vec<(String, &'static str)>)> {
+    KeyGroup::ALL
+        .iter()
+        .map(|&group| {
+            let mut rows: Vec<(Vec<String>, &'static str)> = Vec::new();
+            for s in shortcuts.iter().filter(|s| s.group == group) {
+                let keys = format_keystrokes(s.binding.keystrokes());
+                match rows.iter_mut().find(|(_, d)| *d == s.description) {
+                    Some((list, _)) => {
+                        if !list.contains(&keys) {
+                            list.push(keys);
+                        }
+                    }
+                    None => rows.push((vec![keys], s.description)),
+                }
+            }
+            let rows = rows
+                .into_iter()
+                .map(|(keys, description)| (keys.join(" / "), description))
+                .collect();
+            (group, rows)
+        })
+        .filter(|(_, rows): &(KeyGroup, Vec<_>)| !rows.is_empty())
+        .collect()
+}
+
+/// Register keyboard shortcuts (the `shortcuts` table).
 pub fn bind_keys(cx: &mut App) {
-    let ctx = Some("BlockEditor");
-    cx.bind_keys([
-        KeyBinding::new("enter", Enter, ctx),
-        KeyBinding::new("tab", Tab, ctx),
-        KeyBinding::new("shift-tab", ShiftTab, ctx),
-        KeyBinding::new("backspace", Backspace, ctx),
-        KeyBinding::new("delete", Delete, ctx),
-        KeyBinding::new("left", Left, ctx),
-        KeyBinding::new("right", Right, ctx),
-        KeyBinding::new("up", Up, ctx),
-        KeyBinding::new("down", Down, ctx),
-        KeyBinding::new("home", Home, ctx),
-        KeyBinding::new("end", End, ctx),
-        KeyBinding::new("escape", Escape, ctx),
-        KeyBinding::new("shift-left", SelectLeft, ctx),
-        KeyBinding::new("shift-right", SelectRight, ctx),
-        KeyBinding::new("shift-home", SelectHome, ctx),
-        KeyBinding::new("shift-end", SelectEnd, ctx),
-        KeyBinding::new("ctrl-v", Paste, ctx),
-        KeyBinding::new("ctrl-b", Bold, ctx),
-        KeyBinding::new("ctrl-i", Italic, ctx),
-        KeyBinding::new("ctrl-enter", CycleTask, ctx),
-        // While the settings panel is open the root's key context is
-        // "Settings" instead, so Esc closes the panel.
-        KeyBinding::new("escape", Escape, Some("Settings")),
-        // Likewise "PageMenu" while a page's context menu or its delete
-        // confirmation is open (renaming uses "BlockEditor": it types).
-        KeyBinding::new("escape", Escape, Some("PageMenu")),
-        // Global (no context): works whether or not a block is being edited.
-        KeyBinding::new("ctrl-k", ToggleSearch, None),
-        KeyBinding::new("ctrl-n", NewPage, None),
-        KeyBinding::new("ctrl-j", OpenToday, None),
-        KeyBinding::new("ctrl-z", Undo, None),
-        KeyBinding::new("ctrl-shift-z", Redo, None),
-        KeyBinding::new("ctrl-y", Redo, None),
-        KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
-        KeyBinding::new("ctrl-g", ToggleGraph, None),
-        // `=` and `+` share a key on US layouts; bind both so Ctrl-+ works with
-        // or without Shift.
-        KeyBinding::new("ctrl-=", IncreaseFont, None),
-        KeyBinding::new("ctrl-+", IncreaseFont, None),
-        KeyBinding::new("ctrl--", DecreaseFont, None),
-        KeyBinding::new("ctrl-0", ResetFont, None),
-        KeyBinding::new("ctrl-w", CloseTab, None),
-        KeyBinding::new("ctrl-tab", NextTab, None),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-        KeyBinding::new("ctrl-,", OpenSettings, None),
-        KeyBinding::new("ctrl-q", Quit, None),
-    ]);
+    cx.bind_keys(shortcuts().into_iter().map(|s| s.binding));
     cx.on_action(|_: &Quit, cx| cx.quit());
+}
+
+/// The palette puts a header over each group of results (see
+/// `search::search`): "Commands" over the commands, and "Pages" over the
+/// pages and blocks when commands are listed too. The header shown just
+/// above row `i`, if any.
+fn palette_header(hits: &[Hit], i: usize) -> Option<&'static str> {
+    let is_command = hits[i].target.is_command();
+    if i > 0 && hits[i - 1].target.is_command() == is_command {
+        return None;
+    }
+    if is_command {
+        Some("Commands")
+    } else if hits.iter().any(|h| h.target.is_command()) {
+        Some("Pages")
+    } else {
+        None
+    }
 }
 
 /// Which main view is showing.
@@ -153,8 +281,12 @@ enum Nav {
     Tab,
 }
 
-/// How many results the search overlay shows.
+/// How many page and block results the search overlay shows (commands
+/// come on top of these with an empty query).
 const MAX_RESULTS: usize = 12;
+
+/// Height of the palette's scrolling result list.
+const PALETTE_LIST_HEIGHT: f32 = 440.0;
 
 /// State of the Ctrl-K overlay while it is open.
 struct SearchState {
@@ -167,9 +299,15 @@ struct SearchState {
     /// template" puts the template's blocks after it (see
     /// `Page::insert_blocks_from`); `None` means append to the page.
     insert_after: Option<usize>,
+    /// That block's editor (text, cursor, selection) when the palette
+    /// opened: an editor command (`Needs::Editing`) resumes it.
+    resume: Option<EditorState>,
     /// `Some` once "Insert template" was chosen: the palette then lists these
     /// templates instead of pages, blocks and commands.
     templates: Option<Vec<Template>>,
+    /// The result list scrolls (an empty query lists every command); arrow
+    /// keys keep the highlighted row in view through this.
+    scroll: ScrollHandle,
 }
 
 const MAX_HISTORY: usize = 100;
@@ -305,6 +443,8 @@ pub struct NoteSec {
     /// `Some` while a page's context menu (or its rename / delete step) is
     /// open.
     page_menu: Option<PageMenu>,
+    /// True while the keyboard shortcuts dialog is open.
+    shortcuts_open: bool,
     /// Where the page being dragged in the sidebar would land. Only
     /// meaningful while a drag is active; `render` clears it otherwise.
     page_drop: Option<PageDrop>,
@@ -405,6 +545,7 @@ impl NoteSec {
             slash: None,
             settings: None,
             page_menu: None,
+            shortcuts_open: false,
             page_drop: None,
             selecting: false,
             collapsed: HashSet::new(),
@@ -545,6 +686,7 @@ impl NoteSec {
         self.stop_edit(cx);
         self.close_search(cx);
         self.page_menu = None;
+        self.shortcuts_open = false;
         let fonts = cx.text_system().all_font_names();
         self.settings = Some(SettingsState { fonts });
         cx.notify();
@@ -578,21 +720,6 @@ impl NoteSec {
         cx.notify();
     }
 
-    fn run_command(&mut self, command: Command, cx: &mut Context<Self>) {
-        match command {
-            Command::ToggleTheme => self.toggle_theme(cx),
-            Command::IncreaseFontSize => self.change_font_size(1.0, cx),
-            Command::DecreaseFontSize => self.change_font_size(-1.0, cx),
-            Command::ResetFontSize => self.reset_font_size(cx),
-            Command::ToggleGraph => self.toggle_graph(cx),
-            Command::InsertTemplate => self.open_template_picker(None, cx),
-            Command::OpenSettings => self.open_settings(cx),
-            Command::SortPagesAz => self.sort_pages_az(cx),
-            Command::ToggleLocalGraph => self.toggle_local_graph(cx),
-            Command::OpenAgenda => self.show_agenda(cx),
-        }
-    }
-
     // --- templates -------------------------------------------------------------
 
     /// Show the palette as a template picker. `insert_after` is the block the
@@ -603,7 +730,9 @@ impl NoteSec {
             query: EditorState::default(),
             selected: 0,
             insert_after,
+            resume: None,
             templates: Some(self.storage.load_templates()),
+            scroll: ScrollHandle::new(),
         });
         cx.notify();
     }
@@ -646,7 +775,12 @@ impl NoteSec {
                 let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
                 search_templates(&names, &query.text, MAX_RESULTS)
             }
-            Some(s) => search(&self.pages, &s.query.text, MAX_RESULTS),
+            Some(s) => search(
+                &self.pages,
+                &self.available_commands(),
+                &s.query.text,
+                MAX_RESULTS,
+            ),
             None => Vec::new(),
         }
     }
@@ -675,14 +809,18 @@ impl NoteSec {
         // Remember where the cursor was (for "Insert template"), then save
         // whatever block is being edited before covering it.
         let insert_after = self.editing;
+        let resume = insert_after.map(|_| self.editor.clone());
         self.stop_edit(cx);
         self.settings = None;
         self.page_menu = None;
+        self.shortcuts_open = false;
         self.search = Some(SearchState {
             query: EditorState::default(),
             selected: 0,
             insert_after,
+            resume,
             templates: None,
+            scroll: ScrollHandle::new(),
         });
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -821,10 +959,16 @@ impl NoteSec {
     }
 
     fn move_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let count = self.search_results().len();
+        let hits = self.search_results();
         if let Some(s) = &mut self.search {
-            if count > 0 {
-                s.selected = (s.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+            if !hits.is_empty() {
+                s.selected =
+                    (s.selected as isize + delta).clamp(0, hits.len() as isize - 1) as usize;
+                // Children of the list are headers and rows; find the row's.
+                let headers = (0..=s.selected)
+                    .filter(|&i| palette_header(&hits, i).is_some())
+                    .count();
+                s.scroll.scroll_to_item(s.selected + headers);
             }
         }
         cx.notify();
@@ -842,9 +986,9 @@ impl NoteSec {
     /// Act on a search result: open its page (and for a block hit, start
     /// editing that block) or run the command.
     fn open_hit(&mut self, hit: &Hit, window: &mut Window, cx: &mut Context<Self>) {
-        let (insert_after, templates) = match self.search.take() {
-            Some(s) => (s.insert_after, s.templates),
-            None => (None, None),
+        let (insert_after, resume, templates) = match self.search.take() {
+            Some(s) => (s.insert_after, s.resume, s.templates),
+            None => (None, None, None),
         };
         self.close_search(cx);
         match hit.target {
@@ -859,9 +1003,28 @@ impl NoteSec {
                     self.start_edit(block, window, cx);
                 }
             }
-            // Keeps the palette open, now listing templates.
+            // Keeps the palette open, now listing templates (after the
+            // block that was being edited when it opened).
             Target::Command(Command::InsertTemplate) => self.open_template_picker(insert_after, cx),
-            Target::Command(command) => self.run_command(command, cx),
+            // The same action the command's key binding dispatches. It
+            // runs once this handler returns (GPUI defers it), so the
+            // palette is already closed.
+            Target::Command(command) => {
+                // An editor command acts on the block the palette was
+                // opened from: edit it again, exactly as it was.
+                if command.needs() == Needs::Editing {
+                    let (Some(ix), Some(editor)) = (insert_after, resume) else {
+                        return;
+                    };
+                    if ix >= self.pages[self.selected].blocks.len() {
+                        return;
+                    }
+                    self.start_edit(ix, window, cx);
+                    self.editor = editor;
+                    self.editor.clamp();
+                }
+                window.dispatch_action(command.action(), cx)
+            }
             Target::Template(ix) => {
                 if let Some(template) = templates.as_ref().and_then(|t| t.get(ix)) {
                     self.insert_template(template, insert_after, cx);
@@ -900,6 +1063,191 @@ impl NoteSec {
 
     fn on_reset_font(&mut self, _: &ResetFont, _: &mut Window, cx: &mut Context<Self>) {
         self.reset_font_size(cx);
+    }
+
+    // --- palette commands ------------------------------------------------------
+
+    /// The page the palette's page commands act on: the one on screen, if a
+    /// page tab is showing (not the graph, the agenda or no tab at all).
+    fn current_page(&self) -> Option<String> {
+        (self.mode == Mode::Notes).then(|| self.pages[self.selected].title.clone())
+    }
+
+    /// Commands the palette offers right now, in table order. Page commands
+    /// are left out without a current page, editor commands unless the
+    /// palette was opened while editing a block, and Rename / Delete when
+    /// the page menu would refuse them (a journal; the last page).
+    fn available_commands(&self) -> Vec<Command> {
+        let page = self.current_page();
+        let editing = page.is_some()
+            && self
+                .search
+                .as_ref()
+                .is_some_and(|s| s.insert_after.is_some() && s.resume.is_some());
+        Command::ALL
+            .iter()
+            .copied()
+            .filter(|c| match c.needs() {
+                Needs::Nothing => true,
+                Needs::Page => page.is_some(),
+                Needs::Editing => editing,
+            })
+            .filter(|c| match c {
+                Command::RenamePage => page.as_deref().is_some_and(|t| self.can_rename(t)),
+                Command::DeletePage => self.can_delete(),
+                _ => true,
+            })
+            .collect()
+    }
+
+    fn on_open_agenda(&mut self, _: &OpenAgenda, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_agenda(cx);
+    }
+
+    fn on_sort_pages_az(&mut self, _: &SortPagesAz, _: &mut Window, cx: &mut Context<Self>) {
+        self.sort_pages_az(cx);
+    }
+
+    fn on_toggle_local_graph(
+        &mut self,
+        _: &ToggleLocalGraph,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_local_graph(cx);
+    }
+
+    /// "Fit graph": show the graph (opening it if needed) and fit it.
+    fn on_fit_graph(&mut self, _: &FitGraph, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_graph(cx);
+        if let Some(graph) = self.graph.clone() {
+            graph.update(cx, |g, cx| g.fit(cx));
+        }
+    }
+
+    /// "Toggle journals in graph": show the graph and flip its Journals chip.
+    fn on_toggle_graph_journals(
+        &mut self,
+        _: &ToggleGraphJournals,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_graph(cx);
+        if let Some(graph) = self.graph.clone() {
+            graph.update(cx, |g, cx| g.toggle_journals(cx));
+        }
+    }
+
+    fn on_insert_template(&mut self, _: &InsertTemplate, _: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page().is_some() {
+            self.open_template_picker(self.editing, cx);
+        }
+    }
+
+    /// Where the page menu opens when a command (not a right-click) opens
+    /// it: over the page title, at the top left of the main pane.
+    fn command_menu_position() -> gpui::Point<Pixels> {
+        point(px(272.0), px(80.0))
+    }
+
+    /// "Rename current page": the page menu's rename field, for the page
+    /// on screen.
+    fn on_rename_page(&mut self, _: &RenamePage, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.current_page().filter(|t| self.can_rename(t)) else {
+            return;
+        };
+        self.open_page_menu(title, Self::command_menu_position(), cx);
+        self.start_rename(cx);
+    }
+
+    /// "Delete current page": the page menu's confirm dialog.
+    fn on_delete_page(&mut self, _: &DeletePage, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.current_page() else {
+            return;
+        };
+        self.open_page_menu(title, Self::command_menu_position(), cx);
+        self.ask_delete(cx);
+        // `ask_delete` refuses for the last page; don't leave the menu up.
+        if matches!(
+            self.page_menu,
+            Some(PageMenu {
+                step: MenuStep::Menu,
+                ..
+            })
+        ) {
+            self.close_page_menu(cx);
+        }
+    }
+
+    fn on_copy_page_title(&mut self, _: &CopyPageTitle, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(title) = self.current_page() {
+            cx.write_to_clipboard(ClipboardItem::new_string(title));
+        }
+    }
+
+    fn on_toggle_favorite(&mut self, _: &ToggleFavorite, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(title) = self.current_page() {
+            self.toggle_favorite(&title, cx);
+        }
+    }
+
+    /// "Collapse all": fold every block of the current page that has
+    /// children. Folding is UI-only (not an undo step), like the arrows.
+    fn on_collapse_all(&mut self, _: &CollapseAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page().is_none() {
+            return;
+        }
+        let page = &self.pages[self.selected];
+        self.collapsed.extend(
+            (0..page.blocks.len())
+                .filter(|&ix| page.descendant_count(ix) > 0)
+                .map(|ix| page.blocks[ix].id),
+        );
+        // A block being edited inside a folded subtree stops being edited.
+        let visible = page.visible_blocks(&self.collapsed);
+        if self.editing.is_some_and(|ix| !visible[ix]) {
+            self.stop_edit(cx);
+        }
+        cx.notify();
+    }
+
+    /// "Expand all": unfold every block of the current page.
+    fn on_expand_all(&mut self, _: &ExpandAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page().is_none() {
+            return;
+        }
+        for block in &self.pages[self.selected].blocks {
+            self.collapsed.remove(&block.id);
+        }
+        cx.notify();
+    }
+
+    // --- keyboard shortcuts dialog --------------------------------------------
+
+    /// Ctrl+/ or "Keyboard shortcuts": open the list, or close it if open.
+    fn on_show_shortcuts(
+        &mut self,
+        _: &ShowShortcuts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shortcuts_open {
+            self.close_shortcuts(cx);
+            return;
+        }
+        // A modal like the settings panel: save the edit, close the rest.
+        self.stop_edit(cx);
+        self.close_search(cx);
+        self.settings = None;
+        self.page_menu = None;
+        self.shortcuts_open = true;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn close_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.shortcuts_open = false;
+        cx.notify();
     }
 
     // --- "/" block-type menu --------------------------------------------------
@@ -1164,7 +1512,10 @@ impl NoteSec {
     /// The Ctrl-K palette, the settings panel or a page menu covers the
     /// page. All are modal, so the tab keys do nothing while one is open.
     fn overlay_open(&self) -> bool {
-        self.search.is_some() || self.settings.is_some() || self.page_menu.is_some()
+        self.search.is_some()
+            || self.settings.is_some()
+            || self.page_menu.is_some()
+            || self.shortcuts_open
     }
 
     /// Ctrl+W. Ignored while an overlay is open.
@@ -1697,10 +2048,11 @@ impl NoteSec {
     }
 
     fn start_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        // Never edit under the settings panel or a page menu (e.g. Ctrl-N
-        // while one is open).
+        // Never edit under the settings panel, a page menu or the shortcuts
+        // list (e.g. Ctrl-N while one is open).
         self.settings = None;
         self.page_menu = None;
+        self.shortcuts_open = false;
         self.commit();
         self.text_history_active = false;
         self.load_editor(ix, false);
@@ -1982,6 +2334,8 @@ impl NoteSec {
         if self.page_menu.is_some() {
             // Closes the menu, cancels a rename or a delete.
             self.close_page_menu(cx);
+        } else if self.shortcuts_open {
+            self.close_shortcuts(cx);
         } else if self.settings.is_some() {
             self.close_settings(cx);
         } else if self.search.is_some() {
@@ -2935,6 +3289,88 @@ impl NoteSec {
 }
 
 impl NoteSec {
+    /// The keyboard shortcuts dialog (Ctrl+/ or "Keyboard shortcuts"): the
+    /// `shortcuts` table, grouped, in a modal like the settings panel.
+    fn render_shortcuts(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let mut children: Vec<AnyElement> = Vec::new();
+        let mut n: usize = 0;
+        for (group, rows) in cheatsheet(&shortcuts()) {
+            children.push(
+                div()
+                    .mt_2()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.accent)
+                    .child(group.label())
+                    .into_any_element(),
+            );
+            for (keys, description) in rows {
+                let i = n;
+                n += 1;
+                children.push(
+                    div()
+                        .debug_selector(move || format!("shortcut-row-{i}"))
+                        .flex()
+                        .flex_row()
+                        .gap_3()
+                        .py(px(2.0))
+                        .child(
+                            div()
+                                .w(px(200.0))
+                                .flex_shrink_0()
+                                .text_color(theme.text)
+                                .child(keys),
+                        )
+                        .child(div().text_color(theme.muted).child(description))
+                        .into_any_element(),
+                );
+            }
+        }
+        div()
+            .id("shortcuts-backdrop")
+            .debug_selector(|| "shortcuts-backdrop".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(gpui::black().opacity(0.45))
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(60.0))
+            .on_click(cx.listener(|this, _e, _window, cx| this.close_shortcuts(cx)))
+            .child(
+                div()
+                    .id("shortcuts-dialog")
+                    .debug_selector(|| "shortcuts-dialog".to_string())
+                    .occlude()
+                    .w(px(600.0))
+                    .max_h(px(620.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Keyboard shortcuts"),
+                            )
+                            .child(div().text_color(theme.muted).child("Esc to close")),
+                    )
+                    .children(children),
+            )
+            .into_any_element()
+    }
+
     /// The agenda tab: open tasks in Overdue, Today, Upcoming (one header
     /// per day) and Unscheduled sections. Rows are numbered top to bottom
     /// (`agenda-item-{i}`).
@@ -3108,6 +3544,12 @@ impl Render for NoteSec {
         }
         let theme = self.theme;
         let font_size = self.config.font_size;
+        // Shortcut hints are read from the keymap (`bind_keys`), so they
+        // always show the real binding.
+        let keymap = cx.key_bindings();
+        let hint = move |action: &dyn gpui::Action| -> String {
+            binding_hint(&keymap.borrow(), action).unwrap_or_default()
+        };
         // Style for `[[wikilinks]]` in display mode: accent colour + underline.
         let link_style = HighlightStyle {
             color: Some(theme.accent.into()),
@@ -3376,7 +3818,7 @@ impl Render for NoteSec {
             .hover(|d| d.bg(theme.selected_bg))
             .on_click(cx.listener(|this, _e, _window, cx| this.open_today(cx)))
             .child("Today")
-            .child(div().text_color(theme.muted).child("Ctrl-J"));
+            .child(div().text_color(theme.muted).child(hint(&OpenToday)));
 
         // "Graph view" entry above the page list; highlighted while open.
         let in_graph = self.mode == Mode::Graph;
@@ -3449,7 +3891,7 @@ impl Render for NoteSec {
             .hover(|d| d.bg(theme.selected_bg))
             .on_click(cx.listener(|this, _e, _window, cx| this.open_settings(cx)))
             .child("Settings")
-            .child(div().text_color(theme.muted).child("Ctrl-,"));
+            .child(div().text_color(theme.muted).child(hint(&OpenSettings)));
 
         // Below the last page: dropping here moves a page to the very end.
         let drop_end = div()
@@ -3852,10 +4294,12 @@ impl Render for NoteSec {
             let hits = self.search_results();
             let selected = state.selected;
             let templates = state.templates.as_deref();
+            let headers: Vec<Option<&'static str>> =
+                (0..hits.len()).map(|i| palette_header(&hits, i)).collect();
             let rows: Vec<AnyElement> =
                 hits.into_iter()
                     .enumerate()
-                    .map(|(i, hit)| {
+                    .flat_map(|(i, hit)| {
                         // Page hit: just the title. Block hit: the text, then the
                         // page it lives on. Command: its label and a muted tag.
                         // (Muted text is the secondary column in each case.)
@@ -3879,10 +4323,20 @@ impl Render for NoteSec {
                                     .child(self.pages[p].blocks[b].content.clone()),
                                 self.pages[p].title.clone(),
                             ),
-                            Target::Command(c) => row(
-                                div().text_color(theme.text).child(c.label()),
-                                "command".into(),
-                            ),
+                            // The shortcut hint, right-aligned and muted.
+                            Target::Command(c) => div()
+                                .debug_selector(move || format!("command-{}", c.name()))
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .gap_2()
+                                .child(div().text_color(theme.text).child(c.label()))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(theme.muted)
+                                        .child(hint(c.action().as_ref())),
+                                ),
                             Target::Template(t) => row(
                                 div().text_color(theme.accent).child(
                                     templates.map_or(String::new(), |ts| ts[t].name.clone()),
@@ -3890,9 +4344,21 @@ impl Render for NoteSec {
                                 "template".into(),
                             ),
                         };
-                        div()
+                        let header = headers[i].map(|title| {
+                            div()
+                                .debug_selector(move || {
+                                    format!("palette-{}-header", title.to_lowercase())
+                                })
+                                .px_3()
+                                .pt_2()
+                                .text_color(theme.muted)
+                                .child(title)
+                                .into_any_element()
+                        });
+                        let row = div()
                             .id(("search-result", i))
                             .debug_selector(|| format!("search-result-{i}"))
+                            .flex_shrink_0()
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -3903,7 +4369,8 @@ impl Render for NoteSec {
                                 this.open_hit(&hit, window, cx);
                             }))
                             .child(label)
-                            .into_any_element()
+                            .into_any_element();
+                        header.into_iter().chain(std::iter::once(row))
                     })
                     .collect();
             let no_results = rows.is_empty();
@@ -3964,7 +4431,18 @@ impl Render for NoteSec {
                                 .bg(theme.bg)
                                 .child(BlockText { app: cx.entity() }),
                         )
-                        .children(rows)
+                        // Scrolls: an empty query lists every command.
+                        .child(
+                            div()
+                                .id("search-results")
+                                .max_h(px(PALETTE_LIST_HEIGHT))
+                                .overflow_y_scroll()
+                                .track_scroll(&state.scroll)
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .children(rows),
+                        )
                         .when(no_results, |d| {
                             d.child(
                                 div()
@@ -4044,7 +4522,7 @@ impl Render for NoteSec {
 
         // No tabs: say so and offer the usual ways to open one.
         let empty_state = || {
-            let hint = |keys: &'static str, what: &'static str| {
+            let hint_row = |keys: String, what: &'static str| {
                 div()
                     .flex()
                     .flex_row()
@@ -4086,11 +4564,15 @@ impl Render for NoteSec {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(hint("Ctrl-J", "today's journal"))
-                        .child(hint("Ctrl-K", "search pages and blocks"))
-                        .child(hint("Ctrl-N", "new page"))
-                        .child(hint("Ctrl-G", "graph view"))
-                        .child(hint("", "or pick a page in the sidebar")),
+                        .child(hint_row(hint(&OpenToday), "today's journal"))
+                        .child(hint_row(
+                            hint(&ToggleSearch),
+                            "search pages, blocks and commands",
+                        ))
+                        .child(hint_row(hint(&NewPage), "new page"))
+                        .child(hint_row(hint(&ToggleGraph), "graph view"))
+                        .child(hint_row(hint(&ShowShortcuts), "keyboard shortcuts"))
+                        .child(hint_row(String::new(), "or pick a page in the sidebar")),
                 )
         };
 
@@ -4121,9 +4603,12 @@ impl Render for NoteSec {
             .as_ref()
             .map(|menu| self.render_page_menu(menu, cx));
 
+        let shortcuts_overlay = self.shortcuts_open.then(|| self.render_shortcuts(cx));
+
         let is_editing = self.editing.is_some() || self.text_input_open();
-        let settings_open = self.settings.is_some();
-        let page_menu_open = self.page_menu.is_some() && !is_editing;
+        let shortcuts_open = self.shortcuts_open;
+        let settings_open = self.settings.is_some() && !shortcuts_open;
+        let page_menu_open = self.page_menu.is_some() && !is_editing && !shortcuts_open;
         div()
             .size_full()
             .relative()
@@ -4138,8 +4623,9 @@ impl Render for NoteSec {
             // The key context only exists while editing, which is what makes
             // the "BlockEditor" key bindings conditional. The settings panel
             // takes over the keyboard context while it is open.
+            .when(shortcuts_open, |d| d.key_context("Shortcuts"))
             .when(settings_open, |d| d.key_context("Settings"))
-            .when(!settings_open && is_editing, |d| {
+            .when(!shortcuts_open && !settings_open && is_editing, |d| {
                 d.key_context("BlockEditor")
             })
             .when(!settings_open && page_menu_open, |d| {
@@ -4183,11 +4669,25 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_decrease_font))
             .on_action(cx.listener(Self::on_reset_font))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_open_agenda))
+            .on_action(cx.listener(Self::on_rename_page))
+            .on_action(cx.listener(Self::on_delete_page))
+            .on_action(cx.listener(Self::on_copy_page_title))
+            .on_action(cx.listener(Self::on_toggle_favorite))
+            .on_action(cx.listener(Self::on_sort_pages_az))
+            .on_action(cx.listener(Self::on_insert_template))
+            .on_action(cx.listener(Self::on_collapse_all))
+            .on_action(cx.listener(Self::on_expand_all))
+            .on_action(cx.listener(Self::on_toggle_local_graph))
+            .on_action(cx.listener(Self::on_fit_graph))
+            .on_action(cx.listener(Self::on_toggle_graph_journals))
+            .on_action(cx.listener(Self::on_show_shortcuts))
             .child(sidebar)
             .child(content)
             .children(overlay)
             .children(settings_overlay)
             .children(page_menu_overlay)
+            .children(shortcuts_overlay)
     }
 }
 
@@ -5181,7 +5681,7 @@ mod tests {
 
         // The palette command toggles the view too.
         cx.simulate_keystrokes("ctrl-k");
-        cx.simulate_input("graph");
+        cx.simulate_input("toggle graph view");
         cx.simulate_keystrokes("enter");
         view.update(cx, |app, _| assert_eq!(app.mode, Mode::Notes));
         let _ = std::fs::remove_dir_all(dir);
@@ -5371,7 +5871,10 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.search.as_ref().unwrap().selected, 2)
         });
-        cx.simulate_keystrokes("down down down down down down down down down down down down");
+        // (An empty query lists the pages, then every command.)
+        for _ in 0..Command::ALL.len() + 12 {
+            cx.simulate_keystrokes("down");
+        }
         view.update(cx, |app, _| {
             let last = app.search_results().len() - 1;
             assert_eq!(app.search.as_ref().unwrap().selected, last);
@@ -7816,6 +8319,273 @@ mod tests {
         for group in ["overdue", "today", "upcoming", "unscheduled"] {
             assert!(!has(cx, &format!("agenda-group-{group}")));
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- command palette for everything, shortcuts dialog -----------------------
+
+    /// Open the palette, type `query` and run the top result with Enter.
+    fn run_in_palette(cx: &mut VisualTestContext, query: &str) {
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input(query);
+        cx.simulate_keystrokes("enter");
+    }
+
+    fn top_hit(view: &Entity<NoteSec>, cx: &mut VisualTestContext, query: &str) -> Target {
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input(query);
+        let top = view.update(cx, |app, _| app.search_results()[0].target);
+        cx.simulate_keystrokes("escape");
+        top
+    }
+
+    fn command_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- a\n  - b\n- c\n  - d\n    - e\n"),
+            ("Beta", "- other\n"),
+            ("Alpha", "- more\n"),
+        ]
+    }
+
+    #[gpui::test]
+    fn every_command_is_listed_with_an_empty_query(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "cmd-all", &command_pages(), "Test");
+        // Opened while editing a block, so editor commands are offered too.
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-k");
+        assert!(has(cx, "palette-commands-header"));
+        assert!(has(cx, "palette-pages-header"));
+        let commands: Vec<Command> = view.update(cx, |app, _| {
+            app.search_results()
+                .iter()
+                .filter_map(|h| match h.target {
+                    Target::Command(c) => Some(c),
+                    _ => None,
+                })
+                .collect()
+        });
+        assert_eq!(commands, Command::ALL);
+        // Every row is rendered (the list scrolls; arrows reach the last).
+        for c in Command::ALL {
+            assert!(has(cx, &format!("command-{}", c.name())), "{c:?}");
+        }
+        for _ in 0..Command::ALL.len() + 12 {
+            cx.simulate_keystrokes("down");
+        }
+        let last = view.update(cx, |app, _| {
+            let s = app.search.as_ref().unwrap();
+            app.search_results()[s.selected].target
+        });
+        assert_eq!(last, Target::Command(*Command::ALL.last().unwrap()));
+        cx.simulate_keystrokes("escape");
+
+        // Not editing: no editor commands. From the graph tab: no page
+        // commands either.
+        cx.simulate_keystrokes("escape ctrl-k");
+        let offered = view.update(cx, |app, _| app.available_commands());
+        assert!(!offered.contains(&Command::CycleTask));
+        assert!(offered.contains(&Command::CollapseAll));
+        cx.simulate_keystrokes("escape ctrl-g ctrl-k");
+        let offered = view.update(cx, |app, _| app.available_commands());
+        for c in Command::ALL {
+            assert_eq!(
+                offered.contains(c),
+                c.needs() == Needs::Nothing,
+                "{c:?} on the graph tab"
+            );
+        }
+        assert!(!has(cx, "command-CollapseAll"));
+        assert!(has(cx, "command-FitGraph"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn fuzzy_queries_find_commands(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "cmd-fuzzy", &command_pages(), "Test");
+        for (query, command) in [
+            ("shrt", Command::ShowShortcuts),
+            ("agnd", Command::OpenAgenda),
+            ("col all", Command::CollapseAll),
+            ("exp all", Command::ExpandAll),
+            ("new page", Command::NewPage),
+            ("fav", Command::ToggleFavorite),
+            ("fit", Command::FitGraph),
+            ("journals in graph", Command::ToggleGraphJournals),
+            ("rename", Command::RenamePage),
+            ("prev tab", Command::PrevTab),
+        ] {
+            assert_eq!(
+                top_hit(&view, cx, query),
+                Target::Command(command),
+                "{query}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn palette_commands_do_what_they_say(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "cmd-run", &command_pages(), "Test");
+
+        // Collapse all folds every block with children; Expand all undoes it.
+        run_in_palette(cx, "collapse all");
+        assert_eq!(shown(cx, 5), vec![0, 2]);
+        view.update(cx, |app, _| {
+            assert!(app.search.is_none(), "the palette closed");
+            assert!(app.undo_stack.is_empty(), "folding is not an undo step");
+        });
+        run_in_palette(cx, "expand all");
+        assert_eq!(shown(cx, 5), vec![0, 1, 2, 3, 4]);
+
+        // Toggle favorite stars the current page, and again unstars it.
+        run_in_palette(cx, "toggle favorite");
+        assert!(UiState::load(&dir).favorites.contains(&"Test".to_string()));
+        run_in_palette(cx, "toggle favorite");
+        assert!(UiState::load(&dir).favorites.is_empty());
+
+        // Copy page title.
+        run_in_palette(cx, "copy page title");
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("Test")
+        );
+
+        // Rename opens the rename field, Delete the confirm dialog.
+        run_in_palette(cx, "rename current page");
+        assert!(has(cx, "rename-input"));
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Test"));
+        cx.simulate_keystrokes("escape");
+        run_in_palette(cx, "delete current page");
+        assert!(has(cx, "confirm-delete"));
+        cx.simulate_keystrokes("escape");
+        assert!(dir.join("pages/Test.md").exists());
+
+        // Fit graph and Toggle journals open the graph first.
+        run_in_palette(cx, "toggle journals in graph");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+        let graph = view.update(cx, |app, _| app.graph.clone().unwrap());
+        assert!(!graph.update(cx, |g, _| g.includes_journals()));
+        cx.simulate_keystrokes("ctrl-w");
+        run_in_palette(cx, "fit graph");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+
+        // New page creates a page and opens it.
+        run_in_palette(cx, "new page");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Untitled");
+            assert_eq!(app.mode, Mode::Notes);
+        });
+        assert!(dir.join("pages/Untitled.md").exists());
+
+        // Tabs: previous / close.
+        let tabs = view.update(cx, |app, _| app.tabs.tabs.len());
+        run_in_palette(cx, "close tab");
+        view.update(cx, |app, _| assert_eq!(app.tabs.tabs.len(), tabs - 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn editor_commands_resume_the_block_the_palette_was_opened_from(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "cmd-editor", "- one\n- two\n");
+        click_block(cx, 1);
+        cx.simulate_keystrokes("ctrl-k");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        cx.simulate_input("cycle task");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.text, "TODO two");
+        });
+        assert_eq!(file(&dir), "- one\n- TODO two\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn shortcuts_dialog_opens_from_palette_and_key_and_esc_closes_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "cmd-shortcuts", "- hi\n");
+        run_in_palette(cx, "keyboard shortcuts");
+        assert!(has(cx, "shortcuts-dialog"));
+        view.update(cx, |app, _| assert!(app.search.is_none()));
+        // Modal: tab keys do nothing, Esc closes.
+        cx.simulate_keystrokes("ctrl-w");
+        view.update(cx, |app, _| assert_eq!(app.tabs.tabs.len(), 1));
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "shortcuts-dialog"));
+
+        // Ctrl+/ toggles it, even while editing (which it ends).
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-/");
+        assert!(has(cx, "shortcuts-dialog"));
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        cx.simulate_keystrokes("ctrl-/");
+        assert!(!has(cx, "shortcuts-dialog"));
+
+        // A click on the backdrop closes it; one inside does not.
+        cx.simulate_keystrokes("ctrl-/");
+        click_on(cx, "shortcut-row-0");
+        assert!(has(cx, "shortcuts-dialog"));
+        let backdrop = cx.debug_bounds("shortcuts-backdrop").unwrap();
+        cx.simulate_click(
+            backdrop.bottom_right() - point(px(5.0), px(5.0)),
+            Modifiers::none(),
+        );
+        assert!(!has(cx, "shortcuts-dialog"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn hints_and_cheatsheet_come_from_the_registered_bindings(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(cx, "cmd-hints", "- hi\n");
+        let table = shortcuts();
+        let keymap = cx.update(|_, cx| cx.key_bindings());
+        let keymap = keymap.borrow();
+
+        // Each command's hint is its action's first context-free binding in
+        // the table, else its first binding; no binding, no hint.
+        for c in Command::ALL {
+            let action = c.action();
+            let mine = |s: &&Shortcut| s.binding.action().partial_eq(action.as_ref());
+            let expected = table
+                .iter()
+                .filter(mine)
+                .find(|s| s.binding.predicate().is_none())
+                .or_else(|| table.iter().find(mine))
+                .map(|s| format_keystrokes(s.binding.keystrokes()));
+            assert_eq!(binding_hint(&keymap, action.as_ref()), expected, "{c:?}");
+        }
+        let hint = |c: Command| binding_hint(&keymap, c.action().as_ref());
+        assert_eq!(hint(Command::NewPage).as_deref(), Some("Ctrl+N"));
+        assert_eq!(hint(Command::Redo).as_deref(), Some("Ctrl+Shift+Z"));
+        assert_eq!(hint(Command::IncreaseFont).as_deref(), Some("Ctrl+="));
+        assert_eq!(hint(Command::ShowShortcuts).as_deref(), Some("Ctrl+/"));
+        assert_eq!(hint(Command::CycleTask).as_deref(), Some("Ctrl+Enter"));
+        assert_eq!(hint(Command::OpenAgenda), None);
+
+        // The cheatsheet lists every registered binding.
+        let sheet = cheatsheet(&table);
+        let listed: Vec<String> = sheet
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .flat_map(|(keys, _)| keys.split(" / ").map(str::to_string))
+            .collect();
+        assert_eq!(keymap.bindings().len(), table.len());
+        for binding in keymap.bindings() {
+            let keys = format_keystrokes(binding.keystrokes());
+            assert!(listed.contains(&keys), "{keys} missing from the cheatsheet");
+        }
+        assert_eq!(
+            sheet.iter().map(|(g, _)| *g).collect::<Vec<_>>(),
+            KeyGroup::ALL
+        );
+        drop(keymap);
+
+        // The dialog shows every row.
+        let rows: usize = sheet.iter().map(|(_, rows)| rows.len()).sum();
+        cx.simulate_keystrokes("ctrl-/");
+        assert!(has(cx, &format!("shortcut-row-{}", rows - 1)));
+        assert!(!has(cx, &format!("shortcut-row-{rows}")));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -274,16 +274,17 @@ changes you call `cx.notify()` and GPUI re-renders. **GPUI owns the view**
 ```rust
 actions!(notesec, [Enter, Tab, ShiftTab, Backspace, ...]);
 
-cx.bind_keys([
-    KeyBinding::new("enter", Enter, Some("BlockEditor")),
-    ...
-]);
+// shortcuts(): one line per binding, with its cheatsheet group and text.
+s("enter", Enter, Some("BlockEditor"), Editing, "New block at the cursor"),
+...
+cx.bind_keys(shortcuts().into_iter().map(|s| s.binding));
 ```
 
 Keyboard input goes: **key press -> action -> handler**. The `"BlockEditor"`
 context scopes bindings so Enter only splits blocks *while editing* — the same
 key can mean different things in different contexts. Cleaner than one giant
-`match` on key codes.
+`match` on key codes. The Ctrl-K palette's commands dispatch the same actions
+(decision 33), and the Ctrl+/ dialog lists the same table.
 
 ### Events, not callbacks
 
@@ -735,6 +736,52 @@ that mutate, and data races are essentially impossible.
     marker lines as plain text for now: stripping them in `DisplayBlock`
     and drawing a chip would be nicer, but it is not free and the agenda
     itself already shows the date.
+33. **The palette runs every command; one key table feeds hints and the
+    cheatsheet.** *Commands*: `commands.rs` declares `Command` with one
+    `commands!` row each: `Name => "Label", [keywords], Needs;`. `Name`
+    is both the variant and the GPUI action in `app.rs` it dispatches
+    (`window.dispatch_action`, deferred until the palette has closed),
+    so a command and its key always do the same thing, through the same
+    handler. Adding one is that row plus the action and its handler
+    (needed for a key anyway). *Keys*: `app.rs`'s `shortcuts()` is the
+    whole keymap, one line per binding with its group (Navigation,
+    Editing, View, Tabs, App) and a description; `bind_keys` registers
+    exactly it. *Hints*: a command's hint is read back from GPUI's keymap
+    (`App::key_bindings` -> `Keymap::bindings_for_action`): the first
+    binding without a key context, else the first binding (an editor
+    command's "BlockEditor" key), written as `Ctrl+Shift+T`
+    (`format_keystrokes`). So hints can't drift; the sidebar's Today and
+    Settings hints and the empty state use the same lookup. *Cheatsheet*:
+    "Keyboard shortcuts" or Ctrl+/ (free; Zed's comment key, which we
+    don't need) opens a modal like Settings (dimmed backdrop, `occlude`,
+    own key context "Shortcuts", Esc / backdrop / Ctrl+/ close it) listing
+    `cheatsheet(&shortcuts())`: per group, one row per description with
+    all its keys ("Ctrl+= / Ctrl++"). *Palette*: an empty query lists the
+    pages (as before, up to 12) and then every offered command under a
+    "Commands" header; a query keeps the best 12 hits by the same fuzzy
+    score as before (label, or keyword at a penalty) and shows them as two
+    groups, pages and blocks / commands, the group with the best hit
+    first so Enter still runs the top match. A "Pages" header appears
+    when both groups do. Each command row shows its hint right-aligned
+    and muted; the list scrolls and arrows keep the highlighted row in
+    view (`ScrollHandle::scroll_to_item`). Enter or a click runs the
+    command and closes the palette; Insert template keeps it open as the
+    template picker, and Rename / Delete / Keyboard shortcuts open their
+    own dialog. *Availability*: commands that make no sense are *hidden*,
+    not greyed out (Enter always runs something real): `Needs::Page`
+    commands (Rename, Delete, Copy title, Toggle favorite, Insert
+    template, Collapse all, Expand all) need a page tab on screen (not the
+    graph, the agenda or no tab), Rename also a non-journal and Delete
+    more than one page, as in the page menu; `Needs::Editing` commands
+    (Cycle task, and Coder 1's Move block / image paste at merge) need
+    the palette to have been opened while editing a block — running one
+    resumes that block with its cursor and selection, then dispatches.
+    *New commands*: Collapse all / Expand all fold or unfold every block
+    with children on the current page through the same `collapsed` set
+    as the arrows, so like them they are not undo steps; Fit graph and
+    Toggle journals in graph open the graph tab first, then press its
+    Fit / Journals chips; Rename and Delete open the page menu's rename
+    field (over the page title) or confirm dialog for the current page.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
