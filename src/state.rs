@@ -6,6 +6,10 @@
 //! favorites = ["Projects", "Reading list"]
 //! recent = ["2026-10-08", "Projects"]   # most recent first
 //! page_order = ["Projects", "Inbox"]    # absent: alphabetical
+//!
+//! [shortcuts]                           # absent: the default keys
+//! SplitRight = "ctrl-alt-s"             # see hotkeys.rs (decision 41)
+//! Quit = ""                             # unbound
 //! ```
 //!
 //! This lives apart from `config.toml` on purpose: `recent` changes on every
@@ -15,6 +19,7 @@
 //! a missing file gives an empty state, and an invalid file gives an empty
 //! state after being copied to `state.toml.bak`.
 
+use crate::hotkeys::Overrides;
 use crate::storage::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -36,6 +41,30 @@ pub struct UiState {
     /// the listed ones, alphabetically; entries without a page are ignored
     /// (see `app::sort_pages`).
     pub page_order: Vec<String>,
+    /// Custom keys: command name -> keystroke (`""`: unbound). Read
+    /// leniently by `hotkeys::effective_shortcuts`: unknown names and bad
+    /// keys are ignored there (and kept here, so nothing is lost).
+    #[serde(
+        skip_serializing_if = "Overrides::is_empty",
+        deserialize_with = "lenient_shortcuts"
+    )]
+    pub shortcuts: Overrides,
+}
+
+/// `[shortcuts]` read so a hand-editing slip there can't cost the rest of
+/// the file: entries whose value isn't a string are dropped, and anything
+/// but a table reads as no overrides.
+fn lenient_shortcuts<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Overrides, D::Error> {
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(match value {
+        toml::Value::Table(table) => table
+            .into_iter()
+            .filter_map(|(name, value)| value.as_str().map(|key| (name, key.to_string())))
+            .collect(),
+        _ => Overrides::new(),
+    })
 }
 
 impl UiState {
@@ -80,7 +109,9 @@ impl UiState {
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let body = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let text = format!("# notesec UI state (favorites, recent pages, page order)\n{body}");
+        let text = format!(
+            "# notesec UI state (favorites, recent pages, page order, custom keys)\n{body}"
+        );
         write_atomic(&Self::path(root), &text)
     }
 
@@ -189,6 +220,14 @@ mod tests {
             favorites: titles(&["Projects", "Reading list"]),
             recent: titles(&["2026-10-08", "Projects"]),
             page_order: titles(&["Reading list", "Projects"]),
+            shortcuts: [
+                ("SplitRight", "ctrl-alt-s"),
+                ("Quit", ""),
+                ("FocusOtherPane", "ctrl-|"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
         };
         state.save(&dir).unwrap();
         assert_eq!(UiState::load(&dir), state);
@@ -205,6 +244,31 @@ mod tests {
         assert_eq!(state.favorites, titles(&["A"]));
         assert!(state.recent.is_empty());
         assert!(state.page_order.is_empty(), "no page_order: alphabetical");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn odd_shortcut_entries_cost_nothing_else() {
+        let dir = temp_dir("shortcuts");
+        fs::write(
+            UiState::path(&dir),
+            "favorites = [\"A\"]\n[shortcuts]\nUndo = 5\nRedo = \"ctrl-r\"\nNope = \"nonsense\"\n",
+        )
+        .unwrap();
+        let state = UiState::load(&dir);
+        assert_eq!(state.favorites, titles(&["A"]));
+        // Non-strings are dropped; strings are kept for `hotkeys` to judge.
+        assert_eq!(state.shortcuts.len(), 2);
+        assert_eq!(state.shortcuts["Redo"], "ctrl-r");
+        assert_eq!(state.shortcuts["Nope"], "nonsense");
+        fs::write(UiState::path(&dir), "shortcuts = 3\nrecent = [\"B\"]\n").unwrap();
+        let state = UiState::load(&dir);
+        assert!(state.shortcuts.is_empty());
+        assert_eq!(state.recent, titles(&["B"]));
+        // Without overrides the table isn't written at all.
+        UiState::default().save(&dir).unwrap();
+        let text = fs::read_to_string(UiState::path(&dir)).unwrap();
+        assert!(!text.contains("[shortcuts]"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -264,6 +328,7 @@ mod tests {
             favorites: titles(&["Old", "B"]),
             recent: titles(&["B", "old", "New"]),
             page_order: titles(&["C", "Old", "B"]),
+            ..UiState::default()
         };
         assert!(state.rename("OLD", "New"));
         assert_eq!(state.favorites, titles(&["New", "B"]));

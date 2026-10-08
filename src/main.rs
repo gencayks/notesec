@@ -10,6 +10,7 @@ mod editor;
 mod export;
 mod graph;
 mod graph_view;
+mod hotkeys;
 mod model;
 mod search;
 mod state;

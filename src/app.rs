@@ -14,6 +14,7 @@ use crate::config::{Config, ThemeKind};
 use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
+use crate::hotkeys::{self, effective_shortcuts, KeyChoice, KeyOwner, Overrides};
 use crate::model::{
     backlinks, cycle_task, find_block, parse_block_refs, parse_query, parse_references, tag_counts,
     tag_query, BlockKind, Page, TaskState,
@@ -31,9 +32,9 @@ use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontStyle, FontWeight, GlobalElementId,
-    HighlightStyle, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, ScrollHandle, ShapedLine, SharedString, Style, StyledText,
-    Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
+    HighlightStyle, Hsla, KeyBinding, Keystroke, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ScrollHandle, ShapedLine, SharedString, Style,
+    StyledText, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -105,6 +106,7 @@ actions!(
         FitGraph,
         ToggleGraphJournals,
         ShowShortcuts,
+        CustomizeShortcuts,
     ]
 );
 
@@ -139,30 +141,39 @@ impl KeyGroup {
 }
 
 /// One key binding and how the shortcuts dialog describes it. `bind_keys`
-/// registers exactly these and the dialog lists exactly these, so the two
-/// can't drift; the palette reads its hints back from the keymap.
+/// registers exactly these (with the user's overrides applied, see
+/// `hotkeys::effective_shortcuts`) and the dialog lists exactly these, so
+/// the two can't drift; the palette reads its hints back from the keymap.
 pub struct Shortcut {
     pub binding: KeyBinding,
+    /// The binding's key context (`None`: global).
+    pub context: Option<&'static str>,
     pub group: KeyGroup,
     /// Rows with the same group and description are merged in the dialog
     /// ("Ctrl+= / Ctrl++").
     pub description: &'static str,
 }
 
-/// The whole keymap. One line per binding; an action's main binding comes
-/// first (it is the one shown next to its palette command).
+/// The DEFAULT keymap. One line per binding; an action's main binding comes
+/// first (it is the one shown next to its palette command). The user's
+/// overrides from state.toml go on top of this (`hotkeys.rs`, decision 41):
+/// a command's rows here are its default keys, a command with no row is
+/// unbound by default, and every `commands!` command can be rebound in
+/// Settings > Shortcuts. Other rows (search, the editing keys, Esc in
+/// dialogs) are fixed.
 #[rustfmt::skip]
 pub fn shortcuts() -> Vec<Shortcut> {
     use KeyGroup::*;
     fn s<A: gpui::Action>(
         keys: &str,
         action: A,
-        context: Option<&str>,
+        context: Option<&'static str>,
         group: KeyGroup,
         description: &'static str,
     ) -> Shortcut {
         Shortcut {
             binding: KeyBinding::new(keys, action, context),
+            context,
             group,
             description,
         }
@@ -260,10 +271,23 @@ pub fn cheatsheet(shortcuts: &[Shortcut]) -> Vec<(KeyGroup, Vec<(String, &'stati
         .collect()
 }
 
-/// Register keyboard shortcuts (the `shortcuts` table).
+/// Register keyboard shortcuts (the `shortcuts` table) and the app-wide
+/// Quit handler, at startup. The window's `NoteSec::new` then re-registers
+/// them with the graph's overrides applied (`register_keys`).
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys(shortcuts().into_iter().map(|s| s.binding));
+    register_keys(cx, &Overrides::new());
     cx.on_action(|_: &Quit, cx| cx.quit());
+}
+
+/// Replace the whole keymap with the default table plus `overrides`
+/// (decision 41). Palette hints and the shortcuts list read the result.
+pub fn register_keys(cx: &mut App, overrides: &Overrides) {
+    cx.clear_key_bindings();
+    cx.bind_keys(
+        effective_shortcuts(overrides)
+            .into_iter()
+            .map(|s| s.binding),
+    );
 }
 
 /// The palette puts a header over each group of results (see
@@ -360,11 +384,40 @@ const MAX_HISTORY: usize = 100;
 /// Height of the scrollable font list in the settings panel.
 const FONT_LIST_HEIGHT: f32 = 220.0;
 
+/// Height of the scrollable command list in Settings > Shortcuts.
+const HOTKEY_LIST_HEIGHT: f32 = 320.0;
+
 /// State of the settings panel while it is open.
 struct SettingsState {
     /// Installed font families (`TextSystem::all_font_names`, which sorts and
     /// dedupes), read once when the panel opens rather than on every frame.
     fonts: Vec<String>,
+    /// Which half of the panel shows.
+    section: SettingsSection,
+    /// The command whose new key is awaited ("Press keys…"), decision 41.
+    capture: Option<Command>,
+    /// Why the last key pressed while capturing wasn't taken, or what the
+    /// last reset did.
+    hotkey_message: Option<HotkeyMessage>,
+    /// Scroll position of the command list (tests bring rows into view).
+    hotkey_scroll: ScrollHandle,
+}
+
+/// The settings panel's sections (tab-like buttons at its top).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsSection {
+    /// Theme, fonts, git backup.
+    General,
+    /// Every command with its key, rebindable (decision 41).
+    Shortcuts,
+}
+
+/// A line under the Shortcuts list.
+#[derive(Clone, Debug, PartialEq)]
+struct HotkeyMessage {
+    text: String,
+    /// Drawn in the danger colour (a refused key) rather than muted.
+    error: bool,
 }
 
 /// A sidebar page's right-click menu, and the rename / delete steps it
@@ -639,6 +692,8 @@ pub struct NoteSec {
     backup_seen: u64,
     /// Watching our own notifications, quit and release (for backups).
     _backup_subscriptions: Vec<Subscription>,
+    /// The keystroke interceptor behind Settings > Shortcuts' key capture.
+    _key_capture: Subscription,
 }
 
 impl NoteSec {
@@ -707,6 +762,19 @@ impl NoteSec {
             }),
             cx.on_release(|this, _cx| this.flush_backup()),
         ];
+        // This graph's custom keys (decision 41), and the key capture of
+        // Settings > Shortcuts: interceptors run before key bindings, so a
+        // captured key never also runs its old command.
+        register_keys(cx, &state.shortcuts);
+        let weak = cx.weak_entity();
+        let key_capture = cx.intercept_keystrokes(move |event, _window, cx| {
+            let taken = weak
+                .update(cx, |app, cx| app.capture_keystroke(&event.keystroke, cx))
+                .unwrap_or(false);
+            if taken {
+                cx.stop_propagation();
+            }
+        });
 
         let mut app = NoteSec {
             storage,
@@ -760,6 +828,7 @@ impl NoteSec {
             backup_pending: false,
             backup_seen,
             _backup_subscriptions: backup_subscriptions,
+            _key_capture: key_capture,
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -1041,8 +1110,172 @@ impl NoteSec {
         self.shortcuts_open = false;
         self.trash_confirm = None;
         let fonts = cx.text_system().all_font_names();
-        self.settings = Some(SettingsState { fonts });
+        self.settings = Some(SettingsState {
+            fonts,
+            section: SettingsSection::General,
+            capture: None,
+            hotkey_message: None,
+            hotkey_scroll: ScrollHandle::new(),
+        });
         cx.notify();
+    }
+
+    /// Show `section` of the settings panel, opening it if needed. Leaving
+    /// the Shortcuts section stops a key capture.
+    fn show_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            self.open_settings(cx);
+        }
+        if let Some(settings) = &mut self.settings {
+            if settings.section != section {
+                settings.section = section;
+                settings.capture = None;
+                settings.hotkey_message = None;
+            }
+        }
+        cx.notify();
+    }
+
+    // --- custom hotkeys (decision 41) -----------------------------------------
+
+    /// The keymap in effect: the defaults plus this graph's overrides.
+    fn key_table(&self) -> Vec<Shortcut> {
+        effective_shortcuts(&self.state.shortcuts)
+    }
+
+    /// Register `key_table` as the app's keymap.
+    fn apply_hotkeys(&self, cx: &mut Context<Self>) {
+        register_keys(cx, &self.state.shortcuts);
+    }
+
+    /// The command a key capture is waiting for, if any.
+    fn capturing(&self) -> Option<Command> {
+        self.settings.as_ref().and_then(|s| s.capture)
+    }
+
+    fn set_hotkey_message(&mut self, message: Option<HotkeyMessage>) {
+        if let Some(settings) = &mut self.settings {
+            settings.hotkey_message = message;
+        }
+    }
+
+    /// Click on a command's key: wait for its new key (again: stop waiting).
+    fn toggle_capture(&mut self, command: Command, cx: &mut Context<Self>) {
+        if let Some(settings) = &mut self.settings {
+            settings.capture = (settings.capture != Some(command)).then_some(command);
+            settings.hotkey_message = None;
+        }
+        cx.notify();
+    }
+
+    /// Every keystroke passes here first (`intercept_keystrokes`, before any
+    /// key binding). While a capture waits, the key is taken and nothing
+    /// else sees it (returns true): Esc cancels, Backspace or Delete
+    /// unbinds, a lone modifier keeps waiting, any other key becomes the
+    /// command's key if `choice_for` and the conflict check allow it.
+    fn capture_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let Some(command) = self.capturing() else {
+            return false;
+        };
+        if hotkeys::is_modifier_key(&keystroke.key) {
+            return true;
+        }
+        let plain = !keystroke.modifiers.modified();
+        match keystroke.key.as_str() {
+            "escape" if plain => {
+                if let Some(settings) = &mut self.settings {
+                    settings.capture = None;
+                    settings.hotkey_message = None;
+                }
+            }
+            "backspace" | "delete" if plain => self.set_hotkey(command, KeyChoice::Unbound, cx),
+            _ => match hotkeys::choice_for(keystroke) {
+                Err(text) => self.set_hotkey_message(Some(HotkeyMessage { text, error: true })),
+                Ok(choice) => {
+                    let key = hotkeys::pretty(keystroke);
+                    match hotkeys::conflict(&self.key_table(), command, keystroke) {
+                        Some(KeyOwner::Command(other)) => {
+                            self.set_hotkey_message(Some(HotkeyMessage {
+                                text: format!(
+                                    "{key} is already the key of \u{201c}{}\u{201d}. Change or unbind that one first.",
+                                    other.label()
+                                ),
+                                error: true,
+                            }))
+                        }
+                        Some(KeyOwner::Fixed(what)) => self.set_hotkey_message(Some(HotkeyMessage {
+                            text: format!(
+                                "{key} is used for \u{201c}{what}\u{201d}, which can't be changed."
+                            ),
+                            error: true,
+                        })),
+                        None => self.set_hotkey(command, choice, cx),
+                    }
+                }
+            },
+        }
+        cx.notify();
+        true
+    }
+
+    /// Give `command` the keys `choice` asks for, save and re-register.
+    /// Ends the capture.
+    fn set_hotkey(&mut self, command: Command, choice: KeyChoice, cx: &mut Context<Self>) {
+        match hotkeys::override_value(command, &choice) {
+            Some(value) => self
+                .state
+                .shortcuts
+                .insert(command.name().to_string(), value),
+            None => self.state.shortcuts.remove(command.name()),
+        };
+        self.save_state();
+        self.apply_hotkeys(cx);
+        if let Some(settings) = &mut self.settings {
+            settings.capture = None;
+            settings.hotkey_message = None;
+        }
+        cx.notify();
+    }
+
+    /// A row's ↺: back to the command's default keys.
+    fn reset_hotkey(&mut self, command: Command, cx: &mut Context<Self>) {
+        if self.state.shortcuts.remove(command.name()).is_some() {
+            self.save_state();
+            self.apply_hotkeys(cx);
+        }
+        if let Some(settings) = &mut self.settings {
+            settings.capture = None;
+            settings.hotkey_message = None;
+        }
+        cx.notify();
+    }
+
+    /// "Reset to defaults": forget every override (unknown names too).
+    fn reset_all_hotkeys(&mut self, cx: &mut Context<Self>) {
+        let had = !self.state.shortcuts.is_empty();
+        self.state.shortcuts.clear();
+        if had {
+            self.save_state();
+            self.apply_hotkeys(cx);
+        }
+        if let Some(settings) = &mut self.settings {
+            settings.capture = None;
+            settings.hotkey_message = had.then(|| HotkeyMessage {
+                text: "Every shortcut is back to its default.".into(),
+                error: false,
+            });
+        }
+        cx.notify();
+    }
+
+    fn on_customize_shortcuts(
+        &mut self,
+        _: &CustomizeShortcuts,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shortcuts_open = false;
+        self.show_settings_section(SettingsSection::Shortcuts, cx);
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -4481,6 +4714,63 @@ impl NoteSec {
                 )
             });
 
+        let general = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(label("Theme"))
+            .child(theme_row)
+            .child(label("Font size"))
+            .child(size_row)
+            .child(label("Font family"))
+            .child(font_list)
+            .when_some(missing, |d, family| {
+                d.child(div().text_color(theme.muted).child(format!(
+                    "\u{201c}{family}\u{201d} is not installed; using the system font"
+                )))
+            })
+            .child(label("Git auto-backup"))
+            .child(backup_row)
+            .child(
+                div()
+                    .debug_selector(|| "git-backup-note".to_string())
+                    .text_color(theme.muted)
+                    .child(format!(
+                        "Local git commits {} s after changes. Never pushes.",
+                        backup::BACKUP_AFTER.as_secs()
+                    )),
+            );
+
+        let section = state.section;
+        let tabs = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .child(
+                button(
+                    "settings-tab-general",
+                    "General".into(),
+                    section == SettingsSection::General,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::General, cx)
+                })),
+            )
+            .child(
+                button(
+                    "settings-tab-shortcuts",
+                    "Shortcuts".into(),
+                    section == SettingsSection::Shortcuts,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::Shortcuts, cx)
+                })),
+            );
+        let body = match section {
+            SettingsSection::General => general.into_any_element(),
+            SettingsSection::Shortcuts => self.render_hotkeys(state, cx),
+        };
+
         div()
             .id("settings-backdrop")
             .debug_selector(|| "settings-backdrop".to_string())
@@ -4491,16 +4781,19 @@ impl NoteSec {
             .flex()
             .flex_col()
             .items_center()
-            .pt(px(90.0))
+            .pt(px(60.0))
+            .pb(px(30.0))
             .on_click(cx.listener(|this, _e, _window, cx| this.close_settings(cx)))
             .child(
                 // `occlude` keeps clicks inside the panel from reaching the
-                // backdrop (which would close it).
+                // backdrop (which would close it). The body scrolls when the
+                // panel would be taller than the window (large fonts).
                 div()
                     .id("settings-panel")
                     .debug_selector(|| "settings-panel".to_string())
                     .occlude()
-                    .w(px(460.0))
+                    .w(px(500.0))
+                    .max_h_full()
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -4512,34 +4805,171 @@ impl NoteSec {
                     .shadow_lg()
                     .child(
                         div()
+                            .flex_shrink_0()
                             .flex()
                             .flex_row()
                             .justify_between()
                             .child(div().font_weight(FontWeight::BOLD).child("Settings"))
                             .child(label("Esc to close")),
                     )
-                    .child(label("Theme"))
-                    .child(theme_row)
-                    .child(label("Font size"))
-                    .child(size_row)
-                    .child(label("Font family"))
-                    .child(font_list)
-                    .when_some(missing, |d, family| {
-                        d.child(div().text_color(theme.muted).child(format!(
-                            "\u{201c}{family}\u{201d} is not installed; using the system font"
-                        )))
-                    })
-                    .child(label("Git auto-backup"))
-                    .child(backup_row)
+                    .child(div().flex_shrink_0().child(tabs))
                     .child(
                         div()
-                            .debug_selector(|| "git-backup-note".to_string())
-                            .text_color(theme.muted)
-                            .child(format!(
-                                "Local git commits {} s after changes. Never pushes.",
-                                backup::BACKUP_AFTER.as_secs()
-                            )),
+                            .id("settings-body")
+                            .debug_selector(|| "settings-body".to_string())
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(body),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// Settings > Shortcuts (decision 41): every palette command with its
+    /// keys. Clicking the keys waits for a new key (`capture_keystroke`);
+    /// a changed row is marked and has a ↺ back to its default.
+    fn render_hotkeys(&self, state: &SettingsState, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let table = self.key_table();
+        let rows: Vec<AnyElement> = Command::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &command)| {
+                let name = command.name();
+                let capturing = state.capture == Some(command);
+                let modified = hotkeys::override_for(&self.state.shortcuts, command).is_some();
+                let keys = hotkeys::command_keys(&table, command);
+                let (text, muted) = if capturing {
+                    ("Press keys\u{2026}".to_string(), false)
+                } else if keys.is_empty() {
+                    ("Unbound".to_string(), true)
+                } else {
+                    (keys.join(" / "), false)
+                };
+                let chip = div()
+                    .id(("hotkey-key", i))
+                    .debug_selector(move || format!("hotkey-key-{name}"))
+                    .flex_shrink_0()
+                    .px_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if capturing {
+                        theme.accent
+                    } else {
+                        theme.border
+                    })
+                    .bg(if capturing {
+                        theme.selected_bg
+                    } else {
+                        theme.bg
+                    })
+                    .text_color(if muted { theme.muted } else { theme.text })
+                    .cursor_pointer()
+                    .hover(|d| d.border_color(theme.accent))
+                    .on_click(
+                        cx.listener(move |this, _e, _window, cx| this.toggle_capture(command, cx)),
+                    )
+                    .child(text);
+                div()
+                    .id(("hotkey-row", i))
+                    .debug_selector(move || format!("hotkey-row-{name}"))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(2.0))
+                    .rounded_md()
+                    .when(capturing, |d| d.bg(theme.selected_bg))
+                    .child(div().flex_1().min_w_0().truncate().child(command.label()))
+                    .when(modified, |d| {
+                        d.child(
+                            div()
+                                .debug_selector(move || format!("hotkey-modified-{name}"))
+                                .flex_shrink_0()
+                                .text_color(theme.accent)
+                                .child("changed"),
+                        )
+                    })
+                    .child(chip)
+                    .when(modified, |d| {
+                        d.child(
+                            div()
+                                .id(("hotkey-reset", i))
+                                .debug_selector(move || format!("hotkey-reset-{name}"))
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(theme.muted)
+                                .hover(|d| d.bg(theme.selected_bg).text_color(theme.text))
+                                .on_click(cx.listener(move |this, _e, _window, cx| {
+                                    this.reset_hotkey(command, cx)
+                                }))
+                                .child("\u{21ba}"),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        let any_override = !self.state.shortcuts.is_empty();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(theme.muted)
+                    .child("Click a key, then press the new one. Esc cancels, Backspace unbinds."),
+            )
+            .child(
+                div()
+                    .id("hotkey-list")
+                    .h(px(HOTKEY_LIST_HEIGHT))
+                    .overflow_y_scroll()
+                    .track_scroll(&state.hotkey_scroll)
+                    .flex()
+                    .flex_col()
+                    .p_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.bg)
+                    .children(rows),
+            )
+            .when_some(state.hotkey_message.clone(), |d, message| {
+                d.child(
+                    div()
+                        .debug_selector(|| "hotkey-message".to_string())
+                        .text_color(if message.error {
+                            theme.danger
+                        } else {
+                            theme.muted
+                        })
+                        .child(message.text),
+                )
+            })
+            .child(
+                div().flex().flex_row().child(
+                    div()
+                        .id("hotkeys-reset-all")
+                        .debug_selector(|| "hotkeys-reset-all".to_string())
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .cursor_pointer()
+                        .text_color(if any_override {
+                            theme.text
+                        } else {
+                            theme.muted
+                        })
+                        .hover(|d| d.bg(theme.selected_bg))
+                        .on_click(cx.listener(|this, _e, _window, cx| this.reset_all_hotkeys(cx)))
+                        .child("Reset to defaults"),
+                ),
             )
             .into_any_element()
     }
@@ -4978,7 +5408,7 @@ impl NoteSec {
         let theme = self.theme;
         let mut children: Vec<AnyElement> = Vec::new();
         let mut n: usize = 0;
-        for (group, rows) in cheatsheet(&shortcuts()) {
+        for (group, rows) in cheatsheet(&self.key_table()) {
             children.push(
                 div()
                     .mt_2()
@@ -5048,6 +5478,22 @@ impl NoteSec {
                                     .child("Keyboard shortcuts"),
                             )
                             .child(div().text_color(theme.muted).child("Esc to close")),
+                    )
+                    .child(
+                        div()
+                            .id("shortcuts-customize")
+                            .debug_selector(|| "shortcuts-customize".to_string())
+                            .mt_1()
+                            .text_color(theme.accent)
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _e, _window, cx| {
+                                this.shortcuts_open = false;
+                                this.show_settings_section(SettingsSection::Shortcuts, cx);
+                            }))
+                            .child(
+                                "Change any command's key in Settings \u{203a} Shortcuts \
+                                 (or \u{201c}Change keyboard shortcuts\u{201d} in the palette)",
+                            ),
                     )
                     .children(children),
             )
@@ -7050,6 +7496,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_reset_font))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_toggle_git_backup))
+            .on_action(cx.listener(Self::on_customize_shortcuts))
             .on_action(cx.listener(Self::on_split_right))
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_focus_other_pane))
@@ -11677,6 +12124,8 @@ mod tests {
             ("autosave", Command::ToggleGitBackup),
             ("side by side", Command::SplitRight),
             ("split", Command::SplitRight),
+            ("rebind", Command::CustomizeShortcuts),
+            ("hotkeys", Command::CustomizeShortcuts),
             ("html", Command::ExportHtml),
             ("col all", Command::CollapseAll),
             ("exp all", Command::ExpandAll),
@@ -13003,6 +13452,517 @@ mod tests {
             }
         }
         drop(keymap);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- custom hotkeys (decision 41) -----------------------------------------
+
+    /// Like `setup`, with `state_toml` as the graph's state.toml and
+    /// `config`, both in place before the window opens.
+    fn setup_with_state<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        state_toml: &str,
+        config: Config,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("notesec-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        std::fs::write(dir.join("pages/Test.md"), "- hello\n").unwrap();
+        std::fs::write(UiState::path(&dir), state_toml).unwrap();
+        cx.update(bind_keys);
+        let (view, cx) = cx.add_window_view(|window, cx| NoteSec::new(storage, config, window, cx));
+        view.update(cx, |app, cx| {
+            app.selected = app.find_page("Test").unwrap();
+            app.tabs = Tabs::new(TabTarget::Page("Test".to_string()));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (view, cx, dir)
+    }
+
+    fn open_hotkeys(view: &Entity<NoteSec>, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-shortcuts");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.settings.as_ref().map(|s| s.section),
+                Some(SettingsSection::Shortcuts)
+            )
+        });
+    }
+
+    /// Scroll `command`'s row into view and click its key.
+    fn click_hotkey(view: &Entity<NoteSec>, cx: &mut VisualTestContext, command: Command) {
+        let ix = Command::ALL.iter().position(|c| *c == command).unwrap();
+        view.update(cx, |app, cx| {
+            app.settings
+                .as_ref()
+                .unwrap()
+                .hotkey_scroll
+                .scroll_to_item(ix);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        click_on(cx, &format!("hotkey-key-{}", command.name()));
+    }
+
+    fn capturing(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Option<Command> {
+        view.update(cx, |app, _| app.capturing())
+    }
+
+    fn hotkey_message(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Option<String> {
+        view.update(cx, |app, _| {
+            app.settings
+                .as_ref()
+                .and_then(|s| s.hotkey_message.as_ref().map(|m| m.text.clone()))
+        })
+    }
+
+    /// The palette hint for `command`, read from the live keymap.
+    fn live_hint(cx: &mut VisualTestContext, command: Command) -> Option<String> {
+        let keymap = cx.update(|_, cx| cx.key_bindings());
+        let keymap = keymap.borrow();
+        binding_hint(&keymap, command.action().as_ref())
+    }
+
+    /// Every key bound to `command` in the live keymap.
+    fn live_keys(cx: &mut VisualTestContext, command: Command) -> Vec<String> {
+        let keymap = cx.update(|_, cx| cx.key_bindings());
+        let keymap = keymap.borrow();
+        keymap
+            .bindings_for_action(command.action().as_ref())
+            .map(|b| format_keystrokes(b.keystrokes()))
+            .collect()
+    }
+
+    fn saved_overrides(dir: &std::path::Path) -> Vec<(String, String)> {
+        UiState::load(dir).shortcuts.into_iter().collect()
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn mode_of(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Mode {
+        view.update(cx, |app, _| app.mode)
+    }
+
+    #[gpui::test]
+    fn the_shortcuts_section_lists_every_command_and_fits_the_window(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "hotkey-list", "- hi\n");
+        cx.simulate_resize(size(px(1100.), px(700.)));
+        // From the palette, straight to the section.
+        run_in_palette(cx, "change keyboard shortcuts");
+        assert!(settings_open(&view, cx));
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.settings.as_ref().unwrap().section,
+                SettingsSection::Shortcuts
+            )
+        });
+        assert!(!has(cx, "git-backup-on"));
+        for c in Command::ALL {
+            assert!(has(cx, &format!("hotkey-row-{}", c.name())), "{c:?}");
+            assert!(!has(cx, &format!("hotkey-modified-{}", c.name())), "{c:?}");
+        }
+        // Each row shows the keys in effect; palette-only commands are
+        // unbound and can get one.
+        let table = view.update(cx, |app, _| app.key_table());
+        assert_eq!(
+            hotkeys::command_keys(&table, Command::Redo),
+            ["Ctrl+Shift+Z", "Ctrl+Y"]
+        );
+        assert!(hotkeys::command_keys(&table, Command::OpenAgenda).is_empty());
+        // The panel and its Reset button fit the default window.
+        let window = cx.debug_bounds("settings-backdrop").unwrap();
+        let panel = cx.debug_bounds("settings-panel").unwrap();
+        let reset = cx.debug_bounds("hotkeys-reset-all").unwrap();
+        assert!(panel.bottom() <= window.bottom(), "{panel:?} in {window:?}");
+        assert!(reset.bottom() <= panel.bottom());
+        // The General section is still one click away.
+        click_on(cx, "settings-tab-general");
+        assert!(has(cx, "git-backup-on") && !has(cx, "hotkey-list"));
+        // The cheatsheet points here, and its link opens the section.
+        cx.simulate_keystrokes("escape ctrl-/");
+        assert!(has(cx, "shortcuts-customize"));
+        click_on(cx, "shortcuts-customize");
+        view.update(cx, |app, _| {
+            assert!(!app.shortcuts_open);
+            assert_eq!(
+                app.settings.as_ref().map(|s| s.section),
+                Some(SettingsSection::Shortcuts)
+            );
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn at_the_largest_font_the_settings_panel_scrolls_inside_the_window(cx: &mut TestAppContext) {
+        let config = Config {
+            font_size: crate::config::MAX_FONT_SIZE,
+            ..Config::default()
+        };
+        let (view, cx, dir) = setup_with_state(cx, "hotkey-big-font", "", config);
+        cx.simulate_resize(size(px(1100.), px(700.)));
+        cx.simulate_keystrokes("ctrl-,");
+        let window = cx.debug_bounds("settings-backdrop").unwrap();
+        let panel = cx.debug_bounds("settings-panel").unwrap();
+        assert!(panel.bottom() <= window.bottom(), "{panel:?} in {window:?}");
+        click_on(cx, "settings-tab-shortcuts");
+        let panel = cx.debug_bounds("settings-panel").unwrap();
+        assert!(panel.bottom() <= window.bottom(), "{panel:?} in {window:?}");
+        assert!(settings_open(&view, cx));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_captured_key_fires_and_the_old_one_no_longer_does(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "hotkey-capture", "- hi\n");
+        assert_eq!(
+            live_hint(cx, Command::ToggleGraph).as_deref(),
+            Some("Ctrl+G")
+        );
+        open_hotkeys(&view, cx);
+        click_hotkey(&view, cx, Command::ToggleGraph);
+        assert_eq!(capturing(&view, cx), Some(Command::ToggleGraph));
+
+        cx.simulate_keystrokes("ctrl-alt-g");
+        assert_eq!(capturing(&view, cx), None);
+        // Captured, not run: the graph didn't open.
+        assert_eq!(mode_of(&view, cx), Mode::Notes);
+        assert!(has(cx, "hotkey-modified-ToggleGraph") && has(cx, "hotkey-reset-ToggleGraph"));
+        assert_eq!(
+            saved_overrides(&dir),
+            pairs(&[("ToggleGraph", "ctrl-alt-g")])
+        );
+        // The hint, the cheatsheet and the keymap follow at once.
+        assert_eq!(
+            live_hint(cx, Command::ToggleGraph).as_deref(),
+            Some("Ctrl+Alt+G")
+        );
+        assert_eq!(live_keys(cx, Command::ToggleGraph), ["Ctrl+Alt+G"]);
+        let sheet: Vec<String> = view.update(cx, |app, _| {
+            cheatsheet(&app.key_table())
+                .into_iter()
+                .flat_map(|(_, rows)| rows.into_iter().map(|(keys, _)| keys))
+                .collect()
+        });
+        assert!(sheet.contains(&"Ctrl+Alt+G".to_string()));
+        assert!(!sheet.contains(&"Ctrl+G".to_string()));
+        {
+            let keymap = cx.update(|_, cx| cx.key_bindings());
+            let keymap = keymap.borrow();
+            let table = view.update(cx, |app, _| app.key_table());
+            assert_eq!(keymap.bindings().len(), table.len());
+        }
+        cx.simulate_keystrokes("escape ctrl-k");
+        cx.simulate_input("toggle graph view");
+        assert!(has(cx, "command-ToggleGraph"));
+        cx.simulate_keystrokes("escape");
+
+        // The new key works, the old one doesn't.
+        cx.simulate_keystrokes("ctrl-g");
+        assert_eq!(mode_of(&view, cx), Mode::Notes);
+        cx.simulate_keystrokes("ctrl-alt-g");
+        assert_eq!(mode_of(&view, cx), Mode::Graph);
+        cx.simulate_keystrokes("ctrl-alt-g");
+        assert_eq!(mode_of(&view, cx), Mode::Notes);
+
+        // Capturing a command's own key: nothing runs, no override.
+        let theme = view.update(cx, |app, _| app.config.theme);
+        open_hotkeys(&view, cx);
+        click_hotkey(&view, cx, Command::ToggleTheme);
+        cx.simulate_keystrokes("ctrl-shift-t");
+        assert_eq!(view.update(cx, |app, _| app.config.theme), theme);
+        assert_eq!(capturing(&view, cx), None);
+        assert!(!has(cx, "hotkey-modified-ToggleTheme"));
+        assert_eq!(
+            saved_overrides(&dir),
+            pairs(&[("ToggleGraph", "ctrl-alt-g")])
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn escape_cancels_backspace_unbinds_and_the_row_reset_restores(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "hotkey-cancel", "- hi\n");
+        open_hotkeys(&view, cx);
+        // A lone modifier keeps waiting; Esc cancels and keeps the panel.
+        click_hotkey(&view, cx, Command::Undo);
+        cx.simulate_keystrokes("shift");
+        assert_eq!(capturing(&view, cx), Some(Command::Undo));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(capturing(&view, cx), None);
+        assert!(settings_open(&view, cx));
+        assert!(saved_overrides(&dir).is_empty());
+        assert_eq!(live_hint(cx, Command::Undo).as_deref(), Some("Ctrl+Z"));
+        // Clicking the key again also stops waiting.
+        click_hotkey(&view, cx, Command::Undo);
+        click_hotkey(&view, cx, Command::Undo);
+        assert_eq!(capturing(&view, cx), None);
+
+        // Backspace unbinds.
+        click_hotkey(&view, cx, Command::Undo);
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(capturing(&view, cx), None);
+        assert_eq!(live_hint(cx, Command::Undo), None);
+        assert_eq!(saved_overrides(&dir), pairs(&[("Undo", "")]));
+        assert!(has(cx, "hotkey-modified-Undo"));
+        // Ctrl+Z does nothing now.
+        cx.simulate_keystrokes("escape");
+        edit_and_leave(cx, 0, " more");
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(file(&dir), "- hi more\n");
+
+        // The row's ↺ brings the default back.
+        open_hotkeys(&view, cx);
+        click_hotkey(&view, cx, Command::Undo);
+        cx.simulate_keystrokes("escape");
+        click_on(cx, "hotkey-reset-Undo");
+        assert!(saved_overrides(&dir).is_empty());
+        assert!(!has(cx, "hotkey-modified-Undo"));
+        assert_eq!(live_hint(cx, Command::Undo).as_deref(), Some("Ctrl+Z"));
+        // Esc with no capture closes the panel as before.
+        cx.simulate_keystrokes("escape");
+        assert!(!settings_open(&view, cx));
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(file(&dir), "- hi\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_key_already_in_use_is_refused_with_a_message(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "hotkey-conflict", "- hi\n");
+        open_hotkeys(&view, cx);
+        click_hotkey(&view, cx, Command::Quit);
+        // Another command's key: refused, and it didn't run either.
+        cx.simulate_keystrokes("ctrl-g");
+        assert_eq!(mode_of(&view, cx), Mode::Notes);
+        let message = hotkey_message(&view, cx).unwrap();
+        assert!(
+            message.contains("Ctrl+G") && message.contains("Toggle graph view"),
+            "{message}"
+        );
+        assert!(has(cx, "hotkey-message"));
+        assert_eq!(capturing(&view, cx), Some(Command::Quit), "still waiting");
+        assert!(saved_overrides(&dir).is_empty());
+        assert_eq!(
+            live_hint(cx, Command::ToggleGraph).as_deref(),
+            Some("Ctrl+G")
+        );
+        // A fixed key, and an editor-only command's key.
+        cx.simulate_keystrokes("ctrl-k");
+        assert!(hotkey_message(&view, cx)
+            .unwrap()
+            .contains("can't be changed"));
+        view.update(cx, |app, _| assert!(app.search.is_none()));
+        cx.simulate_keystrokes("ctrl-enter");
+        assert!(hotkey_message(&view, cx)
+            .unwrap()
+            .contains("Cycle task state"));
+        // A free key is taken.
+        cx.simulate_keystrokes("ctrl-alt-q");
+        assert_eq!(capturing(&view, cx), None);
+        assert_eq!(hotkey_message(&view, cx), None);
+        assert_eq!(saved_overrides(&dir), pairs(&[("Quit", "ctrl-alt-q")]));
+        // An editor command against a global key.
+        click_hotkey(&view, cx, Command::CycleTask);
+        cx.simulate_keystrokes("ctrl-alt-q");
+        assert!(hotkey_message(&view, cx).unwrap().contains("Quit"));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(hotkey_message(&view, cx), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn bare_keys_are_refused_but_function_keys_work(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "hotkey-bare", "- hi\n");
+        let page_count = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| app.pages.len())
+        };
+        let pages = page_count(&view, cx);
+        open_hotkeys(&view, cx);
+        click_hotkey(&view, cx, Command::NewPage);
+        for key in ["a", "shift-a", "enter", "space"] {
+            cx.simulate_keystrokes(key);
+            let message = hotkey_message(&view, cx).unwrap_or_default();
+            assert!(message.contains("would type text"), "{key}: {message}");
+            assert_eq!(capturing(&view, cx), Some(Command::NewPage), "{key}");
+        }
+        assert!(saved_overrides(&dir).is_empty());
+        cx.simulate_keystrokes("f2");
+        assert_eq!(saved_overrides(&dir), pairs(&[("NewPage", "f2")]));
+        cx.simulate_keystrokes("escape f2");
+        assert_eq!(page_count(&view, cx), pages + 1);
+        // Alt alone is enough.
+        open_hotkeys(&view, cx);
+        click_hotkey(&view, cx, Command::OpenAgenda);
+        cx.simulate_keystrokes("alt-a");
+        assert_eq!(live_hint(cx, Command::OpenAgenda).as_deref(), Some("Alt+A"));
+        cx.simulate_keystrokes("escape alt-a");
+        assert_eq!(mode_of(&view, cx), Mode::Agenda);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_command_with_two_default_keys_gets_just_the_new_one(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "hotkey-two", "- hi\n");
+        assert_eq!(live_keys(cx, Command::Redo), ["Ctrl+Shift+Z", "Ctrl+Y"]);
+        open_hotkeys(&view, cx);
+        click_hotkey(&view, cx, Command::Redo);
+        cx.simulate_keystrokes("ctrl-alt-r");
+        assert_eq!(live_keys(cx, Command::Redo), ["Ctrl+Alt+R"]);
+        cx.simulate_keystrokes("escape");
+        edit_and_leave(cx, 0, " more");
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(file(&dir), "- hi\n");
+        cx.simulate_keystrokes("ctrl-y ctrl-shift-z");
+        assert_eq!(file(&dir), "- hi\n", "the old keys are gone");
+        cx.simulate_keystrokes("ctrl-alt-r");
+        assert_eq!(file(&dir), "- hi more\n");
+        // Its ↺ gives both back.
+        open_hotkeys(&view, cx);
+        click_hotkey(&view, cx, Command::Redo);
+        cx.simulate_keystrokes("escape");
+        click_on(cx, "hotkey-reset-Redo");
+        assert_eq!(live_keys(cx, Command::Redo), ["Ctrl+Shift+Z", "Ctrl+Y"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn reset_to_defaults_restores_everything(cx: &mut TestAppContext) {
+        let state = "favorites = [\"Test\"]\n[shortcuts]\nToggleGraph = \"ctrl-alt-g\"\nRedo = \"ctrl-alt-r\"\nQuit = \"\"\nSomeFutureCommand = \"ctrl-alt-f\"\n";
+        let (view, cx, dir) = setup_with_state(cx, "hotkey-reset", state, Config::default());
+        assert_eq!(
+            live_hint(cx, Command::ToggleGraph).as_deref(),
+            Some("Ctrl+Alt+G")
+        );
+        assert_eq!(live_hint(cx, Command::Quit), None);
+        open_hotkeys(&view, cx);
+        assert!(has(cx, "hotkey-modified-ToggleGraph") && has(cx, "hotkey-modified-Redo"));
+        click_on(cx, "hotkeys-reset-all");
+        assert!(saved_overrides(&dir).is_empty());
+        assert!(!std::fs::read_to_string(UiState::path(&dir))
+            .unwrap()
+            .contains("[shortcuts]"));
+        assert_eq!(UiState::load(&dir).favorites, vec!["Test".to_string()]);
+        for c in Command::ALL {
+            assert!(!has(cx, &format!("hotkey-modified-{}", c.name())), "{c:?}");
+        }
+        assert!(hotkey_message(&view, cx).unwrap().contains("default"));
+        // The keymap is the default table again.
+        {
+            let keymap = cx.update(|_, cx| cx.key_bindings());
+            let keymap = keymap.borrow();
+            let defaults = shortcuts();
+            assert_eq!(keymap.bindings().len(), defaults.len());
+            for (binding, default) in keymap.bindings().zip(defaults.iter()) {
+                assert_eq!(
+                    format_keystrokes(binding.keystrokes()),
+                    format_keystrokes(default.binding.keystrokes())
+                );
+                assert!(binding.action().partial_eq(default.binding.action()));
+            }
+        }
+        cx.simulate_keystrokes("escape ctrl-g");
+        assert_eq!(mode_of(&view, cx), Mode::Graph);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn overrides_load_from_state_toml_and_odd_entries_are_ignored(cx: &mut TestAppContext) {
+        let state = "[shortcuts]\nSplitRight = \"ctrl-alt-s\"\nRedo = \"y\"\nUndo = \"ctrl-nope-z\"\nOpenTrash = \"ctrl-k ctrl-t\"\nNoSuchCommand = \"ctrl-alt-n\"\nExportHtml = 7\n";
+        let (view, cx, dir) = setup_with_state(cx, "hotkey-load", state, Config::default());
+        // The valid one applies...
+        cx.simulate_keystrokes("ctrl-\\");
+        assert_eq!(view.update(cx, |app, _| app.split.clone()), None);
+        cx.simulate_keystrokes("ctrl-alt-s");
+        assert!(view.update(cx, |app, _| app.split.is_some()));
+        // ...the rest keep their defaults.
+        assert_eq!(live_keys(cx, Command::Redo), ["Ctrl+Shift+Z", "Ctrl+Y"]);
+        assert_eq!(live_keys(cx, Command::Undo), ["Ctrl+Z"]);
+        assert!(live_keys(cx, Command::OpenTrash).is_empty());
+        assert!(live_keys(cx, Command::ExportHtml).is_empty());
+        open_hotkeys(&view, cx);
+        assert!(has(cx, "hotkey-modified-SplitRight"));
+        assert!(!has(cx, "hotkey-modified-Redo") && !has(cx, "hotkey-modified-Undo"));
+        // A change keeps the entries this build doesn't use in the file.
+        click_hotkey(&view, cx, Command::Quit);
+        cx.simulate_keystrokes("ctrl-alt-q");
+        let saved = UiState::load(&dir).shortcuts;
+        assert_eq!(saved["NoSuchCommand"], "ctrl-alt-n");
+        assert_eq!(saved["Redo"], "y");
+        assert_eq!(saved["Quit"], "ctrl-alt-q");
+        assert!(!saved.contains_key("ExportHtml"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_shifted_symbol_key_round_trips(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "hotkey-pipe", "- hi\n");
+        open_hotkeys(&view, cx);
+        // Ctrl+| is Focus other pane's: free it first, then take it.
+        click_hotkey(&view, cx, Command::ToggleGraph);
+        cx.simulate_keystrokes("ctrl-|");
+        assert!(hotkey_message(&view, cx)
+            .unwrap()
+            .contains("Focus other pane"));
+        cx.simulate_keystrokes("escape");
+        click_hotkey(&view, cx, Command::FocusOtherPane);
+        cx.simulate_keystrokes("backspace");
+        click_hotkey(&view, cx, Command::ToggleGraph);
+        cx.simulate_keystrokes("ctrl-|");
+        assert_eq!(
+            saved_overrides(&dir),
+            pairs(&[("FocusOtherPane", ""), ("ToggleGraph", "ctrl-|")])
+        );
+        assert_eq!(
+            live_hint(cx, Command::ToggleGraph).as_deref(),
+            Some("Ctrl+|")
+        );
+        cx.simulate_keystrokes("escape ctrl-|");
+        assert_eq!(mode_of(&view, cx), Mode::Graph);
+        // And from the file, in a fresh window on the same graph.
+        let storage = Storage::open(dir.clone()).unwrap();
+        let (view2, cx2) = cx
+            .cx
+            .add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
+        assert_eq!(
+            live_hint(cx2, Command::ToggleGraph).as_deref(),
+            Some("Ctrl+|")
+        );
+        cx2.simulate_keystrokes("ctrl-|");
+        assert_eq!(mode_of(&view2, cx2), Mode::Graph);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn pane_and_new_commands_are_rebindable_with_no_extra_code(cx: &mut TestAppContext) {
+        // Every `commands!` command has a row, a context and a binding.
+        let (view, cx, dir) = setup(cx, "hotkey-every", "- hi\n");
+        open_hotkeys(&view, cx);
+        for (i, &c) in Command::ALL.iter().enumerate() {
+            let key = format!("ctrl-alt-shift-f{}", i % 24 + 1);
+            let binding = c.binding(&key);
+            assert_eq!(format_keystrokes(binding.keystrokes()).is_empty(), false);
+            assert!(binding.action().partial_eq(c.action().as_ref()), "{c:?}");
+        }
+        click_hotkey(&view, cx, Command::CustomizeShortcuts);
+        cx.simulate_keystrokes("alt-k");
+        assert_eq!(
+            live_hint(cx, Command::CustomizeShortcuts).as_deref(),
+            Some("Alt+K")
+        );
+        cx.simulate_keystrokes("escape alt-k");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.settings.as_ref().map(|s| s.section),
+                Some(SettingsSection::Shortcuts)
+            )
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 }

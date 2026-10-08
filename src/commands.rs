@@ -9,7 +9,10 @@
 //! binding either.
 //!
 //! Adding a command is one row in `commands!` below (plus the action and
-//! its handler in `app.rs`, which a key binding needs anyway).
+//! its handler in `app.rs`, which a key binding needs anyway). A default
+//! key is one more row in `app::shortcuts`. The command then shows up in
+//! Settings > Shortcuts by itself and can be rebound there (decision 41,
+//! `hotkeys.rs`).
 
 use crate::app;
 use gpui::{Action, KeyBinding, KeybindingKeystroke, Keymap};
@@ -72,14 +75,33 @@ macro_rules! commands {
                 }
             }
 
-            /// A stable name for debug selectors (`command-NewPage`).
+            /// A stable name for debug selectors (`command-NewPage`) and
+            /// the key of its override in state.toml's `[shortcuts]`.
             pub fn name(self) -> &'static str {
                 match self {
                     $(Command::$name => stringify!($name),)*
                 }
             }
+
+            /// A binding of `keys` (valid GPUI keystrokes; panics
+            /// otherwise, like `KeyBinding::new`) to the command's action,
+            /// in its key context.
+            pub fn binding(self, keys: &str) -> KeyBinding {
+                let context = self.key_context();
+                match self {
+                    $(Command::$name => KeyBinding::new(keys, app::$name, context),)*
+                }
+            }
         }
     };
+}
+
+impl Command {
+    /// The key context of the command's bindings: "BlockEditor" for the
+    /// commands that need a block being edited, else none (global).
+    pub fn key_context(self) -> Option<&'static str> {
+        (self.needs() == Needs::Editing).then_some("BlockEditor")
+    }
 }
 
 commands! {
@@ -125,6 +147,7 @@ commands! {
     OpenSettings => "Open settings", ["preferences", "theme", "font"], Nothing;
     ToggleGitBackup => "Toggle git auto-backup", ["git", "backup", "version", "history", "autosave"], Nothing;
     ShowShortcuts => "Keyboard shortcuts", ["keys", "keymap", "cheatsheet", "help"], Nothing;
+    CustomizeShortcuts => "Change keyboard shortcuts", ["customize", "rebind", "hotkeys", "key bindings", "remap"], Nothing;
     Quit => "Quit", ["exit", "close app"], Nothing;
 }
 

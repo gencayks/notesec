@@ -18,6 +18,7 @@ search.rs      — fuzzy matcher, pure functions (NO ui code here)
 tabs.rs        — open tabs: open/focus/close/cycle rules (NO ui code here)
 export.rs      — a page as one self-contained HTML string (NO ui code here)
 backup.rs      — git auto-backup: runs the `git` program (NO ui code here)
+hotkeys.rs     — custom keys: overrides on top of the default keymap (NO ui code)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -856,10 +857,17 @@ that mutate, and data races are essentially impossible.
     (`window.dispatch_action`, deferred until the palette has closed),
     so a command and its key always do the same thing, through the same
     handler. Adding one is that row plus the action and its handler
-    (needed for a key anyway). *Keys*: `app.rs`'s `shortcuts()` is the
-    whole keymap, one line per binding with its group (Navigation,
-    Editing, View, Tabs, App) and a description; `bind_keys` registers
-    exactly it. *Hints*: a command's hint is read back from GPUI's keymap
+    (needed for a key anyway); it then also appears in Settings >
+    Shortcuts, rebindable (decision 41). *Keys*: `app.rs`'s `shortcuts()`
+    is the DEFAULT keymap, one line per binding with its key context, its
+    group (Navigation, Editing, View, Tabs, App) and a description. What
+    is registered is that table with the user's overrides from
+    `state.toml` on top (`hotkeys::effective_shortcuts`, decision 41):
+    `bind_keys` registers the defaults at startup, and the window
+    (`NoteSec::new`, and every change in Settings) replaces the keymap
+    with the effective table (`register_keys`: `App::clear_key_bindings`,
+    then `App::bind_keys`). Hints and the cheatsheet read that same
+    effective keymap, so they follow every rebinding. *Hints*: a command's hint is read back from GPUI's keymap
     (`App::key_bindings` -> `Keymap::bindings_for_action`): the first
     binding without a key context, else the first binding (an editor
     command's "BlockEditor" key), written as `Ctrl+Shift+T`
@@ -868,7 +876,8 @@ that mutate, and data races are essentially impossible.
     "Keyboard shortcuts" or Ctrl+/ (free; Zed's comment key, which we
     don't need) opens a modal like Settings (dimmed backdrop, `occlude`,
     own key context "Shortcuts", Esc / backdrop / Ctrl+/ close it) listing
-    `cheatsheet(&shortcuts())`: per group, one row per description with
+    `cheatsheet(&key_table())` (the effective table, with a link to
+    Settings > Shortcuts at the top): per group, one row per description with
     all its keys ("Ctrl+= / Ctrl++"). *Palette*: an empty query lists the
     pages (as before, up to 12) and then every offered command under a
     "Commands" header; a query keeps the best 12 hits by the same fuzzy
@@ -1180,6 +1189,102 @@ that mutate, and data races are essentially impossible.
     in `state.toml` (a fresh start has one pane). Nice to have later:
     save `Split` with the tabs, and a draggable divider (the panes are
     equal halves now).
+41. **Custom hotkeys: rebind any command in Settings, saved in
+    state.toml.** *What can be rebound*: every `commands!` command (the
+    palette's list), including palette-only ones, which start
+    "Unbound" and can get a key. The other rows of `shortcuts()` are
+    fixed: Ctrl+K (the palette is how you reach everything, so it can't
+    be lost), the editing core (arrows, Home / End, Backspace, Delete,
+    Enter, Tab / Shift+Tab, Shift+Enter, the selection keys, Bold /
+    Italic) and Esc in dialogs. *Model*: `UiState.shortcuts`, a
+    `[shortcuts]` table in state.toml from the command's name to one
+    keystroke in GPUI's binding syntax, or `""` for unbound
+    (`SplitRight = "ctrl-alt-s"`). The name is the `commands!` name,
+    which is also the GPUI action's name without `notesec::` (a test
+    checks they agree); it is stable unless someone renames the action.
+    The context isn't stored: each command binds in one context
+    (`Command::key_context`: "BlockEditor" for `Needs::Editing`
+    commands, else global; a test checks the default table agrees). The
+    table is written only when non-empty. *Applying*
+    (`hotkeys::effective_shortcuts`): start from `shortcuts()`; for each
+    command with a valid override, drop ALL its default rows and add one
+    row with the new key (none if unbound), in its context, keeping the
+    group and description of its first default row (App and its label if
+    it had none). So a command with two default keys (Redo: Ctrl+Shift+Z
+    and Ctrl+Y; Increase font: Ctrl+= and Ctrl++) has exactly the one
+    new key after a rebind; its ↺ gives both back. Choosing a command's
+    own single default key again removes the override instead of storing
+    it. *Lenient file*: unknown names (an older or newer build's
+    command, e.g. a not-yet-merged one) and invalid values (not a key,
+    several keys, a bare key) are ignored, so the command keeps its
+    default keys. They stay in the file until Reset to defaults. A
+    non-string value is dropped, and a `shortcuts` that isn't a table
+    reads as none, so a slip there never costs favorites or recents
+    (`lenient_shortcuts`). *Registering*: `register_keys` clears GPUI's
+    keymap (`App::clear_key_bindings`) and binds the effective table
+    (`App::bind_keys`). Both are on `App` and refresh the windows. The
+    app-wide Quit handler from `bind_keys` is an action handler, not a
+    binding, so it survives. Palette hints and the cheatsheet read the
+    live keymap / effective table, so they update at once (tested).
+    *UI*: Settings has two sections, General (as before) and Shortcuts
+    (`settings-tab-general` / `settings-tab-shortcuts`). The panel is
+    capped at the window's height and its body scrolls (`settings-body`),
+    so large fonts don't push it off screen (tested at the largest font
+    in a 1100×700 window). Shortcuts lists every command (`hotkey-row-
+    <Name>`) in palette order in a 320 px scrolling list: the label, a
+    "changed" marker (`hotkey-modified-<Name>`) when a valid override
+    exists, the key chip (`hotkey-key-<Name>`: "Ctrl+Shift+Z / Ctrl+Y",
+    or "Unbound" muted), and a ↺ per changed row (`hotkey-reset-<Name>`).
+    Below are a message line (`hotkey-message`) and "Reset to defaults"
+    (`hotkeys-reset-all`). No filter box: the palette's text fields are
+    built on the block editor and its "BlockEditor" context, and a third
+    one wasn't worth it for one short list. Opening it: the tab, the palette's
+    "Change keyboard shortcuts" (`CustomizeShortcuts`; customize, rebind,
+    hotkeys, key bindings, remap; no default key), or the cheatsheet's
+    link (`shortcuts-customize`). *Capture*: clicking a chip shows "Press
+    keys…" (clicking it again stops). GPUI dispatches key bindings
+    BEFORE key-down listeners (`Window::dispatch_key_event`: actions
+    first, `on_key_down` only if no action stopped propagation), so a
+    key-down listener couldn't stop the old binding. Instead `NoteSec`
+    registers a keystroke interceptor (`App::intercept_keystrokes`).
+    Interceptors run before binding matching, and `stop_propagation`
+    there skips the bindings. While a capture waits, the interceptor
+    takes every key: a lone modifier keeps waiting; Esc (plain) cancels
+    (a second Esc closes Settings as before); Backspace / Delete (plain)
+    unbind; any other key goes through `choice_for`, then the conflict
+    check. The key is stored as `Keystroke::unparse` of what GPUI
+    reported, checked to parse back to the same key and modifiers, so
+    it matches when pressed again. On Linux, Ctrl+Shift+\ arrives (and
+    is stored) as `ctrl-|`, as decision 40 binds it (tested round trip,
+    and through a fresh window). Tests prove the captured key didn't
+    run its old command (Ctrl+G, Ctrl+K, Ctrl+Shift+T). *Bare keys*: a
+    command's key needs Ctrl, Alt or Super, or is a function key
+    (F1–F24, alone or with modifiers). A plain or Shift+ key would type
+    text, since commands work while a block or the palette takes typing.
+    So "A", "Shift+A", "Enter" and "Space" are refused with "X would type
+    text: add Ctrl, Alt or Super (F1-F24 work alone)", and the capture
+    keeps waiting. The same rule applies to values read from the file.
+    *Conflicts: refused, never moved.* If the key already belongs to
+    another binding where contexts overlap (either is global, or both
+    are "BlockEditor"; the dialog contexts never overlap the editor's),
+    the message names the owner: another command ("Ctrl+G is already the
+    key of “Toggle graph view”. Change or unbind that one first.") or a
+    fixed key ("…is used for “Search pages, blocks and commands”, which
+    can't be changed."). Nothing changes and the capture keeps waiting.
+    Moving silently would unbind something the user may not notice. Two
+    steps (Backspace on the other row, then capture) do a swap. Conflicts
+    in a hand-edited file aren't checked; both bindings are registered
+    and GPUI picks one. *Reset to defaults*: one click, no confirmation.
+    It only touches key overrides (never notes or settings), the defaults
+    are listed on screen, and a ↺ per row exists for finer undo. It
+    clears every override (unknown names too), saves (the `[shortcuts]`
+    table disappears), re-registers, and says "Every shortcut is back to
+    its default." *Adding a command later* (e.g. Coder 1's global
+    search) needs nothing here: its `commands!` row gives it a Settings
+    row, a name for state.toml, a context from its `Needs`, and a
+    binding (`Command::binding`, generated by the macro). Its default
+    key is one `shortcuts()` row, in the same context (global for
+    `Needs::Nothing`).
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
