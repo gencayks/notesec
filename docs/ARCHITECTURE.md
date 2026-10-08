@@ -679,6 +679,21 @@ that mutate, and data races are essentially impossible.
     clicking any multi-line Logseq block used to trigger. Up and Down move
     between lines before moving between blocks, Shift+Enter inserts a line
     break, and pasted newlines still become spaces.
+27. **Fenced code blocks render as their own box, with a copy button
+    kept in app state**: `code::split_code` cuts a block into prose and
+    ```` ``` ```` fenced code (a longer fence holds shorter ones; an
+    unclosed fence runs to the end of the block). Code is drawn monospace
+    (the first installed of `MONO_FONTS`, else the UI font) on the theme's
+    sidebar colour with whitespace kept, and scrolls sideways when wide.
+    Links and tags inside fences aren't references anywhere
+    (`parse_wikilinks`/`parse_references` drop them), so `#include` makes
+    no tag. Hover is tracked in `hovered_code` with `on_hover`, rather than a
+    group-hover style, so the button really isn't there until the mouse is,
+    which tests can see. A click writes the exact code (the lines between
+    the fences, as stored) to the clipboard, sets `copied_code` and starts a
+    `COPIED_FOR` timer task. Keeping the task in a field means a newer copy
+    drops, and so cancels, the old timer. All colours come from `Theme`, so
+    both themes work. A press on the button never starts editing.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

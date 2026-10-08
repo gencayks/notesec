@@ -5,6 +5,7 @@
 //! stops (Escape, click elsewhere, switching pages) the text is written back to
 //! the block and the page is saved to disk.
 
+use crate::code::{split_code, CodeBlock, Part};
 use crate::config::{Config, ThemeKind};
 use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
@@ -27,8 +28,8 @@ use gpui::{
     Bounds, ClickEvent, Context, DragMoveEvent, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hsla,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
-    UnderlineStyle, Window,
+    Pixels, ShapedLine, SharedString, Style, StyledText, Subscription, Task, TextRun,
+    UTF16Selection, UnderlineStyle, Window,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -288,6 +289,15 @@ pub struct NoteSec {
     /// tests can find where a displayed character is on screen.
     #[cfg(test)]
     reading_layouts: Vec<(usize, gpui::TextLayout)>,
+    /// Monospace font for code blocks: the first of `MONO_FONTS` installed.
+    mono_font: Option<SharedString>,
+    /// The code block (block id, its number in the block) under the mouse;
+    /// it shows the copy button.
+    hovered_code: Option<(Uuid, usize)>,
+    /// The code block whose copy button shows "Copied", until
+    /// `copied_task` clears it.
+    copied_code: Option<(Uuid, usize)>,
+    copied_task: Option<Task<()>>,
 }
 
 impl NoteSec {
@@ -343,6 +353,7 @@ impl NoteSec {
             .and_then(|family| installed_font(family, cx));
 
         let state = UiState::load(storage.root());
+        let mono_font = mono_font(cx);
 
         let mut app = NoteSec {
             storage,
@@ -374,6 +385,10 @@ impl NoteSec {
             last_bounds: None,
             #[cfg(test)]
             reading_layouts: Vec::new(),
+            mono_font,
+            hovered_code: None,
+            copied_code: None,
+            copied_task: None,
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -1737,6 +1752,115 @@ impl NoteSec {
         }
     }
 
+    /// The copy button on a code block: put its code on the clipboard and
+    /// say "Copied" for a moment. A newer copy restarts the moment (the old
+    /// timer is dropped, which cancels it).
+    fn copy_code(&mut self, block: Uuid, n: usize, code: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(code));
+        let which = (block, n);
+        self.copied_code = Some(which);
+        self.copied_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FOR).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied_code == Some(which) {
+                    this.copied_code = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    /// A fenced code block in reading view: monospace on the sidebar colour,
+    /// whitespace kept, scrolling sideways when too wide. While the mouse is
+    /// over it (or just after a copy) it shows a Copy button in its corner.
+    fn render_code(
+        &self,
+        ix: usize,
+        block: Uuid,
+        n: usize,
+        code: &CodeBlock,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let font_size = self.config.font_size;
+        let which = (block, n);
+        let copied = self.copied_code == Some(which);
+        let show_button = copied || self.hovered_code == Some(which);
+        let text = code.code.clone();
+        let button = show_button.then(|| {
+            div()
+                .id("copy")
+                .debug_selector(move || format!("code-{ix}-{n}-copy"))
+                .absolute()
+                .top_1()
+                .right_1()
+                .px_2()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.bg)
+                .text_size(px(font_size * 0.8))
+                .text_color(if copied { theme.accent } else { theme.muted })
+                .cursor_pointer()
+                .hover(|d| d.text_color(theme.text))
+                // A press here never starts editing the block.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.copy_code(block, n, text.clone(), cx)
+                }))
+                .when(copied, |d| {
+                    d.debug_selector(move || format!("code-{ix}-{n}-copied"))
+                })
+                .child(if copied { "Copied" } else { "Copy" })
+        });
+        let lang = (!code.lang.is_empty()).then(|| {
+            div()
+                .text_size(px(font_size * 0.75))
+                .text_color(theme.muted)
+                .child(code.lang.clone())
+        });
+        div()
+            .id(SharedString::from(format!("code-{ix}-{n}")))
+            .debug_selector(move || format!("code-{ix}-{n}"))
+            .relative()
+            .mt_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar_bg)
+            .text_color(theme.text)
+            .font_weight(FontWeight::NORMAL)
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                let now = hovered.then_some(which);
+                if *hovered || this.hovered_code == Some(which) {
+                    if this.hovered_code != now {
+                        this.hovered_code = now;
+                        cx.notify();
+                    }
+                }
+            }))
+            .child(
+                div()
+                    .id("code-scroll")
+                    .px_3()
+                    .py_2()
+                    .overflow_x_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(lang)
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .text_size(px(font_size * 0.9))
+                            .when_some(self.mono_font.clone(), |d, font| d.font_family(font))
+                            .child(code.code.clone()),
+                    ),
+            )
+            .children(button)
+            .into_any_element()
+    }
+
     /// In a block with line breaks, move the cursor to the line above
     /// (`-1`) or below (`1`), keeping its horizontal position. False when
     /// there is no such line, so Up and Down move to the next block instead.
@@ -1876,7 +2000,7 @@ impl NoteSec {
 /// on the sidebar colour, and a table wider than the page scrolls sideways.
 fn table_grid(
     theme: &Theme,
-    ix: usize,
+    name: String,
     rows: Vec<Vec<StyledText>>,
     align: &[Align],
 ) -> impl IntoElement {
@@ -1890,6 +2014,7 @@ fn table_grid(
     let column_count = columns.len();
     let columns = columns.into_iter().enumerate().map(|(c, cells)| {
         let align = align[c];
+        let name = name.clone();
         div()
             .flex()
             .flex_col()
@@ -1898,8 +2023,9 @@ fn table_grid(
                 col.border_r_1().border_color(theme.border)
             })
             .children(cells.into_iter().enumerate().map(move |(r, cell)| {
+                let name = name.clone();
                 div()
-                    .debug_selector(move || format!("table-{ix}-cell-{r}-{c}"))
+                    .debug_selector(move || format!("{name}-cell-{r}-{c}"))
                     .flex()
                     .flex_row()
                     .px_2()
@@ -1916,9 +2042,10 @@ fn table_grid(
                     .child(cell)
             }))
     });
+    let columns: Vec<_> = columns.collect();
     div()
-        .id(("table", ix))
-        .debug_selector(move || format!("table-{ix}"))
+        .id(SharedString::from(name.clone()))
+        .debug_selector(move || name)
         .overflow_x_scroll()
         .max_w_full()
         .child(
@@ -1973,6 +2100,35 @@ fn reading_highlights(
 /// the next save can retry.
 /// `family` as a font to render with, if it is installed. GPUI would
 /// otherwise fall back silently and the user would not know why.
+/// Monospace fonts for code blocks, most preferred first.
+const MONO_FONTS: [&str; 12] = [
+    "JetBrains Mono",
+    "Fira Code",
+    "Cascadia Code",
+    "Source Code Pro",
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Noto Sans Mono",
+    "Ubuntu Mono",
+    "Hack",
+    "Menlo",
+    "Consolas",
+    "Courier New",
+];
+
+/// The first installed font of `MONO_FONTS`, if any (code then falls back
+/// to the UI font, quietly: it still reads fine).
+fn mono_font(cx: &App) -> Option<SharedString> {
+    let names = cx.text_system().all_font_names();
+    MONO_FONTS
+        .iter()
+        .find(|font| names.iter().any(|name| name == *font))
+        .map(|font| SharedString::from(*font))
+}
+
+/// How long a copy button says "Copied".
+const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
+
 fn installed_font(family: &str, cx: &App) -> Option<SharedString> {
     if cx
         .text_system()
@@ -3193,59 +3349,91 @@ impl Render for NoteSec {
                         .child(BlockText { app: cx.entity() })
                         .into_any_element(),
                     Some(d) => {
-                        // A pipe table is drawn as a grid between the text
-                        // before and after it. Its cells aren't mapped back
-                        // to `content`, so a press on it starts editing at
-                        // the start of the block.
-                        let table = parse_table(&block.content).map(|table| {
+                        // Code blocks and pipe tables are drawn as their
+                        // own boxes between the prose around them. They
+                        // aren't mapped back to `content`, so a press on
+                        // such a block starts editing at its start.
+                        let parts = split_code(&block.content);
+                        let rich = parts.iter().any(|part| match part {
+                            Part::Code(_) => true,
+                            Part::Text(text) => parse_table(text).is_some(),
+                        });
+                        let text = if rich {
                             let resolve = |id| {
                                 find_block(&self.pages, id)
                                     .map(|(p, b)| self.pages[p].blocks[b].content.clone())
                             };
-                            let styled = |d: &DisplayBlock| {
+                            let styled = |text: &str, first: bool| {
+                                // Only the block's first line can carry its
+                                // type prefix and task keyword (hidden).
+                                let d = if first {
+                                    DisplayBlock::with_refs(text, resolve)
+                                } else {
+                                    DisplayBlock::inline(text, resolve)
+                                };
                                 StyledText::new(d.text.clone()).with_highlights(reading_highlights(
-                                    d, link_style, tag_style, ref_style,
+                                    &d, link_style, tag_style, ref_style,
                                 ))
                             };
-                            // The text around the table keeps the block's
-                            // type prefix and task keyword (hidden) in `before`.
-                            let before = (!table.before.is_empty())
-                                .then(|| styled(&DisplayBlock::with_refs(&table.before, resolve)));
-                            let after = (!table.after.is_empty())
-                                .then(|| styled(&DisplayBlock::inline(&table.after, resolve)));
-                            let cells = table
-                                .rows
-                                .iter()
-                                .map(|row| {
-                                    row.iter()
-                                        .map(|cell| styled(&DisplayBlock::inline(cell, resolve)))
-                                        .collect()
-                                })
-                                .collect();
+                            let mut pieces: Vec<AnyElement> = Vec::new();
+                            let (mut tables, mut codes) = (0, 0);
+                            for (p, part) in parts.iter().enumerate() {
+                                let mut rest = match part {
+                                    Part::Code(code) => {
+                                        pieces
+                                            .push(self.render_code(ix, block.id, codes, code, cx));
+                                        codes += 1;
+                                        continue;
+                                    }
+                                    Part::Text(text) => text.clone(),
+                                };
+                                let mut first = p == 0;
+                                while let Some(table) = parse_table(&rest) {
+                                    if !table.before.is_empty() {
+                                        pieces
+                                            .push(styled(&table.before, first).into_any_element());
+                                    }
+                                    let cells = table
+                                        .rows
+                                        .iter()
+                                        .map(|row| {
+                                            row.iter().map(|cell| styled(cell, false)).collect()
+                                        })
+                                        .collect();
+                                    let name = match tables {
+                                        0 => format!("table-{ix}"),
+                                        k => format!("table-{ix}-{k}"),
+                                    };
+                                    pieces.push(
+                                        table_grid(&theme, name, cells, &table.align)
+                                            .into_any_element(),
+                                    );
+                                    tables += 1;
+                                    first = false;
+                                    rest = table.after;
+                                }
+                                if !rest.is_empty() {
+                                    pieces.push(styled(&rest, first).into_any_element());
+                                }
+                            }
                             div()
                                 .flex()
                                 .flex_col()
                                 .gap_1()
-                                .children(before)
-                                .child(table_grid(&theme, ix, cells, &table.align))
-                                .children(after)
-                        });
-                        let text = match table {
-                            Some(table) => table.into_any_element(),
-                            None => {
-                                let highlights =
-                                    reading_highlights(d, link_style, tag_style, ref_style);
-                                // `with_highlights` resolves against the
-                                // inherited text style, so heading size/weight
-                                // and quote styling (and the theme's text
-                                // colour) apply to the unhighlighted parts.
-                                let text =
-                                    StyledText::new(d.text.clone()).with_highlights(highlights);
-                                text_layout = Some(text.layout().clone());
-                                #[cfg(test)]
-                                reading_layouts.push((ix, text.layout().clone()));
-                                text.into_any_element()
-                            }
+                                .children(pieces)
+                                .into_any_element()
+                        } else {
+                            let highlights =
+                                reading_highlights(d, link_style, tag_style, ref_style);
+                            // `with_highlights` resolves against the inherited
+                            // text style, so heading size/weight and quote
+                            // styling (and the theme's text colour) apply to
+                            // the unhighlighted parts.
+                            let text = StyledText::new(d.text.clone()).with_highlights(highlights);
+                            text_layout = Some(text.layout().clone());
+                            #[cfg(test)]
+                            reading_layouts.push((ix, text.layout().clone()));
+                            text.into_any_element()
                         };
                         // DONE text is dimmed and struck through.
                         let text = div()
@@ -7366,6 +7554,104 @@ mod tests {
         });
         cx.simulate_keystrokes("ctrl-z");
         view.update(cx, |app, _| assert!(app.editor.text.ends_with("| 1 | 2 |")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const CODE_PAGE: &str =
+        "- Run:\n  ```sh\n  ls -la  \n    echo  #hi [[x]]\n  ```\n  then done\n- next\n";
+
+    /// Hover code block `n` of block 0, click its copy button and check the
+    /// clipboard, the "Copied" label and that it goes away again.
+    fn copy_first_code_block(view: &Entity<NoteSec>, cx: &mut VisualTestContext) {
+        assert!(has(cx, "code-0-0") && !has(cx, "code-0-0-copy"));
+        let code = bounds_of(cx, "code-0-0");
+        cx.simulate_mouse_move(code.center(), None, Modifiers::none());
+        cx.run_until_parked();
+        assert!(has(cx, "code-0-0-copy") && !has(cx, "code-0-0-copied"));
+        let button = bounds_of(cx, "code-0-0-copy");
+        assert!(
+            code.contains(&button.center()),
+            "the button sits inside the block"
+        );
+        cx.simulate_click(button.center(), Modifiers::none());
+        cx.run_until_parked();
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("ls -la  \n  echo  #hi [[x]]"));
+        assert!(has(cx, "code-0-0-copied"));
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, None, "copying doesn't edit")
+        });
+        // The label goes back after a moment, with the mouse elsewhere.
+        let away = bounds_of(cx, "block-1").center();
+        cx.simulate_mouse_move(away, None, Modifiers::none());
+        cx.executor()
+            .advance_clock(COPIED_FOR + std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(!has(cx, "code-0-0-copied") && !has(cx, "code-0-0-copy"));
+    }
+
+    #[gpui::test]
+    fn code_blocks_render_with_a_copy_button_on_hover(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "code-copy", CODE_PAGE);
+        assert!(has(cx, "code-0-0"));
+        // Prose around the code still renders; the code is not a link or tag.
+        let code = bounds_of(cx, "code-0-0");
+        assert!(bounds_of(cx, "block-1").top() >= code.bottom());
+        view.update(cx, |app, _| {
+            assert!(app.pages[app.selected].blocks[0].content.contains("```sh"));
+            assert!(crate::model::tag_counts(&app.pages).is_empty());
+        });
+        copy_first_code_block(&view, cx);
+        // A press on the code itself (not the button) edits the raw block.
+        let at = bounds_of(cx, "code-0-0").center();
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(
+                app.editor.text,
+                "Run:\n```sh\nls -la  \n  echo  #hi [[x]]\n```\nthen done"
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(file(&dir), CODE_PAGE, "nothing rewritten");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn copy_button_works_in_the_light_theme(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "code-copy-light", CODE_PAGE);
+        view.update(cx, |app, cx| app.set_theme(ThemeKind::Light, cx));
+        cx.run_until_parked();
+        view.update(cx, |app, _| assert_eq!(app.config.theme, ThemeKind::Light));
+        copy_first_code_block(&view, cx);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn copying_again_restarts_the_copied_label(cx: &mut TestAppContext) {
+        let md = "- ```\n  one\n  ```\n  ```\n  two\n  ```\n- next\n";
+        let (_view, cx, dir) = setup(cx, "code-copy-two", md);
+        let click_copy = |cx: &mut VisualTestContext, n: usize| {
+            let code = bounds_of(cx, &format!("code-0-{n}"));
+            cx.simulate_mouse_move(code.center(), None, Modifiers::none());
+            cx.run_until_parked();
+            let button = bounds_of(cx, &format!("code-0-{n}-copy")).center();
+            cx.simulate_click(button, Modifiers::none());
+            cx.run_until_parked();
+        };
+        click_copy(cx, 0);
+        cx.executor().advance_clock(COPIED_FOR / 2);
+        click_copy(cx, 1);
+        let text = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(text.as_deref(), Some("two"));
+        // Only the latest copy says "Copied", for its full moment.
+        assert!(has(cx, "code-0-1-copied") && !has(cx, "code-0-0-copied"));
+        cx.executor().advance_clock(COPIED_FOR * 3 / 4);
+        cx.run_until_parked();
+        assert!(has(cx, "code-0-1-copied"));
+        cx.executor().advance_clock(COPIED_FOR / 2);
+        cx.run_until_parked();
+        assert!(!has(cx, "code-0-1-copied"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

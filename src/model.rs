@@ -138,6 +138,10 @@ pub fn parse_wikilinks(text: &str) -> Vec<Reference> {
         });
         pos = end + 2;
     }
+    // Links inside fenced code are code, not links (the graph reads this
+    // directly).
+    let code = crate::code::fenced_ranges(text);
+    links.retain(|l| !code.iter().any(|c| c.contains(&l.range.start)));
     links
 }
 
@@ -219,6 +223,10 @@ pub fn parse_references(text: &str) -> Vec<Reference> {
         })
         .chain(tags.iter().cloned())
         .collect();
+    // Nothing inside a fenced code block is a reference (`#include`,
+    // bash's `[[ -f x ]]`).
+    let code = crate::code::fenced_ranges(text);
+    all.retain(|r| !code.iter().any(|c| c.contains(&r.range.start)));
     all.sort_by_key(|r| r.range.start);
     all
 }
@@ -1518,5 +1526,16 @@ mod tests {
         assert_eq!(page.to_markdown(), md);
         let page = Page::from_markdown("t", false, "- a\n  - b\n  under\n");
         assert_eq!(page.blocks[1].content, "b\nunder");
+    }
+
+    #[test]
+    fn references_inside_code_blocks_are_ignored() {
+        let text = "see [[Real]] #tag\n```c\n#include <x>\nif [[ -f a ]]\n```\nand #after";
+        let names: Vec<String> = parse_references(text)
+            .into_iter()
+            .map(|r| r.target)
+            .collect();
+        assert_eq!(names, ["Real", "tag", "after"]);
+        assert_eq!(parse_wikilinks(text).len(), 1);
     }
 }
