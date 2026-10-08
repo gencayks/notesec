@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod display;
 mod editor;
 mod graph;
 mod graph_view;

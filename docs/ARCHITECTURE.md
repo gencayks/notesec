@@ -13,12 +13,13 @@ app.rs         — the GPUI root view: sidebar, page, editor, search overlay
 model.rs       — data: Block, Page, link/tag parsing (NO ui code here)
 storage.rs     — files on disk: load/save markdown (NO ui code here)
 editor.rs      — text-editing state machine (NO ui code here)
+display.rs     — reading view of a block: hidden markup + offset map (NO ui code)
 search.rs      — fuzzy matcher, pure functions (NO ui code here)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
 
-**The key design rule:** `model`, `storage`, `editor`, `search` know *nothing* about
+**The key design rule:** `model`, `storage`, `editor`, `display`, `search` know *nothing* about
 GPUI. They're plain Rust. That means:
 
 - They can be **unit-tested** without opening a window (most of the 42 tests).
@@ -412,9 +413,36 @@ that mutate, and data races are essentially impossible.
     Ctrl+I inside `**x**` gives `***x***`. Removing takes the stars next to
     the text; the selection (or the cursor's place in the word) still covers
     the same text afterwards. Each press is one undo step and the text is
-    saved when editing ends, like typing. Display mode still shows the
-    markers as typed: hiding them would need a display-to-source offset map
-    for click-to-cursor and link hit-testing.
+    saved when editing ends, like typing. Display mode renders the result
+    (see 15).
+15. **Reading view hides paired emphasis markers; one offset map for all
+    hidden text** — a block that isn't being edited is shown through
+    `DisplayBlock` (`display.rs`): the type prefix and paired `*` markers
+    are removed from the shown text, which keeps a list of visible source
+    chunks. That one map turns a click or drag-start position into an
+    editor offset and moves link/tag ranges into shown offsets, so
+    hit-testing and highlighting keep working. The edited block shows the
+    raw markdown; `content` and the files never change.
+    *Pairing rules* (simplified CommonMark): a maximal run of `*` is a
+    delimiter; it can open if followed by a non-space and close if preceded
+    by a non-space (so `2 * 3`, a lone `**`, `** x**` and a leading
+    `* item` stay literal). A closer pairs with the nearest earlier opener
+    that has stars left, using two stars (bold) if both have two or more,
+    else one (italic), innermost stars first, so `***x***` is bold+italic;
+    openers in between are dropped, unpaired stars stay visible. Stars
+    inside `[[links]]`/`#tags` are plain text. Not handled: CommonMark's
+    punctuation-flanking and "multiple of 3" rules, `_` emphasis, code spans.
+    *Boundary rule:* a shown offset sticks to the visible character before
+    it. Clicking just after a bold word's last letter puts the cursor
+    before the closing `**` (inside the bold); clicking before the first
+    letter of a bold word that follows other text puts it before the
+    opening `**` (after the previous character). Offset 0 is the first
+    visible character (after the prefix and any opening markers); past the
+    end is after the last visible character. Byte positions inside a chunk
+    map one to one, so they stay on character boundaries, and the editor
+    snaps to graphemes as usual.
+    Bold/italic are applied as highlights on top of link/tag styles and
+    under the row's heading/quote style.
 
 ---
 

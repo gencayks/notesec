@@ -6,6 +6,7 @@
 //! the block and the page is saved to disk.
 
 use crate::config::Config;
+use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::model::{backlinks, parse_references, tag_counts, BlockKind, Page};
@@ -15,9 +16,10 @@ use crate::ui::{block_row, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, GlobalElementId, HighlightStyle, Hsla, KeyBinding, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ShapedLine, SharedString,
-    Style, StyledText, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
+    FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hsla, KeyBinding,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels,
+    ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
+    UnderlineStyle, Window,
 };
 use std::ops::Range;
 use std::rc::Rc;
@@ -184,6 +186,10 @@ pub struct NoteSec {
     /// input-method's questions about where characters are on screen.
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// Text layouts of the rows in reading view from the last render, so
+    /// tests can find where a displayed character is on screen.
+    #[cfg(test)]
+    reading_layouts: Vec<(usize, gpui::TextLayout)>,
 }
 
 impl NoteSec {
@@ -267,6 +273,8 @@ impl NoteSec {
             _graph_subscription: None,
             last_layout: None,
             last_bounds: None,
+            #[cfg(test)]
+            reading_layouts: Vec::new(),
         }
     }
 
@@ -1096,6 +1104,36 @@ impl NoteSec {
     }
 }
 
+/// Highlights for a block in reading view: link/tag styling with bold and
+/// italic on top. Heading and quote styling come from the row and still apply
+/// underneath (`StyledText::with_highlights` resolves against it).
+fn reading_highlights(
+    display: &DisplayBlock,
+    link_style: HighlightStyle,
+    tag_style: HighlightStyle,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    display
+        .segments()
+        .into_iter()
+        .map(|(range, format)| {
+            let mut style = if format.tag {
+                tag_style
+            } else if format.link {
+                link_style
+            } else {
+                HighlightStyle::default()
+            };
+            if format.bold {
+                style.font_weight = Some(FontWeight::BOLD);
+            }
+            if format.italic {
+                style.font_style = Some(FontStyle::Italic);
+            }
+            (range, style)
+        })
+        .collect()
+}
+
 /// Journals first (newest first, since `YYYY-MM-DD` sorts lexically), then
 /// regular pages alphabetically.
 fn sort_pages(pages: &mut [Page]) {
@@ -1675,6 +1713,8 @@ impl Render for NoteSec {
 
         // --- Main pane: title + blocks --------------------------------------
         let page = &self.pages[self.selected];
+        #[cfg(test)]
+        let mut reading_layouts = Vec::new();
         let rows: Vec<AnyElement> = page
             .blocks
             .iter()
@@ -1682,55 +1722,56 @@ impl Render for NoteSec {
             .map(|(ix, block)| {
                 let is_editing = self.editing == Some(ix);
                 let depth = page.depth_of(ix);
-                // Display mode hides the type prefix (`# `, `> `) and styles
-                // the row instead; the editor shows the raw markdown.
-                let (kind, body) = if is_editing {
-                    (
-                        BlockKind::parse(&self.editor.text).0,
-                        block.content.as_str(),
-                    )
-                } else {
-                    BlockKind::parse(&block.content)
+                // Display mode (the reading view) hides the type prefix
+                // (`# `, `> `) and paired `**`/`*` markers and styles the row
+                // instead; the editor shows the raw markdown. `display` also
+                // maps shown offsets back to `content` offsets.
+                let display = (!is_editing).then(|| Rc::new(DisplayBlock::new(&block.content)));
+                let kind = match &display {
+                    Some(d) => d.kind,
+                    None => BlockKind::parse(&self.editor.text).0,
                 };
-                let links = Rc::new(parse_references(body));
-                // Bytes of `content` hidden in display mode (the type prefix),
-                // to map a display position back to an editor offset.
-                let hidden = block.content.len() - body.len();
                 // Layout of this row's text, kept so a press can be mapped to
                 // the character (and so the link) under the mouse.
                 let mut text_layout = None;
-                let content: AnyElement = if is_editing {
-                    div()
+                let content: AnyElement = match &display {
+                    None => div()
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::on_text_mouse_down))
                         .child(BlockText { app: cx.entity() })
-                        .into_any_element()
-                } else {
-                    let highlights = links.iter().map(|l| {
-                        let style = if l.is_tag { tag_style } else { link_style };
-                        (l.range.clone(), style)
-                    });
-                    // `with_highlights` resolves against the inherited text
-                    // style, so heading size/weight and quote styling (and the
-                    // theme's text colour) apply to the unhighlighted parts.
-                    let text = StyledText::new(body.to_string()).with_highlights(highlights);
-                    text_layout = Some(text.layout().clone());
-                    div().child(text).into_any_element()
+                        .into_any_element(),
+                    Some(d) => {
+                        let highlights = reading_highlights(d, link_style, tag_style);
+                        // `with_highlights` resolves against the inherited text
+                        // style, so heading size/weight and quote styling (and
+                        // the theme's text colour) apply to the unhighlighted
+                        // parts.
+                        let text = StyledText::new(d.text.clone()).with_highlights(highlights);
+                        text_layout = Some(text.layout().clone());
+                        #[cfg(test)]
+                        reading_layouts.push((ix, text.layout().clone()));
+                        div().child(text).into_any_element()
+                    }
                 };
                 // A press on a row that isn't being edited starts editing it
                 // with the cursor under the mouse, and a drag from there
                 // selects (the root's mouse-move handler extends it). A press
                 // on a link does nothing here: the click handler navigates.
                 let link_at = {
-                    let (layout, links) = (text_layout.clone(), links.clone());
+                    let (layout, display) = (text_layout.clone(), display.clone());
                     move |position: gpui::Point<Pixels>| {
-                        let layout = layout.as_ref()?;
+                        let (layout, display) = (layout.as_ref()?, display.as_ref()?);
                         // `Ok` only when the mouse is over an actual glyph.
                         let char_ix = layout.index_for_position(position).ok()?;
-                        links.iter().find(|l| l.range.contains(&char_ix)).cloned()
+                        display
+                            .links
+                            .iter()
+                            .find(|l| l.range.contains(&char_ix))
+                            .cloned()
                     }
                 };
                 let on_press = {
-                    let (layout, link_at) = (text_layout.clone(), link_at.clone());
+                    let (layout, display, link_at) =
+                        (text_layout.clone(), display.clone(), link_at.clone());
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         if link_at(event.position).is_some() {
                             return;
@@ -1740,8 +1781,11 @@ impl Render for NoteSec {
                                 Ok(i) | Err(i) => i,
                             }
                         });
+                        // Hidden prefix and markers are accounted for here;
+                        // see `DisplayBlock::to_source` for the boundary rule.
+                        let source = display.as_ref().map_or(0, |d| d.to_source(offset));
                         this.start_edit(ix, window, cx);
-                        this.editor.set_cursor(hidden + offset);
+                        this.editor.set_cursor(source);
                         this.selecting = true;
                         cx.notify();
                     })
@@ -1788,6 +1832,10 @@ impl Render for NoteSec {
                 }
             })
             .collect();
+        #[cfg(test)]
+        {
+            self.reading_layouts = reading_layouts;
+        }
 
         // --- Backlinks: blocks on other pages that link here ----------------
         // Recomputed every frame. That is a scan of every block, which is fine
@@ -3486,6 +3534,203 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.search.as_ref().unwrap().query.text, "ab");
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Where display offset `ix` of reading-view row `row` is on screen
+    /// (1px into the character that starts there, vertically centred).
+    fn reading_point(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        row: usize,
+        ix: usize,
+    ) -> Point<Pixels> {
+        view.update(cx, |app, _| {
+            let (_, layout) = app
+                .reading_layouts
+                .iter()
+                .find(|(r, _)| *r == row)
+                .expect("row is in reading view");
+            let p = layout.position_for_index(ix).expect("index on the line");
+            point(p.x + px(1.), p.y + layout.line_height() / 2.)
+        })
+    }
+
+    /// The text shown for reading-view row `row`, if it is in reading view.
+    fn reading_text(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        row: usize,
+    ) -> Option<String> {
+        view.update(cx, |app, _| {
+            app.reading_layouts
+                .iter()
+                .find(|(r, _)| *r == row)
+                .map(|(_, l)| l.text())
+        })
+    }
+
+    #[gpui::test]
+    fn unedited_block_hides_markers_and_renders_formatting(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(
+            cx,
+            "read-format",
+            "- a **bold** and *it* 2 * 3\n- ## ***Big*** [[Page]]\n- **see [[Page]] #tag**\n",
+        );
+        assert_eq!(
+            reading_text(&view, cx, 0).as_deref(),
+            Some("a bold and it 2 * 3")
+        );
+        assert_eq!(reading_text(&view, cx, 1).as_deref(), Some("Big [[Page]]"));
+        assert_eq!(
+            reading_text(&view, cx, 2).as_deref(),
+            Some("see [[Page]] #tag")
+        );
+
+        // The highlights handed to the text: bold/italic, combined with the
+        // link and tag styles.
+        let link = HighlightStyle {
+            color: Some(gpui::red()),
+            ..Default::default()
+        };
+        let tag = HighlightStyle {
+            color: Some(gpui::blue()),
+            ..Default::default()
+        };
+        let bold = Some(FontWeight::BOLD);
+        let italic = Some(FontStyle::Italic);
+        let h = reading_highlights(&DisplayBlock::new("a **bold** and *it*"), link, tag);
+        assert_eq!(h.len(), 2);
+        assert_eq!((h[0].0.clone(), h[0].1.font_weight), (2..6, bold));
+        assert_eq!((h[1].0.clone(), h[1].1.font_style), (11..13, italic));
+        let h = reading_highlights(&DisplayBlock::new("## ***Big*** [[Page]]"), link, tag);
+        assert_eq!(h[0].0, 0..3);
+        assert_eq!((h[0].1.font_weight, h[0].1.font_style), (bold, italic));
+        assert_eq!((h[1].0.clone(), h[1].1), (4..12, link));
+        let h = reading_highlights(&DisplayBlock::new("**see [[Page]] #tag**"), link, tag);
+        let ranges: Vec<_> = h.iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(ranges, vec![0..4, 4..12, 12..13, 13..17]);
+        assert!(h.iter().all(|(_, s)| s.font_weight == bold));
+        assert_eq!((h[1].1.color, h[3].1.color), (link.color, tag.color));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn click_on_formatted_block_maps_to_the_source_offset(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "read-click", "- ab **cd** ef\n- # é**😀ü**x\n");
+        // Shown as "ab cd ef". Between "c" and "d": inside the bold.
+        let at = reading_point(&view, cx, 0, 4);
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.editor.text, "ab **cd** ef");
+            assert_eq!(app.editor.cursor, "ab **c".len());
+        });
+        cx.simulate_keystrokes("escape");
+        // Just after "cd": before the closing "**", still inside the bold.
+        let at = reading_point(&view, cx, 0, 5);
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, "ab **cd".len()));
+        cx.simulate_keystrokes("escape");
+        // Before "e": after the closing markers and the space.
+        let at = reading_point(&view, cx, 0, 6);
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.cursor, "ab **cd** ".len())
+        });
+        cx.simulate_keystrokes("escape");
+
+        // Heading prefix, accents and emoji next to markers: shown as
+        // "é😀üx"; after "ü" lands before the closing "**".
+        assert_eq!(reading_text(&view, cx, 1).as_deref(), Some("é😀üx"));
+        let at = reading_point(&view, cx, 1, "é😀ü".len());
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, "# é**😀ü".len());
+        });
+        cx.simulate_keystrokes("escape");
+        let at = reading_point(&view, cx, 1, "é".len());
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, "# é".len()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn edit_mode_shows_raw_markers(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "read-edit", "- **bold** *it*\n- other\n");
+        assert_eq!(reading_text(&view, cx, 0).as_deref(), Some("bold it"));
+        let at = reading_point(&view, cx, 0, 0);
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.editor.text, "**bold** *it*");
+            assert_eq!(app.editor.cursor, 2, "start of the text, inside the bold");
+            // The edited row is drawn by the editor with the raw text.
+            let layout = app.last_layout.as_ref().expect("edited block painted");
+            assert_eq!(layout.text.as_ref(), "**bold** *it*");
+        });
+        assert_eq!(reading_text(&view, cx, 0), None);
+        // Leaving the block goes back to the reading view.
+        cx.simulate_keystrokes("escape escape");
+        assert_eq!(reading_text(&view, cx, 0).as_deref(), Some("bold it"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn link_inside_bold_navigates(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "read-link", "- **see [[Foo]]** *x*\n- other\n");
+        // Shown as "see [[Foo]] x"; "F" is at display offset 6.
+        let at = reading_point(&view, cx, 0, 6);
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Foo");
+            assert_eq!(app.editing, None);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn drag_from_formatted_unedited_block_maps_the_start(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "read-drag", "- one\n- **ab** cd\n");
+        click_block(cx, 0);
+        // Press just after "ab" (display 2): source 4, before the closing
+        // "**". Then drag to the end of the now-raw text.
+        let start = reading_point(&view, cx, 1, 2);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, 4);
+        });
+        let to = text_point(&view, cx, 9);
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        assert_eq!(selection(&view, cx), Some(4..9));
+        view.update(cx, |app, _| assert_eq!(&app.editor.text[4..9], "** cd"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn reading_view_leaves_storage_unchanged(cx: &mut TestAppContext) {
+        let original = "- # **Big** title\n- ***both*** and 2 * 3 **\n- *é😀* [[A*b]]\n- edit me\n";
+        let (view, cx, dir) = setup(cx, "read-store", original);
+        // Model round trip keeps the raw markers.
+        let page = Page::from_markdown("Test", false, original);
+        assert_eq!(page.to_markdown(), original);
+        // Rendering in reading view and saving (by editing another block)
+        // writes the formatted blocks back byte for byte.
+        assert_eq!(
+            reading_text(&view, cx, 1).as_deref(),
+            Some("both and 2 * 3 **")
+        );
+        click_block(cx, 3);
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("escape escape");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks[0].content, "# **Big** title");
+        });
+        assert_eq!(file(&dir), original.replace("edit me", "edit me!"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
