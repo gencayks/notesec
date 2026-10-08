@@ -12,8 +12,8 @@ use crate::graph_view::{GraphEvent, GraphView};
 use crate::model::{
     backlinks, cycle_task, parse_references, tag_counts, BlockKind, Page, TaskState,
 };
-use crate::search::{search, Command, Hit, Target};
-use crate::storage::{today_title, Storage};
+use crate::search::{search, search_templates, Command, Hit, Target};
+use crate::storage::{today_title, Storage, Template};
 use crate::ui::{block_row, fold_arrow, fold_badge, task_checkbox, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
@@ -55,6 +55,7 @@ actions!(
         CycleTask,
         ToggleSearch,
         NewPage,
+        OpenToday,
         Undo,
         Redo,
         ToggleTheme,
@@ -95,6 +96,7 @@ pub fn bind_keys(cx: &mut App) {
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-n", NewPage, None),
+        KeyBinding::new("ctrl-j", OpenToday, None),
         KeyBinding::new("ctrl-z", Undo, None),
         KeyBinding::new("ctrl-shift-z", Redo, None),
         KeyBinding::new("ctrl-y", Redo, None),
@@ -130,6 +132,13 @@ struct SearchState {
     query: EditorState,
     /// Highlighted result (index into the current results).
     selected: usize,
+    /// The block that was being edited when the palette opened. "Insert
+    /// template" puts the template's blocks after it (see
+    /// `Page::insert_blocks_from`); `None` means append to the page.
+    insert_after: Option<usize>,
+    /// `Some` once "Insert template" was chosen: the palette then lists these
+    /// templates instead of pages, blocks and commands.
+    templates: Option<Vec<Template>>,
 }
 
 const MAX_HISTORY: usize = 100;
@@ -216,12 +225,7 @@ impl NoteSec {
         // Auto-create today's journal if it doesn't exist yet.
         let today = today_title();
         if !pages.iter().any(|p| p.is_journal && p.title == today) {
-            let mut page = Page::from_markdown(&today, true, "- \n");
-            page.blocks[0].content.clear();
-            if let Err(err) = storage.save(&page) {
-                eprintln!("notesec: could not create journal {today}: {err}");
-            }
-            pages.push(page);
+            pages.push(create_journal(&storage, &today));
         }
 
         // First run: give the user something to look at.
@@ -343,13 +347,64 @@ impl NoteSec {
             Command::DecreaseFontSize => self.change_font_size(-1.0, cx),
             Command::ResetFontSize => self.reset_font_size(cx),
             Command::ToggleGraph => self.toggle_graph(cx),
+            Command::InsertTemplate => self.open_template_picker(None, cx),
         }
+    }
+
+    // --- templates -------------------------------------------------------------
+
+    /// Show the palette as a template picker. `insert_after` is the block the
+    /// chosen template goes after (`None`: end of the page).
+    fn open_template_picker(&mut self, insert_after: Option<usize>, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+        self.search = Some(SearchState {
+            query: EditorState::default(),
+            selected: 0,
+            insert_after,
+            templates: Some(self.storage.load_templates()),
+        });
+        cx.notify();
+    }
+
+    /// Insert `template`'s blocks into the selected page after block
+    /// `insert_after` (replacing it if it is an empty leaf), or at the end of
+    /// the page. One undo step; saved right away like other structural edits.
+    fn insert_template(
+        &mut self,
+        template: &Template,
+        insert_after: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_edit(cx);
+        let source = Page::from_markdown(&template.name, false, &template.markdown);
+        if source.blocks.is_empty() {
+            return;
+        }
+        let page = &self.pages[self.selected];
+        // A page that is just one blank bullet (a fresh journal or page) gets
+        // that bullet replaced rather than a template appended below it.
+        let insert_after = insert_after.or_else(|| {
+            (page.blocks.len() == 1 && page.blocks[0].content.trim().is_empty()).then_some(0)
+        });
+        self.record_edit();
+        self.pages[self.selected].insert_blocks_from(insert_after, &source);
+        self.save_page();
+        self.mode = Mode::Notes;
+        cx.notify();
     }
 
     // --- search overlay --------------------------------------------------------
 
     fn search_results(&self) -> Vec<Hit> {
         match &self.search {
+            Some(SearchState {
+                query,
+                templates: Some(templates),
+                ..
+            }) => {
+                let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
+                search_templates(&names, &query.text, MAX_RESULTS)
+            }
             Some(s) => search(&self.pages, &s.query.text, MAX_RESULTS),
             None => Vec::new(),
         }
@@ -368,11 +423,15 @@ impl NoteSec {
             self.close_search(cx);
             return;
         }
-        // Save whatever block is being edited before covering it.
+        // Remember where the cursor was (for "Insert template"), then save
+        // whatever block is being edited before covering it.
+        let insert_after = self.editing;
         self.stop_edit(cx);
         self.search = Some(SearchState {
             query: EditorState::default(),
             selected: 0,
+            insert_after,
+            templates: None,
         });
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -514,6 +573,10 @@ impl NoteSec {
     /// Act on a search result: open its page (and for a block hit, start
     /// editing that block) or run the command.
     fn open_hit(&mut self, hit: &Hit, window: &mut Window, cx: &mut Context<Self>) {
+        let (insert_after, templates) = match self.search.take() {
+            Some(s) => (s.insert_after, s.templates),
+            None => (None, None),
+        };
         self.close_search(cx);
         match hit.target {
             Target::Page(page) => {
@@ -527,7 +590,14 @@ impl NoteSec {
                     self.start_edit(block, window, cx);
                 }
             }
+            // Keeps the palette open, now listing templates.
+            Target::Command(Command::InsertTemplate) => self.open_template_picker(insert_after, cx),
             Target::Command(command) => self.run_command(command, cx),
+            Target::Template(ix) => {
+                if let Some(template) = templates.as_ref().and_then(|t| t.get(ix)) {
+                    self.insert_template(template, insert_after, cx);
+                }
+            }
         }
     }
 
@@ -537,6 +607,10 @@ impl NoteSec {
 
     fn on_new_page(&mut self, _: &NewPage, window: &mut Window, cx: &mut Context<Self>) {
         self.new_page(window, cx);
+    }
+
+    fn on_open_today(&mut self, _: &OpenToday, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_today(cx);
     }
 
     fn on_undo(&mut self, action: &Undo, window: &mut Window, cx: &mut Context<Self>) {
@@ -706,6 +780,32 @@ impl NoteSec {
             }
         };
         self.selected = ix;
+        self.mode = Mode::Notes;
+        cx.notify();
+    }
+
+    /// Index of the journal page for `title` (`YYYY-MM-DD`). Only journals
+    /// match, so a regular page that happens to have a date as its name is
+    /// never mistaken for the daily note.
+    fn find_journal(&self, title: &str) -> Option<usize> {
+        self.pages
+            .iter()
+            .position(|p| p.is_journal && p.title == title)
+    }
+
+    /// Show today's journal ("Today" button / Ctrl-J), creating it if it
+    /// doesn't exist yet. Startup already creates it, but the app may have been
+    /// left open past midnight, or the file deleted behind our back.
+    fn open_today(&mut self, cx: &mut Context<Self>) {
+        // Save the block being edited first (this may add pages and reorder
+        // the sidebar, so look the journal up afterwards).
+        self.stop_edit(cx);
+        let today = today_title();
+        if self.find_journal(&today).is_none() {
+            let page = create_journal(&self.storage, &today);
+            self.add_page(page);
+        }
+        self.selected = self.find_journal(&today).unwrap_or(0);
         self.mode = Mode::Notes;
         cx.notify();
     }
@@ -1223,6 +1323,19 @@ fn reading_highlights(
         .collect()
 }
 
+/// Create and save an empty journal page for `title` (`YYYY-MM-DD`). Storage
+/// turns the title into Logseq's `journals/YYYY_MM_DD.md` file name. A failed
+/// save is reported but the page is still returned, so the user can type and
+/// the next save can retry.
+fn create_journal(storage: &Storage, title: &str) -> Page {
+    let mut page = Page::from_markdown(title, true, "- \n");
+    page.blocks[0].content.clear();
+    if let Err(err) = storage.save(&page) {
+        eprintln!("notesec: could not create journal {title}: {err}");
+    }
+    page
+}
+
 /// Journals first (newest first, since `YYYY-MM-DD` sorts lexically), then
 /// regular pages alphabetically.
 fn sort_pages(pages: &mut [Page]) {
@@ -1680,6 +1793,31 @@ impl Render for NoteSec {
             .collect();
         let has_tags = !tag_rows.is_empty();
 
+        // "Today" button at the very top: one click to today's journal.
+        // Highlighted while that journal is the page on screen.
+        let today = today_title();
+        let on_today = self.mode == Mode::Notes
+            && self
+                .pages
+                .get(self.selected)
+                .is_some_and(|p| p.is_journal && p.title == today);
+        let today_item = div()
+            .id("today")
+            .debug_selector(|| "today".to_string())
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .cursor_pointer()
+            .text_color(if on_today { theme.accent } else { theme.text })
+            .when(on_today, |d| d.bg(theme.selected_bg))
+            .hover(|d| d.bg(theme.selected_bg))
+            .on_click(cx.listener(|this, _e, _window, cx| this.open_today(cx)))
+            .child("Today")
+            .child(div().text_color(theme.muted).child("Ctrl-J"));
+
         // "Graph view" entry above the page list; highlighted while open.
         let in_graph = self.mode == Mode::Graph;
         let graph_item = div()
@@ -1733,6 +1871,7 @@ impl Render for NoteSec {
             .border_r_1()
             .border_color(theme.border)
             .overflow_y_scroll()
+            .child(today_item)
             .child(graph_item)
             .child(pages_header)
             .children(sidebar_items)
@@ -2080,6 +2219,7 @@ impl Render for NoteSec {
         let overlay = self.search.as_ref().map(|state| {
             let hits = self.search_results();
             let selected = state.selected;
+            let templates = state.templates.as_deref();
             let rows: Vec<AnyElement> =
                 hits.into_iter()
                     .enumerate()
@@ -2111,6 +2251,12 @@ impl Render for NoteSec {
                                 div().text_color(theme.text).child(c.label()),
                                 "command".into(),
                             ),
+                            Target::Template(t) => row(
+                                div().text_color(theme.accent).child(
+                                    templates.map_or(String::new(), |ts| ts[t].name.clone()),
+                                ),
+                                "template".into(),
+                            ),
                         };
                         div()
                             .id(("search-result", i))
@@ -2129,6 +2275,15 @@ impl Render for NoteSec {
                     })
                     .collect();
             let no_results = rows.is_empty();
+            // In template mode: a heading, and a hint if there are no templates.
+            let picking_templates = templates.is_some();
+            let empty_message = match templates {
+                Some([]) => format!(
+                    "No templates yet: add .md files to {}",
+                    self.storage.templates_dir().display()
+                ),
+                _ => "No results".to_string(),
+            };
 
             // Backdrop: dims the app, swallows mouse events, closes on click.
             div()
@@ -2159,6 +2314,15 @@ impl Render for NoteSec {
                         .border_1()
                         .border_color(theme.border)
                         .shadow_lg()
+                        .when(picking_templates, |d| {
+                            d.child(
+                                div()
+                                    .px_3()
+                                    .pt_1()
+                                    .text_color(theme.muted)
+                                    .child("Insert template"),
+                            )
+                        })
                         .child(
                             div()
                                 .debug_selector(|| "search-input".to_string())
@@ -2175,7 +2339,7 @@ impl Render for NoteSec {
                                     .px_3()
                                     .py_1()
                                     .text_color(theme.muted)
-                                    .child("No results"),
+                                    .child(empty_message),
                             )
                         }),
                 )
@@ -2228,6 +2392,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::cycle_task))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::on_new_page))
+            .on_action(cx.listener(Self::on_open_today))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_toggle_theme))
@@ -2347,6 +2512,219 @@ mod tests {
             std::fs::read_to_string(dir.join("pages/Untitled.md")).unwrap(),
             "- \n"
         );
+    }
+
+    /// Path of today's journal file in `dir` (Logseq naming: `YYYY_MM_DD.md`).
+    fn todays_journal_file(dir: &std::path::Path) -> PathBuf {
+        dir.join(format!("journals/{}.md", today_title().replace('-', "_")))
+    }
+
+    /// Like `setup`, but today's journal already exists on disk with
+    /// `journal_markdown` before the app starts.
+    fn setup_with_journal<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        journal_markdown: &str,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("notesec-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        std::fs::write(dir.join("pages/Test.md"), "- hello\n").unwrap();
+        std::fs::write(todays_journal_file(&dir), journal_markdown).unwrap();
+
+        cx.update(bind_keys);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
+        view.update(cx, |app, cx| {
+            app.selected = app.pages.iter().position(|p| p.title == "Test").unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (view, cx, dir)
+    }
+
+    #[gpui::test]
+    fn today_button_opens_the_existing_journal(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_with_journal(cx, "today-existing", "- morning notes\n");
+        let button = cx.debug_bounds("today").expect("Today button rendered");
+
+        cx.simulate_click(button.center(), Modifiers::none());
+
+        let today = today_title();
+        view.update(cx, |app, _| {
+            let page = &app.pages[app.selected];
+            assert!(page.is_journal);
+            assert_eq!(page.title, today);
+            assert_eq!(page.blocks[0].content, "morning notes");
+            assert_eq!(
+                app.pages
+                    .iter()
+                    .filter(|p| p.is_journal && p.title == today)
+                    .count(),
+                1,
+                "no duplicate journal created"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(todays_journal_file(&dir)).unwrap(),
+            "- morning notes\n",
+            "existing journal left untouched"
+        );
+    }
+
+    #[gpui::test]
+    fn today_button_creates_a_missing_journal(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "today-missing", "- hello\n");
+        // Simulate the journal not existing (e.g. the app was left open past
+        // midnight, or the file was deleted): drop it from memory and disk.
+        let today = today_title();
+        view.update(cx, |app, cx| {
+            app.pages.retain(|p| !(p.is_journal && p.title == today));
+            app.selected = app.find_page("Test").unwrap();
+            cx.notify();
+        });
+        std::fs::remove_file(todays_journal_file(&dir)).unwrap();
+        cx.run_until_parked();
+
+        let button = cx.debug_bounds("today").expect("Today button rendered");
+        cx.simulate_click(button.center(), Modifiers::none());
+
+        view.update(cx, |app, _| {
+            let page = &app.pages[app.selected];
+            assert!(page.is_journal);
+            assert_eq!(page.title, today);
+            assert_eq!(app.mode, Mode::Notes);
+            // Journals sort first, so it is back at the top of the sidebar.
+            assert_eq!(app.selected, 0);
+        });
+        assert_eq!(
+            std::fs::read_to_string(todays_journal_file(&dir)).unwrap(),
+            "- \n",
+            "journal file created with Logseq naming"
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_j_opens_today_and_saves_the_edited_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "today-ctrl-j", "- hello\n");
+        click_block(cx, 0);
+        cx.simulate_input(" world");
+
+        cx.simulate_keystrokes("ctrl-j");
+
+        view.update(cx, |app, _| {
+            let page = &app.pages[app.selected];
+            assert!(page.is_journal);
+            assert_eq!(page.title, today_title());
+            assert_eq!(app.editing, None);
+        });
+        assert_eq!(file(&dir), "- hello world\n");
+    }
+
+    #[gpui::test]
+    fn ctrl_j_leaves_the_graph_view(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = setup(cx, "today-from-graph", "- hello\n");
+        cx.simulate_keystrokes("ctrl-g");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+
+        cx.simulate_keystrokes("ctrl-j");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Notes);
+            assert_eq!(app.pages[app.selected].title, today_title());
+        });
+    }
+
+    /// Open the palette, choose "Insert template", and return the template
+    /// names the picker lists.
+    fn open_template_picker(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("insert template");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            let state = app.search.as_ref().expect("palette stays open");
+            let templates = state.templates.as_ref().expect("in template mode");
+            assert_eq!(state.query.text, "", "query cleared for the picker");
+            app.search_results()
+                .iter()
+                .map(|hit| match hit.target {
+                    Target::Template(ix) => templates[ix].name.clone(),
+                    other => panic!("unexpected hit {other:?}"),
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn insert_template_lists_templates_and_inserts_after_the_edited_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "template-insert", "- one\n- two\n");
+        std::fs::write(
+            dir.join("templates/Meeting.md"),
+            "- Agenda\n  - item\n- Notes\n",
+        )
+        .unwrap();
+        click_block(cx, 0);
+
+        let names = open_template_picker(&view, cx);
+        assert_eq!(names, ["Daily review", "Meeting"]);
+
+        cx.simulate_input("meet");
+        cx.simulate_keystrokes("enter");
+
+        view.update(cx, |app, _| {
+            assert!(app.search.is_none(), "palette closes after inserting");
+            let contents: Vec<&str> = app.pages[app.selected]
+                .blocks
+                .iter()
+                .map(|b| b.content.as_str())
+                .collect();
+            assert_eq!(contents, ["one", "Agenda", "item", "Notes", "two"]);
+        });
+        assert_eq!(file(&dir), "- one\n- Agenda\n  - item\n- Notes\n- two\n");
+
+        // The whole insert is one undo step.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks.len(), 2);
+        });
+        assert_eq!(file(&dir), "- one\n- two\n");
+    }
+
+    #[gpui::test]
+    fn insert_template_without_an_edited_block_appends_to_the_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "template-append", "- one\n  - child\n");
+        // Not editing: the template goes at the end, at the top level.
+        open_template_picker(&view, cx);
+        cx.simulate_keystrokes("enter"); // first (only) template: Daily review
+        assert_eq!(
+            file(&dir),
+            "- one\n  - child\n- Wins\n  - \n- Lessons\n  - \n- Plan for tomorrow\n  - \n"
+        );
+    }
+
+    #[gpui::test]
+    fn insert_template_replaces_a_blank_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "template-blank", "- \n");
+        open_template_picker(&view, cx);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            file(&dir),
+            "- Wins\n  - \n- Lessons\n  - \n- Plan for tomorrow\n  - \n"
+        );
+    }
+
+    #[gpui::test]
+    fn template_picker_with_no_templates_inserts_nothing(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "template-none", "- one\n");
+        std::fs::remove_file(dir.join("templates/Daily review.md")).unwrap();
+
+        assert!(open_template_picker(&view, cx).is_empty());
+        cx.simulate_keystrokes("enter");
+
+        view.update(cx, |app, _| {
+            assert!(app.search.is_some(), "nothing to pick, palette stays open");
+        });
+        assert_eq!(file(&dir), "- one\n");
     }
 
     #[gpui::test]

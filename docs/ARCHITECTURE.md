@@ -484,6 +484,31 @@ that mutate, and data races are essentially impossible.
 
 ---
 
+18. **"Today" button / Ctrl-J opens today's journal, creating it if missing**:
+    startup already creates the day's journal, but the app can stay open past
+    midnight or the file can be deleted, so the button re-checks every time.
+    It only matches journal pages (`is_journal`), never a regular page that
+    happens to be named like a date, and it saves the block being edited
+    first. Startup and the button share `create_journal`, so the file is
+    always Logseq's `journals/YYYY_MM_DD.md`.
+19. **Templates are plain markdown files in `<graph>/templates/`, inserted at
+    the cursor**: the file name (without `.md`) is the template's name and
+    the body uses the same bullet format as pages, so templates are edited in
+    any text editor and Logseq simply ignores the folder. A new graph gets one
+    example (`Daily review`, shipped from `assets/templates/`); it is written
+    only when the folder doesn't exist yet, so deleting it sticks. The folder
+    is re-read each time the picker opens, so new files show up without a
+    restart. Ctrl-K, then "Insert template", turns the palette into a template
+    picker. Of the two options in the spec (insert at the cursor, or create a
+    new page) we chose inserting at the cursor because it needs no page name
+    and works in journals, where templates are most used: the blocks go right
+    after the block you were editing when you opened the palette (after its
+    children too, as its siblings), or at the end of the page if you weren't
+    editing. An empty leaf block, or a page that is just one blank bullet, is
+    replaced instead of leaving a stray empty bullet. The template's own
+    nesting is kept, every copy gets fresh IDs, and the whole insert is one
+    undo step.
+
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
 code you've already seen above — that's the advantage of learning from your own

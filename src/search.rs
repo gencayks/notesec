@@ -105,15 +105,18 @@ pub enum Command {
     DecreaseFontSize,
     ResetFontSize,
     ToggleGraph,
+    /// Switches the palette to a list of templates (see `search_templates`).
+    InsertTemplate,
 }
 
 impl Command {
-    pub const ALL: [Command; 5] = [
+    pub const ALL: [Command; 6] = [
         Command::ToggleTheme,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
         Command::ResetFontSize,
         Command::ToggleGraph,
+        Command::InsertTemplate,
     ];
 
     pub fn label(self) -> &'static str {
@@ -123,6 +126,7 @@ impl Command {
             Command::DecreaseFontSize => "Decrease font size",
             Command::ResetFontSize => "Reset font size",
             Command::ToggleGraph => "Toggle graph view",
+            Command::InsertTemplate => "Insert template",
         }
     }
 }
@@ -135,6 +139,8 @@ pub enum Target {
     /// A block: (page index, block index within that page).
     Block(usize, usize),
     Command(Command),
+    /// A template, by index into the list given to `search_templates`.
+    Template(usize),
 }
 
 /// One search result.
@@ -194,6 +200,27 @@ pub fn search(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
         }
     }
     // Stable sort: equal scores keep page/document order.
+    hits.sort_by(|a, b| b.score.cmp(&a.score));
+    hits.truncate(limit);
+    hits
+}
+
+/// Filter template names for the palette's "Insert template" step. An empty
+/// query lists every template in the given order; otherwise names are fuzzy
+/// matched like page titles, best first.
+pub fn search_templates(names: &[&str], query: &str, limit: usize) -> Vec<Hit> {
+    let query = query.trim();
+    let mut hits: Vec<Hit> = names
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, name)| {
+            fuzzy_score(query, name).map(|score| Hit {
+                target: Target::Template(ix),
+                score,
+            })
+        })
+        .collect();
+    // Stable sort, so an empty query (all scores 0) keeps the given order.
     hits.sort_by(|a, b| b.score.cmp(&a.score));
     hits.truncate(limit);
     hits
@@ -289,6 +316,34 @@ mod tests {
         let hits = search(&pages(), "  ", 2);
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| matches!(h.target, Target::Page(_))));
+    }
+
+    #[test]
+    fn insert_template_is_a_command() {
+        let hits = search(&pages(), "insert template", 10);
+        assert_eq!(hits[0].target, Target::Command(Command::InsertTemplate));
+    }
+
+    #[test]
+    fn template_search_lists_all_then_filters() {
+        let names = ["Book notes", "Daily review", "Meeting"];
+        let all: Vec<Target> = search_templates(&names, "", 10)
+            .into_iter()
+            .map(|h| h.target)
+            .collect();
+        assert_eq!(
+            all,
+            [
+                Target::Template(0),
+                Target::Template(1),
+                Target::Template(2)
+            ]
+        );
+        let daily = search_templates(&names, "daily", 10);
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].target, Target::Template(1));
+        assert!(search_templates(&names, "zzz", 10).is_empty());
+        assert_eq!(search_templates(&names, "", 2).len(), 2);
     }
 
     #[test]
