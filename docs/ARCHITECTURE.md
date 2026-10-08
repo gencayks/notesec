@@ -920,6 +920,17 @@ that mutate, and data races are essentially impossible.
     highlight, and it uses the editor's own selection, so there is no
     extra state to clear. Searching scans every block on each keystroke;
     like backlinks, an index can come later if it is ever slow.
+35. **"Linked from" covers block references too, and is always shown.**
+    `model::backlinks` takes the page (an index) instead of a title, so
+    besides `[[Title]]` and `#Title` it can also match `((id))` references
+    to any of that page's blocks; a block that does both is listed once,
+    and the page's own blocks never count. Every page ends with the
+    "Linked from" section: a page row per linking page (click opens it)
+    and a row per linking block (click opens its page and unfolds down to
+    it), with the page and reference counts, or "No other page links here
+    yet." The block rows show reading text (`DisplayBlock::with_refs`), so
+    a block reference reads as the text it points at, not `((uuid))`. It
+    is still a full scan per render, as before.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

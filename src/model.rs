@@ -269,27 +269,39 @@ pub struct BacklinkGroup {
     pub blocks: Vec<usize>,
 }
 
-/// Find every block, on any *other* page, that contains `[[title]]`.
+/// Find every block, on any *other* page, that links to page `target`
+/// (an index into `pages`): with `[[Title]]` or `#Title`, or with a block
+/// reference `((id))` to one of its blocks. A block that does both is
+/// listed once.
 ///
 /// Title matching ignores case, like page lookup does. Groups come back in the
 /// order of `pages`, and blocks in document order. A page's links to itself
-/// are not backlinks and are skipped.
-pub fn backlinks(pages: &[Page], title: &str) -> Vec<BacklinkGroup> {
-    let wanted = title.to_lowercase();
+/// (including references to its own blocks) are not backlinks and are
+/// skipped.
+pub fn backlinks(pages: &[Page], target: usize) -> Vec<BacklinkGroup> {
+    let Some(target_page) = pages.get(target) else {
+        return Vec::new();
+    };
+    let wanted = target_page.title.to_lowercase();
+    let ids: std::collections::HashSet<Uuid> = target_page.blocks.iter().map(|b| b.id).collect();
+    let links_here = |content: &str| {
+        parse_references(content)
+            .iter()
+            .any(|r| r.target.to_lowercase() == wanted)
+            || parse_block_refs(content)
+                .iter()
+                .any(|(_, id)| ids.contains(id))
+    };
     let mut groups = Vec::new();
     for (page_ix, page) in pages.iter().enumerate() {
-        if page.title.to_lowercase() == wanted {
+        if page_ix == target || page.title.to_lowercase() == wanted {
             continue;
         }
         let blocks: Vec<usize> = page
             .blocks
             .iter()
             .enumerate()
-            .filter(|(_, b)| {
-                parse_references(&b.content)
-                    .iter()
-                    .any(|r| r.target.to_lowercase() == wanted)
-            })
+            .filter(|(_, b)| links_here(&b.content))
             .map(|(i, _)| i)
             .collect();
         if !blocks.is_empty() {
@@ -1252,7 +1264,7 @@ mod tests {
             Page::from_markdown("C", false, "- [[Other]]\n  - deep [[ TARGET ]]\n"),
         ];
         assert_eq!(
-            backlinks(&pages, "Target"),
+            backlinks(&pages, 1),
             vec![
                 BacklinkGroup {
                     page: 0,
@@ -1264,7 +1276,39 @@ mod tests {
                 },
             ]
         );
-        assert!(backlinks(&pages, "Nobody").is_empty());
+        assert!(backlinks(&pages, 2).is_empty());
+        assert!(backlinks(&pages, 99).is_empty());
+    }
+
+    #[test]
+    fn backlinks_include_block_references_once() {
+        let id = "6f9b2c1e-0000-4000-8000-000000000001";
+        let pages = vec![
+            Page::from_markdown(
+                "Target",
+                false,
+                &format!("- the plan\n  id:: {id}\n- own (({id}))\n"),
+            ),
+            Page::from_markdown("A", false, &format!("- see (({id}))\n- none\n")),
+            // A wikilink and a block reference in one block: listed once.
+            Page::from_markdown("B", false, &format!("- [[Target]] and (({id}))\n")),
+            // A reference to a block that isn't on Target.
+            Page::from_markdown("C", false, "- ((6f9b2c1e-0000-4000-8000-000000000002))\n"),
+        ];
+        assert_eq!(pages[0].blocks[0].id.to_string(), id);
+        assert_eq!(
+            backlinks(&pages, 0),
+            vec![
+                BacklinkGroup {
+                    page: 1,
+                    blocks: vec![0]
+                },
+                BacklinkGroup {
+                    page: 2,
+                    blocks: vec![0]
+                },
+            ]
+        );
     }
 
     fn refs(text: &str) -> Vec<(String, bool)> {
@@ -1356,7 +1400,7 @@ mod tests {
             Page::from_markdown("Target", false, "- x\n"),
         ];
         assert_eq!(
-            backlinks(&pages, "Target"),
+            backlinks(&pages, 1),
             vec![BacklinkGroup {
                 page: 0,
                 blocks: vec![0]

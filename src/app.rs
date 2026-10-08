@@ -527,6 +527,9 @@ pub struct NoteSec {
     /// tests can find where a displayed character is on screen.
     #[cfg(test)]
     reading_layouts: Vec<(usize, gpui::TextLayout)>,
+    /// The "Linked from" rows' text from the last render, for tests.
+    #[cfg(test)]
+    backlink_texts: Vec<String>,
     /// Monospace font for code blocks: the first of `MONO_FONTS` installed.
     mono_font: Option<SharedString>,
     /// The code block (block id, its number in the block) under the mouse;
@@ -629,6 +632,8 @@ impl NoteSec {
             last_bounds: None,
             #[cfg(test)]
             reading_layouts: Vec::new(),
+            #[cfg(test)]
+            backlink_texts: Vec::new(),
             mono_font,
             hovered_code: None,
             copied_code: None,
@@ -5411,20 +5416,28 @@ impl Render for NoteSec {
             self.reading_layouts = reading_layouts;
         }
 
-        // --- Backlinks: blocks on other pages that link here ----------------
+        // --- Linked from: blocks on other pages that link here ---------------
         // Recomputed every frame. That is a scan of every block, which is fine
         // for a personal graph; an index can replace it if it ever shows up in
         // a profile.
-        let groups = backlinks(&self.pages, &page.title);
+        let groups = backlinks(&self.pages, self.selected);
         let total: usize = groups.iter().map(|g| g.blocks.len()).sum();
+        // Blocks are shown as in reading view, so a block reference reads as
+        // the text it points at rather than `((uuid))`.
+        let pages = &self.pages;
+        let resolve =
+            |id: Uuid| find_block(pages, id).map(|(p, b)| pages[p].blocks[b].content.clone());
         let mut backlink_items: Vec<AnyElement> = Vec::new();
+        #[cfg(test)]
+        let mut backlink_texts = Vec::new();
         let mut n: usize = 0; // running index over all references, for ids
-        for group in &groups {
+        for (g, group) in groups.iter().enumerate() {
             let source = &self.pages[group.page];
             let source_title = source.title.clone();
             backlink_items.push(
                 div()
                     .id(("backlink-page", group.page))
+                    .debug_selector(move || format!("linked-page-{g}"))
                     .mt_2()
                     .text_color(theme.accent)
                     .cursor_pointer()
@@ -5437,6 +5450,9 @@ impl Render for NoteSec {
             );
             for &block_ix in &group.blocks {
                 let title = source_title.clone();
+                let text = DisplayBlock::with_refs(&source.blocks[block_ix].content, &resolve).text;
+                #[cfg(test)]
+                backlink_texts.push(text.clone());
                 backlink_items.push(
                     div()
                         .id(("backlink", n))
@@ -5453,27 +5469,51 @@ impl Render for NoteSec {
                                 this.reveal(block_ix);
                             }
                         }))
-                        .child(source.blocks[block_ix].content.clone())
+                        .child(text)
                         .into_any_element(),
                 );
                 n += 1;
             }
         }
-        let backlinks_panel = (total > 0).then(|| {
-            div()
-                .id("backlinks")
-                .mt_8()
-                .pt_4()
-                .border_t_1()
-                .border_color(theme.border)
-                .flex()
-                .flex_col()
-                .child(div().text_color(theme.muted).child(format!(
-                    "{total} LINKED REFERENCE{}",
-                    if total == 1 { "" } else { "S" }
-                )))
-                .children(backlink_items)
-        });
+        #[cfg(test)]
+        {
+            self.backlink_texts = backlink_texts;
+        }
+        // Every page has the section; with nothing linking here it says so.
+        let pages_count = groups.len();
+        let backlinks_panel = div()
+            .id("backlinks")
+            .debug_selector(|| "linked-from".to_string())
+            .mt_8()
+            .pt_4()
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().text_color(theme.text).child("Linked from"))
+                    .when(total > 0, |d| {
+                        d.child(div().text_color(theme.muted).child(format!(
+                            "{pages_count} page{}, {total} reference{}",
+                            if pages_count == 1 { "" } else { "s" },
+                            if total == 1 { "" } else { "s" }
+                        )))
+                    }),
+            )
+            .when(total == 0, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "linked-from-empty".to_string())
+                        .mt_1()
+                        .text_color(theme.muted)
+                        .child("No other page links here yet."),
+                )
+            })
+            .children(backlink_items);
 
         let main = div()
             .id("main")
@@ -5549,7 +5589,7 @@ impl Render for NoteSec {
                 .absolute()
                 .size_0()
             })
-            .children(backlinks_panel)
+            .child(backlinks_panel)
             // Empty space below the blocks: clicking it leaves edit mode.
             .child(
                 div()
@@ -10997,6 +11037,61 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.pages[app.selected].title, today_title());
             assert_eq!(app.editing, Some(0));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- "Linked from" -------------------------------------------------------
+
+    #[gpui::test]
+    fn linked_from_lists_wikilinks_and_block_references(cx: &mut TestAppContext) {
+        let id = "6f9b2c1e-0000-4000-8000-0000000000aa";
+        let test = format!("- the plan\n  id:: {id}\n");
+        let alpha = format!("- see (({id})) now\n- unrelated\n");
+        let beta = format!("- [[Test]] and (({id}))\n- also [[test]]\n");
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "linked-from",
+            &[
+                ("Test", test.as_str()),
+                ("Alpha", alpha.as_str()),
+                ("Beta", beta.as_str()),
+                ("Gamma", "- nothing here\n"),
+            ],
+            "Test",
+        );
+        assert!(has(cx, "linked-from"));
+        assert!(!has(cx, "linked-from-empty"));
+        // Alpha's block reference, then Beta's two blocks (the one with
+        // both kinds of link is listed once), shown as reading text.
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.backlink_texts,
+                vec!["see the plan now", "[[Test]] and the plan", "also [[test]]"]
+            );
+        });
+        assert!(has(cx, "linked-page-0") && has(cx, "linked-page-1"));
+        assert!(!has(cx, "linked-page-2"));
+        assert!(has(cx, "backlink-2") && !has(cx, "backlink-3"));
+
+        // A page row opens that page...
+        let r = cx.debug_bounds("linked-page-1").unwrap();
+        cx.simulate_click(r.center(), Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Beta")
+        });
+        // ...which nothing links to: the section says so.
+        assert!(has(cx, "linked-from") && has(cx, "linked-from-empty"));
+        view.update(cx, |app, _| assert!(app.backlink_texts.is_empty()));
+
+        // Back on Test, a block-reference row opens the referencing page.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("Test");
+        cx.simulate_keystrokes("enter");
+        let r = cx.debug_bounds("backlink-0").unwrap();
+        cx.simulate_click(r.center(), Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Alpha")
         });
         let _ = std::fs::remove_dir_all(dir);
     }
