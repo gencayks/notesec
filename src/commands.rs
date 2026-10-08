@@ -87,6 +87,7 @@ commands! {
     NewPage => "New page", ["create", "add page"], Nothing;
     OpenToday => "Open today's journal", ["today", "daily", "journal"], Nothing;
     OpenAgenda => "Open agenda", ["tasks", "todo", "scheduled", "deadline"], Nothing;
+    SearchAllPages => "Search all pages", ["global search", "full text", "find in pages"], Nothing;
     RenamePage => "Rename current page", ["title", "name"], Page;
     DeletePage => "Delete current page", ["remove", "trash"], Page;
     CopyPageTitle => "Copy page title", ["clipboard", "name"], Page;

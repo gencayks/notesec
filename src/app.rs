@@ -17,7 +17,7 @@ use crate::model::{
     backlinks, cycle_task, find_block, parse_block_refs, parse_query, parse_references, tag_counts,
     tag_query, BlockKind, Page, TaskState,
 };
-use crate::search::{search, search_blocks, search_templates, Hit, Target};
+use crate::search::{search, search_blocks, search_templates, search_text, snippet, Hit, Target};
 use crate::state::UiState;
 use crate::storage::{today_title, validate_title, Storage, Template};
 use crate::table::{parse_table, Align};
@@ -72,6 +72,7 @@ actions!(
         NextTab,
         PrevTab,
         ToggleSearch,
+        SearchAllPages,
         NewPage,
         OpenToday,
         Undo,
@@ -167,6 +168,7 @@ pub fn shortcuts() -> Vec<Shortcut> {
     vec![
         // Global (no context): work whether or not a block is being edited.
         s("ctrl-k",         ToggleSearch,  None, Navigation, "Search pages, blocks and commands"),
+        s("ctrl-shift-f",   SearchAllPages, None, Navigation, "Search the text of every page and journal"),
         s("ctrl-j",         OpenToday,     None, Navigation, "Open today's journal"),
         s("ctrl-n",         NewPage,       None, Navigation, "New page"),
         s("up",             Up,            ed,   Navigation, "Block above / below (or palette result)"),
@@ -315,6 +317,12 @@ enum Nav {
 /// come on top of these with an empty query).
 const MAX_RESULTS: usize = 12;
 
+/// How many results global search lists (titles first, then lines).
+const MAX_TEXT_RESULTS: usize = 100;
+
+/// Longest snippet (in characters) a global search result shows.
+const SNIPPET_CHARS: usize = 90;
+
 /// Height of the palette's scrolling result list.
 const PALETTE_LIST_HEIGHT: f32 = 440.0;
 
@@ -338,6 +346,10 @@ struct SearchState {
     /// The result list scrolls (an empty query lists every command); arrow
     /// keys keep the highlighted row in view through this.
     scroll: ScrollHandle,
+    /// Global search (Ctrl+Shift+F): the same overlay, but the results are
+    /// `search_text`'s exact matches in titles and text, not fuzzy pages,
+    /// blocks and commands.
+    global: bool,
 }
 
 const MAX_HISTORY: usize = 100;
@@ -795,6 +807,7 @@ impl NoteSec {
             resume: None,
             templates: Some(self.storage.load_templates()),
             scroll: ScrollHandle::new(),
+            global: false,
         });
         cx.notify();
     }
@@ -837,6 +850,7 @@ impl NoteSec {
                 let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
                 search_templates(&names, &query.text, MAX_RESULTS)
             }
+            Some(s) if s.global => search_text(&self.pages, &s.query.text, MAX_TEXT_RESULTS),
             Some(s) => search(
                 &self.pages,
                 &self.available_commands(),
@@ -883,6 +897,36 @@ impl NoteSec {
             resume,
             templates: None,
             scroll: ScrollHandle::new(),
+            global: false,
+        });
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+F: open global search, or close it if it is open. From the
+    /// Ctrl-K palette it switches over (the query starts empty).
+    fn search_all_pages(
+        &mut self,
+        _: &SearchAllPages,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search.as_ref().is_some_and(|s| s.global) {
+            self.close_search(cx);
+            return;
+        }
+        self.stop_edit(cx);
+        self.settings = None;
+        self.page_menu = None;
+        self.shortcuts_open = false;
+        self.search = Some(SearchState {
+            query: EditorState::default(),
+            selected: 0,
+            insert_after: None,
+            resume: None,
+            templates: None,
+            scroll: ScrollHandle::new(),
+            global: true,
         });
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -1063,6 +1107,26 @@ impl NoteSec {
                 self.navigate(&title, Nav::Tab, cx);
                 if block < self.pages[self.selected].blocks.len() {
                     self.start_edit(block, window, cx);
+                }
+            }
+            // Edit the block with the match selected, so it shows highlighted
+            // (and typing replaces it, as with any selection).
+            Target::Match {
+                page,
+                block,
+                start,
+                end,
+            } => {
+                let title = self.pages[page].title.clone();
+                self.navigate(&title, Nav::Tab, cx);
+                let blocks = &self.pages[self.selected].blocks;
+                if block < blocks.len() {
+                    let valid = blocks[block].content.get(start..end).is_some();
+                    self.start_edit(block, window, cx);
+                    if valid {
+                        self.editor.anchor = Some(start);
+                        self.editor.cursor = end;
+                    }
                 }
             }
             // Keeps the palette open, now listing templates (after the
@@ -5549,6 +5613,40 @@ impl Render for NoteSec {
                                 ),
                                 "template".into(),
                             ),
+                            // Global search: the page, then the matching line
+                            // with the match in bold accent.
+                            Target::Match {
+                                page,
+                                block,
+                                start,
+                                end,
+                            } => {
+                                let content = &self.pages[page].blocks[block].content;
+                                let (text, range) = snippet(content, start..end, SNIPPET_CHARS);
+                                let bold = HighlightStyle {
+                                    color: Some(theme.accent.into()),
+                                    font_weight: Some(FontWeight::BOLD),
+                                    ..Default::default()
+                                };
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_color(theme.muted)
+                                            .child(self.pages[page].title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .debug_selector(move || format!("snippet-{i}"))
+                                            .truncate()
+                                            .text_color(theme.text)
+                                            .child(
+                                                StyledText::new(text)
+                                                    .with_highlights([(range, bold)]),
+                                            ),
+                                    )
+                            }
                         };
                         let header = headers[i].map(|title| {
                             div()
@@ -5582,11 +5680,15 @@ impl Render for NoteSec {
             let no_results = rows.is_empty();
             // In template mode: a heading, and a hint if there are no templates.
             let picking_templates = templates.is_some();
+            let global = state.global;
             let empty_message = match templates {
                 Some([]) => format!(
                     "No templates yet: add .md files to {}",
                     self.storage.templates_dir().display()
                 ),
+                _ if global && state.query.text.trim().is_empty() => {
+                    "Type to search the text of every page and journal".to_string()
+                }
                 _ => "No results".to_string(),
             };
 
@@ -5626,6 +5728,16 @@ impl Render for NoteSec {
                                     .pt_1()
                                     .text_color(theme.muted)
                                     .child("Insert template"),
+                            )
+                        })
+                        .when(global, |d| {
+                            d.child(
+                                div()
+                                    .debug_selector(|| "global-search-heading".to_string())
+                                    .px_3()
+                                    .pt_1()
+                                    .text_color(theme.muted)
+                                    .child("Search all pages"),
                             )
                         })
                         .child(
@@ -5775,6 +5887,10 @@ impl Render for NoteSec {
                             hint(&ToggleSearch),
                             "search pages, blocks and commands",
                         ))
+                        .child(hint_row(
+                            hint(&SearchAllPages),
+                            "search the text of every page",
+                        ))
                         .child(hint_row(hint(&NewPage), "new page"))
                         .child(hint_row(hint(&ToggleGraph), "graph view"))
                         .child(hint_row(hint(&ShowShortcuts), "keyboard shortcuts"))
@@ -5865,6 +5981,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_move_block_up))
             .on_action(cx.listener(Self::on_move_block_down))
             .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(Self::search_all_pages))
             .on_action(cx.listener(Self::on_new_page))
             .on_action(cx.listener(Self::on_open_today))
             .on_action(cx.listener(Self::on_undo))
@@ -10742,6 +10859,145 @@ mod tests {
         let (day, items) = &agenda.upcoming[0];
         assert_eq!(*day, chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap());
         assert_eq!(items[0].text, "pay rent");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- global search (Ctrl+Shift+F) -----------------------------------------
+
+    fn global_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- hello\n"),
+            ("Recipes", "- pasta\n- bread\n  needs Flour and water\n"),
+            ("Flour", "- types of flour\n"),
+        ]
+    }
+
+    /// The current global search results as (page title, matched text);
+    /// the matched text is `None` for a title hit.
+    fn text_hits(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(String, Option<String>)> {
+        view.update(cx, |app, _| {
+            app.search_results()
+                .iter()
+                .map(|h| match h.target {
+                    Target::Page(p) => (app.pages[p].title.clone(), None),
+                    Target::Match {
+                        page,
+                        block,
+                        start,
+                        end,
+                    } => (
+                        app.pages[page].title.clone(),
+                        Some(app.pages[page].blocks[block].content[start..end].to_string()),
+                    ),
+                    other => panic!("not a global search result: {other:?}"),
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn ctrl_shift_f_finds_text_everywhere_and_selects_the_match(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "global-search", &global_pages(), "Test");
+        // Opening it saves the block being edited, like the palette.
+        click_block(cx, 0);
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("ctrl-shift-f");
+        view.update(cx, |app, _| {
+            assert!(app.search.as_ref().is_some_and(|s| s.global));
+            assert_eq!(app.editing, None);
+        });
+        assert_eq!(file(&dir), "- hello!\n");
+        assert!(has(cx, "global-search-heading"));
+        assert!(text_hits(&view, cx).is_empty(), "nothing before typing");
+
+        // Title match first, then each matching line, ignoring case.
+        cx.simulate_input("flour");
+        assert_eq!(
+            text_hits(&view, cx),
+            vec![
+                ("Flour".to_string(), None),
+                ("Flour".to_string(), Some("flour".to_string())),
+                ("Recipes".to_string(), Some("Flour".to_string())),
+            ]
+        );
+        assert!(has(cx, "snippet-1") && has(cx, "snippet-2"));
+        assert!(!has(cx, "snippet-0"), "a title hit has no snippet");
+
+        // Enter on a line opens its page and selects the match in the block.
+        cx.simulate_keystrokes("down down enter");
+        view.update(cx, |app, _| {
+            assert!(app.search.is_none());
+            assert_eq!(app.pages[app.selected].title, "Recipes");
+            assert_eq!(app.editing, Some(1));
+            let selected = app.editor.selection().unwrap();
+            assert_eq!(&app.editor.text[selected], "Flour");
+        });
+        // It is a real selection: typing replaces it.
+        cx.simulate_input("Rye");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Recipes")).unwrap(),
+            "- pasta\n- bread\n  needs Rye and water\n"
+        );
+
+        // A title hit just opens the page.
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.simulate_input("FLOUR");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Flour");
+            assert_eq!(app.editing, None);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn global_search_opens_closes_and_comes_from_the_palette(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "global-toggle", &global_pages(), "Test");
+        let global = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| app.search.as_ref().map(|s| s.global))
+        };
+        cx.simulate_keystrokes("ctrl-shift-f");
+        assert_eq!(global(&view, cx), Some(true));
+        cx.simulate_keystrokes("ctrl-shift-f");
+        assert_eq!(global(&view, cx), None, "the key closes it again");
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.simulate_input("zzz");
+        assert!(text_hits(&view, cx).is_empty());
+        cx.simulate_keystrokes("escape");
+        assert_eq!(global(&view, cx), None);
+
+        // From the Ctrl-K palette: the key switches over, and so does the
+        // command.
+        cx.simulate_keystrokes("ctrl-k");
+        assert_eq!(global(&view, cx), Some(false));
+        cx.simulate_keystrokes("ctrl-shift-f");
+        assert_eq!(global(&view, cx), Some(true));
+        cx.simulate_keystrokes("escape");
+        run_in_palette(cx, "search all pages");
+        assert_eq!(global(&view, cx), Some(true));
+        assert!(has(cx, "global-search-heading"));
+        cx.simulate_keystrokes("escape");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn global_search_includes_journals(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_with_journal(cx, "global-journal", "- met Ada at the cafe\n");
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.simulate_input("ada");
+        assert_eq!(
+            text_hits(&view, cx),
+            vec![(today_title(), Some("Ada".to_string()))]
+        );
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, today_title());
+            assert_eq!(app.editing, Some(0));
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 }
