@@ -107,16 +107,19 @@ pub enum Command {
     ToggleGraph,
     /// Switches the palette to a list of templates (see `search_templates`).
     InsertTemplate,
+    /// Opens the settings panel.
+    OpenSettings,
 }
 
 impl Command {
-    pub const ALL: [Command; 6] = [
+    pub const ALL: [Command; 7] = [
         Command::ToggleTheme,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
         Command::ResetFontSize,
         Command::ToggleGraph,
         Command::InsertTemplate,
+        Command::OpenSettings,
     ];
 
     pub fn label(self) -> &'static str {
@@ -127,7 +130,31 @@ impl Command {
             Command::ResetFontSize => "Reset font size",
             Command::ToggleGraph => "Toggle graph view",
             Command::InsertTemplate => "Insert template",
+            Command::OpenSettings => "Open settings",
         }
+    }
+
+    /// Other words that find the command. They rank below label matches
+    /// (see `KEYWORD_PENALTY`), so "theme" still puts "Toggle dark/light
+    /// theme" first and "Open settings" after it.
+    pub fn keywords(self) -> &'static [&'static str] {
+        match self {
+            Command::OpenSettings => &["preferences", "theme", "font"],
+            _ => &[],
+        }
+    }
+
+    /// How well `query` matches this command: its label, or failing that
+    /// (or if better) one of its keywords at a penalty.
+    fn score(self, query: &str) -> Option<i32> {
+        let label = fuzzy_score(query, self.label());
+        let keyword = self
+            .keywords()
+            .iter()
+            .filter_map(|k| fuzzy_score(query, k))
+            .max()
+            .map(|score| score - KEYWORD_PENALTY);
+        label.max(keyword)
     }
 }
 
@@ -155,6 +182,8 @@ pub struct Hit {
 const TITLE_BONUS: i32 = 25;
 /// Commands rank just below title matches but above block text.
 const COMMAND_BONUS: i32 = 20;
+/// Taken off a command's score when only one of its keywords matched.
+const KEYWORD_PENALTY: i32 = 40;
 
 /// Search all pages. Returns at most `limit` hits, best first.
 ///
@@ -173,7 +202,7 @@ pub fn search(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
 
     let mut hits = Vec::new();
     for command in Command::ALL {
-        if let Some(score) = fuzzy_score(query, command.label()) {
+        if let Some(score) = command.score(query) {
             hits.push(Hit {
                 target: Target::Command(command),
                 score: score + COMMAND_BONUS,
@@ -322,6 +351,26 @@ mod tests {
     fn insert_template_is_a_command() {
         let hits = search(&pages(), "insert template", 10);
         assert_eq!(hits[0].target, Target::Command(Command::InsertTemplate));
+    }
+
+    #[test]
+    fn settings_command_is_found_by_its_keywords() {
+        let top = |q: &str| search(&pages(), q, 10)[0].target;
+        assert_eq!(top("settings"), Target::Command(Command::OpenSettings));
+        assert_eq!(top("open settings"), Target::Command(Command::OpenSettings));
+        assert_eq!(top("preferences"), Target::Command(Command::OpenSettings));
+        for q in ["theme", "font"] {
+            let targets: Vec<Target> = search(&pages(), q, 10)
+                .into_iter()
+                .map(|h| h.target)
+                .collect();
+            assert!(
+                targets.contains(&Target::Command(Command::OpenSettings)),
+                "{q}"
+            );
+        }
+        // A keyword match ranks below a label match.
+        assert_eq!(top("theme"), Target::Command(Command::ToggleTheme));
     }
 
     #[test]

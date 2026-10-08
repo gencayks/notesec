@@ -5,7 +5,7 @@
 //! stops (Escape, click elsewhere, switching pages) the text is written back to
 //! the block and the page is saved to disk.
 
-use crate::config::Config;
+use crate::config::{Config, ThemeKind};
 use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
@@ -64,6 +64,7 @@ actions!(
         IncreaseFont,
         DecreaseFont,
         ResetFont,
+        OpenSettings,
         Quit,
     ]
 );
@@ -94,6 +95,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-b", Bold, ctx),
         KeyBinding::new("ctrl-i", Italic, ctx),
         KeyBinding::new("ctrl-enter", CycleTask, ctx),
+        // While the settings panel is open the root's key context is
+        // "Settings" instead, so Esc closes the panel.
+        KeyBinding::new("escape", Escape, Some("Settings")),
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-n", NewPage, None),
@@ -109,6 +113,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-+", IncreaseFont, None),
         KeyBinding::new("ctrl--", DecreaseFont, None),
         KeyBinding::new("ctrl-0", ResetFont, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -143,6 +148,16 @@ struct SearchState {
 }
 
 const MAX_HISTORY: usize = 100;
+
+/// Height of the scrollable font list in the settings panel.
+const FONT_LIST_HEIGHT: f32 = 220.0;
+
+/// State of the settings panel while it is open.
+struct SettingsState {
+    /// Installed font families (`TextSystem::all_font_names`, which sorts and
+    /// dedupes), read once when the panel opens rather than on every frame.
+    fonts: Vec<String>,
+}
 
 /// The "/" block-type menu while it is open (see `editor::SlashMenu`).
 struct SlashState {
@@ -187,6 +202,8 @@ pub struct NoteSec {
     search: Option<SearchState>,
     /// `Some` while the "/" block-type menu is open on the edited block.
     slash: Option<SlashState>,
+    /// `Some` while the settings panel is open.
+    settings: Option<SettingsState>,
     /// True between a mouse-down in the edited block and the mouse-up: mouse
     /// moves in between extend the selection.
     selecting: bool,
@@ -257,16 +274,10 @@ impl NoteSec {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
-        // Only use the configured font if it is actually installed; GPUI would
-        // otherwise fall back silently and the user would not know why.
-        let font_family = config.font_family.clone().and_then(|family| {
-            if cx.text_system().all_font_names().contains(&family) {
-                Some(SharedString::from(family))
-            } else {
-                eprintln!("notesec: font {family:?} is not installed; using the system font");
-                None
-            }
-        });
+        let font_family = config
+            .font_family
+            .as_deref()
+            .and_then(|family| installed_font(family, cx));
 
         let state = UiState::load(storage.root());
 
@@ -283,6 +294,7 @@ impl NoteSec {
             editor: EditorState::default(),
             search: None,
             slash: None,
+            settings: None,
             selecting: false,
             collapsed: HashSet::new(),
             undo_stack: Vec::new(),
@@ -351,12 +363,60 @@ impl NoteSec {
         cx.notify();
     }
 
-    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        self.config.theme = self.config.theme.toggled();
-        self.theme = Theme::from_kind(self.config.theme);
+    /// Switch to theme `kind`, apply it right away and save it.
+    fn set_theme(&mut self, kind: ThemeKind, cx: &mut Context<Self>) {
+        if self.config.theme == kind {
+            return;
+        }
+        self.config.theme = kind;
+        self.theme = Theme::from_kind(kind);
         self.save_config();
         self.sync_graph_style(cx);
         cx.notify();
+    }
+
+    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        self.set_theme(self.config.theme.toggled(), cx);
+    }
+
+    /// Use font `family` (`None`: the system UI font), apply it right away
+    /// and save it. A family that isn't installed is still saved, but the
+    /// system font is used, as at startup.
+    fn set_font_family(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+        let family = family.filter(|f| !f.trim().is_empty());
+        if self.config.font_family == family {
+            return;
+        }
+        self.font_family = family.as_deref().and_then(|f| installed_font(f, cx));
+        self.config.font_family = family;
+        self.save_config();
+        self.sync_graph_style(cx);
+        cx.notify();
+    }
+
+    // --- settings panel --------------------------------------------------------
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        // Save the edited block and close the palette: the panel covers both.
+        self.stop_edit(cx);
+        self.close_search(cx);
+        let fonts = cx.text_system().all_font_names();
+        self.settings = Some(SettingsState { fonts });
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings = None;
+        cx.notify();
+    }
+
+    /// Ctrl-, opens the panel, or closes it if it is already open.
+    fn on_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.close_settings(cx);
+        } else {
+            self.open_settings(cx);
+        }
     }
 
     fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -381,6 +441,7 @@ impl NoteSec {
             Command::ResetFontSize => self.reset_font_size(cx),
             Command::ToggleGraph => self.toggle_graph(cx),
             Command::InsertTemplate => self.open_template_picker(None, cx),
+            Command::OpenSettings => self.open_settings(cx),
         }
     }
 
@@ -460,6 +521,7 @@ impl NoteSec {
         // whatever block is being edited before covering it.
         let insert_after = self.editing;
         self.stop_edit(cx);
+        self.settings = None;
         self.search = Some(SearchState {
             query: EditorState::default(),
             selected: 0,
@@ -978,6 +1040,8 @@ impl NoteSec {
     }
 
     fn start_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Never edit under the settings panel (e.g. Ctrl-N while it is open).
+        self.settings = None;
         self.commit();
         self.text_history_active = false;
         self.load_editor(ix, false);
@@ -1252,7 +1316,9 @@ impl NoteSec {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() {
+        if self.settings.is_some() {
+            self.close_settings(cx);
+        } else if self.search.is_some() {
             self.close_search(cx);
         } else if self.slash.is_some() {
             self.dismiss_slash(cx);
@@ -1368,6 +1434,22 @@ fn reading_highlights(
 /// turns the title into Logseq's `journals/YYYY_MM_DD.md` file name. A failed
 /// save is reported but the page is still returned, so the user can type and
 /// the next save can retry.
+/// `family` as a font to render with, if it is installed. GPUI would
+/// otherwise fall back silently and the user would not know why.
+fn installed_font(family: &str, cx: &App) -> Option<SharedString> {
+    if cx
+        .text_system()
+        .all_font_names()
+        .iter()
+        .any(|f| f == family)
+    {
+        Some(SharedString::from(family.to_string()))
+    } else {
+        eprintln!("notesec: font {family:?} is not installed; using the system font");
+        None
+    }
+}
+
 fn create_journal(storage: &Storage, title: &str) -> Page {
     let mut page = Page::from_markdown(title, true, "- \n");
     page.blocks[0].content.clear();
@@ -1755,6 +1837,211 @@ impl Element for BlockText {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+impl NoteSec {
+    /// The settings panel (gear, Ctrl-, or "Open settings" in the palette):
+    /// a backdrop like the palette's with theme, font size and font family.
+    /// Every control applies and saves its change right away.
+    fn render_settings(&self, state: &SettingsState, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let config = &self.config;
+
+        // A selectable button; `active` highlights the current choice.
+        let button = |id: &'static str, label: SharedString, active: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(if active { theme.accent } else { theme.border })
+                .cursor_pointer()
+                .text_color(if active { theme.accent } else { theme.text })
+                .when(active, |d| d.bg(theme.selected_bg))
+                .hover(|d| d.bg(theme.selected_bg))
+                .child(label)
+        };
+        let label = |text: &'static str| div().text_color(theme.muted).child(text);
+
+        let theme_row = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .child(
+                button("theme-dark", "Dark".into(), config.theme == ThemeKind::Dark).on_click(
+                    cx.listener(|this, _e, _window, cx| this.set_theme(ThemeKind::Dark, cx)),
+                ),
+            )
+            .child(
+                button(
+                    "theme-light",
+                    "Light".into(),
+                    config.theme == ThemeKind::Light,
+                )
+                .on_click(
+                    cx.listener(|this, _e, _window, cx| this.set_theme(ThemeKind::Light, cx)),
+                ),
+            );
+
+        // The − / + buttons are dimmed at the limits (clicking them then
+        // does nothing, as `adjust_font_size` clamps).
+        let size = config.font_size;
+        let at_min = size <= crate::config::MIN_FONT_SIZE;
+        let at_max = size >= crate::config::MAX_FONT_SIZE;
+        let size_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                button("font-size-dec", "−".into(), false)
+                    .when(at_min, |d| d.text_color(theme.muted))
+                    .on_click(cx.listener(|this, _e, _window, cx| this.change_font_size(-1.0, cx))),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "font-size-value".to_string())
+                    .min_w(px(40.0))
+                    .flex()
+                    .justify_center()
+                    .child(format!("{size}")),
+            )
+            .child(
+                button("font-size-inc", "+".into(), false)
+                    .when(at_max, |d| d.text_color(theme.muted))
+                    .on_click(cx.listener(|this, _e, _window, cx| this.change_font_size(1.0, cx))),
+            )
+            .child(
+                button(
+                    "font-size-reset",
+                    "Reset".into(),
+                    size == crate::config::DEFAULT_FONT_SIZE,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| this.reset_font_size(cx))),
+            );
+
+        // Font family: "System default", then every installed family.
+        let row = |id: ElementId, selector: String, text: String, active: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || selector)
+                .flex_shrink_0()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(if active { theme.accent } else { theme.text })
+                .when(active, |d| d.bg(theme.selected_bg))
+                .hover(|d| d.bg(theme.selected_bg))
+                .child(text)
+        };
+        let current = config.font_family.as_deref();
+        let font_rows: Vec<AnyElement> = state
+            .fonts
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let family = name.clone();
+                row(
+                    ElementId::from(("font-family", i)),
+                    format!("font-family-{i}"),
+                    name.clone(),
+                    current == Some(name.as_str()),
+                )
+                .on_click(cx.listener(move |this, _e, _window, cx| {
+                    this.set_font_family(Some(family.clone()), cx)
+                }))
+                .into_any_element()
+            })
+            .collect();
+        let no_fonts = font_rows.is_empty();
+        // A configured family that isn't installed (e.g. a typo in
+        // config.toml) is kept in the file but not used; say so.
+        let missing = current.filter(|f| !state.fonts.iter().any(|name| name == f));
+        let font_list = div()
+            .id("font-family-list")
+            .h(px(FONT_LIST_HEIGHT))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.bg)
+            .child(
+                row(
+                    ElementId::from("font-family-default"),
+                    "font-family-default".to_string(),
+                    "System default".to_string(),
+                    current.is_none(),
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| this.set_font_family(None, cx))),
+            )
+            .children(font_rows)
+            .when(no_fonts, |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_color(theme.muted)
+                        .child("No installed fonts were found"),
+                )
+            });
+
+        div()
+            .id("settings-backdrop")
+            .debug_selector(|| "settings-backdrop".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(gpui::black().opacity(0.45))
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(90.0))
+            .on_click(cx.listener(|this, _e, _window, cx| this.close_settings(cx)))
+            .child(
+                // `occlude` keeps clicks inside the panel from reaching the
+                // backdrop (which would close it).
+                div()
+                    .id("settings-panel")
+                    .debug_selector(|| "settings-panel".to_string())
+                    .occlude()
+                    .w(px(460.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .child(div().font_weight(FontWeight::BOLD).child("Settings"))
+                            .child(label("Esc to close")),
+                    )
+                    .child(label("Theme"))
+                    .child(theme_row)
+                    .child(label("Font size"))
+                    .child(size_row)
+                    .child(label("Font family"))
+                    .child(font_list)
+                    .when_some(missing, |d, family| {
+                        d.child(div().text_color(theme.muted).child(format!(
+                            "\u{201c}{family}\u{201d} is not installed; using the system font"
+                        )))
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for NoteSec {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -2008,18 +2295,33 @@ impl Render for NoteSec {
                     .child("+ New page"),
             );
 
-        let sidebar = div()
+        // Settings entry, pinned under the scrolling list.
+        let settings_item = div()
+            .id("settings-gear")
+            .debug_selector(|| "settings-gear".to_string())
+            .m_2()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .cursor_pointer()
+            .text_color(theme.text)
+            .hover(|d| d.bg(theme.selected_bg))
+            .on_click(cx.listener(|this, _e, _window, cx| this.open_settings(cx)))
+            .child("Settings")
+            .child(div().text_color(theme.muted).child("Ctrl-,"));
+
+        let sidebar_list = div()
             .id("sidebar")
-            .w(px(240.0))
-            .h_full()
-            .flex_shrink_0()
+            .debug_selector(|| "sidebar".to_string())
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .gap_1()
             .p_2()
-            .bg(theme.sidebar_bg)
-            .border_r_1()
-            .border_color(theme.border)
             .overflow_y_scroll()
             .child(today_item)
             .child(graph_item)
@@ -2042,6 +2344,22 @@ impl Render for NoteSec {
                 )
                 .children(tag_rows)
             });
+        let sidebar = div()
+            .w(px(240.0))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(theme.sidebar_bg)
+            .border_r_1()
+            .border_color(theme.border)
+            .child(sidebar_list)
+            .child(
+                div()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(settings_item),
+            );
 
         // --- "/" block-type menu (shown under the edited block) -------------
         let mut slash_menu = self.slash.as_ref().map(|state| {
@@ -2507,7 +2825,13 @@ impl Render for NoteSec {
             _ => main.into_any_element(),
         };
 
+        let settings_overlay = self
+            .settings
+            .as_ref()
+            .map(|state| self.render_settings(state, cx));
+
         let is_editing = self.editing.is_some() || self.search.is_some();
+        let settings_open = self.settings.is_some();
         div()
             .size_full()
             .relative()
@@ -2520,8 +2844,12 @@ impl Render for NoteSec {
             .when_some(self.font_family.clone(), |d, family| d.font_family(family))
             .track_focus(&self.focus_handle)
             // The key context only exists while editing, which is what makes
-            // the "BlockEditor" key bindings conditional.
-            .when(is_editing, |d| d.key_context("BlockEditor"))
+            // the "BlockEditor" key bindings conditional. The settings panel
+            // takes over the keyboard context while it is open.
+            .when(settings_open, |d| d.key_context("Settings"))
+            .when(!settings_open && is_editing, |d| {
+                d.key_context("BlockEditor")
+            })
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::tab))
             .on_action(cx.listener(Self::shift_tab))
@@ -2556,9 +2884,11 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_increase_font))
             .on_action(cx.listener(Self::on_decrease_font))
             .on_action(cx.listener(Self::on_reset_font))
+            .on_action(cx.listener(Self::on_open_settings))
             .child(sidebar)
             .child(content)
             .children(overlay)
+            .children(settings_overlay)
     }
 }
 
@@ -4697,6 +5027,29 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Click `selector` in the sidebar, first scrolling the list (as a user
+    /// would) if the row is below its visible part.
+    fn click_in_sidebar(cx: &mut VisualTestContext, selector: &str) {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        let list = cx.debug_bounds("sidebar").expect("sidebar rendered");
+        let row = cx.debug_bounds(selector).expect(selector);
+        if row.bottom() > list.bottom() {
+            cx.simulate_event(ScrollWheelEvent {
+                position: list.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), list.bottom() - row.bottom() - px(8.))),
+                modifiers: Modifiers::none(),
+                touch_phase: TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+        let row = cx.debug_bounds(selector).expect(selector);
+        assert!(
+            row.bottom() <= list.bottom(),
+            "{selector} scrolled into view"
+        );
+        cx.simulate_click(row.center(), Modifiers::none());
+    }
+
     #[gpui::test]
     fn clicking_a_page_row_records_it_in_recent_and_persists(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup_pages(
@@ -4740,7 +5093,7 @@ mod tests {
 
         for title in &titles {
             let row = page_row(&view, cx, "page", title);
-            click_on(cx, &row);
+            click_in_sidebar(cx, &row);
         }
         // Reopening a page moves it to the front without duplicating it,
         // whichever route opened it (here: a search for it, via `open_page`).
@@ -4855,6 +5208,211 @@ mod tests {
             assert_eq!(app.state.recent, vec![today_title(), "Beta".to_string()]);
         });
         assert!(has(cx2, "fav-0") && has(cx2, "recent-1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- settings panel ----------------------------------------------------
+
+    fn settings_open(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> bool {
+        let open = view.update(cx, |app, _| app.settings.is_some());
+        assert_eq!(open, has(cx, "settings-panel"), "state and rendering agree");
+        open
+    }
+
+    fn config_text(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(Config::path(dir)).unwrap()
+    }
+
+    #[gpui::test]
+    fn gear_and_ctrl_comma_open_settings_and_escape_closes_them(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-open", "- hello\n");
+        assert!(!settings_open(&view, cx));
+
+        click_on(cx, "settings-gear");
+        assert!(settings_open(&view, cx));
+        cx.simulate_keystrokes("escape");
+        assert!(!settings_open(&view, cx));
+
+        // Ctrl-, saves the block being edited first, and toggles.
+        click_block(cx, 0);
+        cx.simulate_input(" world");
+        cx.simulate_keystrokes("ctrl-,");
+        assert!(settings_open(&view, cx));
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), "- hello world\n");
+        cx.simulate_keystrokes("ctrl-,");
+        assert!(!settings_open(&view, cx));
+
+        // Starting to edit (Ctrl-N) closes the panel rather than editing under it.
+        cx.simulate_keystrokes("ctrl-, ctrl-n");
+        assert!(!settings_open(&view, cx));
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn palette_command_opens_settings(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-palette", "- hi\n");
+        for query in ["settings", "preferences"] {
+            cx.simulate_keystrokes("ctrl-k");
+            cx.simulate_input(query);
+            view.update(cx, |app, _| {
+                assert_eq!(
+                    app.search_results()[0].target,
+                    Target::Command(Command::OpenSettings),
+                    "{query}"
+                );
+            });
+            cx.simulate_keystrokes("enter");
+            view.update(cx, |app, _| assert!(app.search.is_none()));
+            assert!(settings_open(&view, cx));
+            cx.simulate_keystrokes("escape");
+            assert!(!settings_open(&view, cx));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn backdrop_click_closes_settings_but_panel_clicks_do_not(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-backdrop", "- hi\n");
+        click_on(cx, "settings-gear");
+
+        let panel = cx.debug_bounds("settings-panel").unwrap();
+        cx.simulate_click(panel.origin + point(px(8.), px(8.)), Modifiers::none());
+        assert!(
+            settings_open(&view, cx),
+            "a click inside the panel keeps it open"
+        );
+
+        let backdrop = cx.debug_bounds("settings-backdrop").unwrap();
+        cx.simulate_click(backdrop.origin + point(px(20.), px(20.)), Modifiers::none());
+        assert!(!settings_open(&view, cx));
+        // The click didn't reach the sidebar underneath.
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].title.clone()),
+            "Test"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn theme_buttons_apply_immediately_and_persist(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-theme", "- hi\n");
+        click_on(cx, "settings-gear");
+
+        click_on(cx, "theme-light");
+        view.update(cx, |app, _| {
+            assert_eq!(app.config.theme, ThemeKind::Light);
+            assert_eq!(app.theme.bg, Theme::light().bg);
+        });
+        assert_eq!(saved_config(&dir).theme, ThemeKind::Light);
+        assert!(config_text(&dir).contains("theme = \"light\""));
+        assert!(settings_open(&view, cx), "the panel stays open");
+
+        click_on(cx, "theme-dark");
+        view.update(cx, |app, _| assert_eq!(app.theme.bg, Theme::dark().bg));
+        assert_eq!(saved_config(&dir).theme, ThemeKind::Dark);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn font_size_buttons_change_persist_and_clamp(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-size", "- hi\n");
+        click_on(cx, "settings-gear");
+        let size = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| app.config.font_size)
+        };
+        assert!(has(cx, "font-size-value"));
+
+        click_on(cx, "font-size-inc");
+        click_on(cx, "font-size-inc");
+        assert_eq!(size(&view, cx), 18.0);
+        assert_eq!(saved_config(&dir).font_size, 18.0);
+        click_on(cx, "font-size-dec");
+        assert_eq!(size(&view, cx), 17.0);
+        click_on(cx, "font-size-reset");
+        assert_eq!(size(&view, cx), crate::config::DEFAULT_FONT_SIZE);
+        assert_eq!(
+            saved_config(&dir).font_size,
+            crate::config::DEFAULT_FONT_SIZE
+        );
+
+        for _ in 0..10 {
+            click_on(cx, "font-size-dec");
+        }
+        assert_eq!(size(&view, cx), crate::config::MIN_FONT_SIZE);
+        assert_eq!(saved_config(&dir).font_size, crate::config::MIN_FONT_SIZE);
+        for _ in 0..30 {
+            click_on(cx, "font-size-inc");
+        }
+        assert_eq!(size(&view, cx), crate::config::MAX_FONT_SIZE);
+        assert_eq!(saved_config(&dir).font_size, crate::config::MAX_FONT_SIZE);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn font_family_choice_persists_and_system_default_removes_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-family", "- hi\n");
+        click_on(cx, "settings-gear");
+        // The test platform's text system reports no installed fonts, so the
+        // list only has "System default"...
+        assert!(has(cx, "font-family-default"));
+        assert!(!has(cx, "font-family-0"));
+        // ...so give the open panel a known list, as the real text system would.
+        view.update(cx, |app, cx| {
+            app.settings.as_mut().unwrap().fonts = vec!["Test Sans".into(), "Test Serif".into()];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(has(cx, "font-family-1") && !has(cx, "font-family-2"));
+
+        click_on(cx, "font-family-1");
+        view.update(cx, |app, _| {
+            assert_eq!(app.config.font_family.as_deref(), Some("Test Serif"));
+            // Not really installed here, so rendering keeps the system font.
+            assert_eq!(app.font_family, None);
+        });
+        assert_eq!(
+            saved_config(&dir).font_family.as_deref(),
+            Some("Test Serif")
+        );
+        assert!(config_text(&dir).contains("font_family = \"Test Serif\""));
+
+        click_on(cx, "font-family-default");
+        view.update(cx, |app, _| assert_eq!(app.config.font_family, None));
+        assert_eq!(saved_config(&dir).font_family, None);
+        assert!(
+            !config_text(&dir)
+                .lines()
+                .any(|l| l.starts_with("font_family")),
+            "only the commented-out hint is left"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn settings_from_the_panel_load_in_a_fresh_window(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-reload", "- hi\n");
+        click_on(cx, "settings-gear");
+        click_on(cx, "theme-light");
+        for _ in 0..4 {
+            click_on(cx, "font-size-inc");
+        }
+        view.update(cx, |app, cx| {
+            app.set_font_family(Some("Test Serif".into()), cx)
+        });
+
+        let storage = Storage::open(dir.clone()).unwrap();
+        let config = Config::load(&dir);
+        let (view2, cx2) = cx
+            .cx
+            .add_window_view(|window, cx| NoteSec::new(storage, config, window, cx));
+        view2.update(cx2, |app, _| {
+            assert_eq!(app.config.theme, ThemeKind::Light);
+            assert_eq!(app.theme.bg, Theme::light().bg);
+            assert_eq!(app.config.font_size, 20.0);
+            assert_eq!(app.config.font_family.as_deref(), Some("Test Serif"));
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 }

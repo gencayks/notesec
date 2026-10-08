@@ -7,8 +7,9 @@
 //! ```
 //!
 //! The file is read once at startup. The app rewrites it when you change the
-//! theme or font size (via shortcuts or the Ctrl-K palette), so hand edits to
-//! other keys survive only if they are valid ones we know about.
+//! theme, font size or font family (in the settings panel, via shortcuts, or
+//! from the Ctrl-K palette), so hand edits to other keys survive only if they
+//! are valid ones we know about.
 
 use crate::storage::write_atomic;
 use serde::{Deserialize, Serialize};

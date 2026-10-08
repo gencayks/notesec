@@ -536,6 +536,26 @@ that mutate, and data races are essentially impossible.
     records its page too. Undo/redo and `add_page` move `selected` without
     going through it, since they aren't the user opening a page. Anything
     new that opens a page (e.g. tabs) should call `show_page` or `open_page`.
+22. **Settings are an overlay in the main window, not a second window**:
+    the panel reuses the Ctrl-K palette's pattern (a dimming backdrop that
+    closes on click, an `occlude`d panel on top) and opens from the
+    "Settings" row pinned under the sidebar's scrolling list, from Ctrl-,
+    (Zed's binding), or from "Open settings" in the palette (also found by
+    "preferences", "theme" and "font": `Command::keywords` match at a
+    penalty, so a label match like "Toggle dark/light theme" still ranks
+    first). While it is open the root's key context is `Settings` instead of
+    `BlockEditor`, which is how Esc closes it; opening it saves the edited
+    block and closes the palette, and anything that starts editing (e.g.
+    Ctrl-N) closes it. Every control applies at once and writes
+    `config.toml` through one small method each (`set_theme`,
+    `change_font_size` / `reset_font_size`, `set_font_family`), which also
+    re-render and push the style into the graph view, exactly like the
+    keyboard shortcuts. The font list comes from GPUI's
+    `TextSystem::all_font_names()` (sorted and deduped by GPUI), read once
+    when the panel opens and shown in a fixed-height scrolling list after
+    "System default". Choosing "System default" removes `font_family` from
+    the file; a configured family that isn't installed is kept in the file
+    and named in the panel, but the system font is used, as at startup.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
