@@ -157,6 +157,42 @@ impl Storage {
         write_atomic(&self.path_for(page), &page.to_markdown())
     }
 
+    /// Rename `page`'s file to the one for `new_title` (same folder). The
+    /// page's current content must already be saved. `fs::rename` is atomic
+    /// on one filesystem, so a crash leaves either the old file or the new
+    /// one. Fails with `AlreadyExists` rather than overwrite another page's
+    /// file (a case-only rename of the same file is allowed). If the old
+    /// file is missing, the page is simply written under the new name.
+    pub fn rename(&self, page: &Page, new_title: &str) -> io::Result<()> {
+        let old = self.path_for(page);
+        let renamed = Page {
+            title: new_title.to_string(),
+            ..page.clone()
+        };
+        let new = self.path_for(&renamed);
+        let same_file =
+            old.to_string_lossy().to_lowercase() == new.to_string_lossy().to_lowercase();
+        if new.exists() && !same_file {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", new.display()),
+            ));
+        }
+        if old.exists() {
+            fs::rename(&old, &new)
+        } else {
+            self.save(&renamed)
+        }
+    }
+
+    /// Delete `page`'s file. A file that is already gone counts as deleted.
+    pub fn delete(&self, page: &Page) -> io::Result<()> {
+        match fs::remove_file(self.path_for(page)) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+
     /// The graph directory.
     pub fn root(&self) -> &Path {
         &self.root
@@ -174,6 +210,34 @@ impl Storage {
                 .join(format!("{}.md", filename_from_title(&page.title)))
         }
     }
+}
+
+/// Longest file name most filesystems allow, in bytes.
+const MAX_FILENAME_BYTES: usize = 255;
+
+/// Check a new page title (from Rename) and return it trimmed, or say why
+/// it can't be used. The rules follow how titles become file names here:
+/// `/` is fine (namespaces, stored as `___`), but a literal `___` would read
+/// back as `/`; control characters (newlines, NUL) don't belong in a file
+/// name; and the name must fit the filesystem's limit including the `.md`
+/// extension and the `.<name>.tmp` file that `write_atomic` writes first.
+/// Name collisions are checked by the caller, which knows the other pages.
+pub fn validate_title(title: &str) -> Result<String, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("The name can't be empty".into());
+    }
+    if title.chars().any(char::is_control) {
+        return Err("The name can't contain line breaks or control characters".into());
+    }
+    if title.contains("___") {
+        return Err("The name can't contain \"___\" (it stands for / in file names)".into());
+    }
+    let file_name = format!(".{}.md.tmp", filename_from_title(title));
+    if file_name.len() > MAX_FILENAME_BYTES {
+        return Err("The name is too long".into());
+    }
+    Ok(title.to_string())
 }
 
 /// `/` can't appear in a filename; Logseq encodes it as `___`.
@@ -293,6 +357,67 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(names, ["Book notes", "Daily review", "meeting"]);
+    }
+
+    #[test]
+    fn rename_moves_the_file_and_refuses_to_overwrite() {
+        let root = temp_root("rename");
+        let storage = Storage::open(root.clone()).unwrap();
+        let page = Page::from_markdown("Old", false, "- body\n");
+        storage.save(&page).unwrap();
+        storage
+            .save(&Page::from_markdown("Taken", false, "- other\n"))
+            .unwrap();
+
+        let err = storage.rename(&page, "Taken").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(root.join("pages/Taken.md")).unwrap(),
+            "- other\n"
+        );
+
+        // Namespaced titles use the same `___` mapping as saving.
+        storage.rename(&page, "Area/New").unwrap();
+        assert!(!root.join("pages/Old.md").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("pages/Area___New.md")).unwrap(),
+            "- body\n"
+        );
+        let titles: Vec<String> = storage.load_all().into_iter().map(|p| p.title).collect();
+        assert!(titles.contains(&"Area/New".to_string()));
+
+        // Case-only renames of the same file are allowed.
+        let renamed = Page::from_markdown("Area/New", false, "- body\n");
+        storage.rename(&renamed, "area/new").unwrap();
+        assert!(root.join("pages/area___new.md").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_removes_the_file_and_tolerates_a_missing_one() {
+        let root = temp_root("delete");
+        let storage = Storage::open(root.clone()).unwrap();
+        let journal = Page::from_markdown("2026-10-08", true, "- day\n");
+        storage.save(&journal).unwrap();
+        assert!(root.join("journals/2026_10_08.md").exists());
+        storage.delete(&journal).unwrap();
+        assert!(!root.join("journals/2026_10_08.md").exists());
+        storage.delete(&journal).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn titles_are_validated_like_file_names() {
+        assert_eq!(validate_title("  New name "), Ok("New name".to_string()));
+        assert_eq!(validate_title("Area/Sub"), Ok("Area/Sub".to_string()));
+        assert!(validate_title("   ").is_err());
+        assert!(validate_title("two\nlines").is_err());
+        assert!(validate_title("a___b").is_err());
+        // 255-byte names, counting the `.<name>.md.tmp` of an atomic save.
+        assert!(validate_title(&"x".repeat(247)).is_ok());
+        assert!(validate_title(&"x".repeat(248)).is_err());
+        // A `/` takes three bytes in the file name.
+        assert!(validate_title(&format!("{}/", "x".repeat(245))).is_err());
     }
 
     #[test]

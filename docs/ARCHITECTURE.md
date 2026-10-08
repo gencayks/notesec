@@ -607,6 +607,38 @@ that mutate, and data races are essentially impossible.
     "System default". Choosing "System default" removes `font_family` from
     the file; a configured family that isn't installed is kept in the file
     and named in the panel, but the system font is used, as at startup.
+29. **Page context menu: rename, delete, copy title** (23-28 are the blocks
+    track's): right-clicking a page row in PAGES, FAVORITES or RECENT
+    (`on_mouse_down(MouseButton::Right)`) opens a small menu at the click
+    position, placed with `anchored()` like Zed's right-click menus, over a
+    transparent full-window backdrop that closes it on any click (left or
+    right) outside; the menu panel `occlude`s so its own clicks don't reach
+    the backdrop. Esc closes it via a `PageMenu` key context. Opening it
+    saves the block being edited. The page is held by title, never index.
+    *Rename* turns the menu into a text field in place, reusing the
+    palette's `EditorState` + `BlockText` input (`active_editor` returns
+    it), with the old name selected. Enter renames, Esc cancels; a refused
+    name keeps the field open with the reason under it: empty, another
+    page's name (ignoring case, as links do; a case-only rename is fine), a
+    literal `___` (it reads back as `/`), control characters, or a file
+    name over 255 bytes counting `write_atomic`'s `.<name>.md.tmp`
+    (`storage::validate_title`). The file moves with one `fs::rename`
+    (`Storage::rename`, which uses the same title-to-file mapping as saving
+    and refuses to overwrite another file). The title, page id and blocks'
+    `page_id` change (`Page::rename`), pages re-sort, and selection, tabs
+    (`Tabs::rename`) and favorites/recent (`UiState::rename`) follow.
+    `[[links]]` to the old name are not rewritten (v1). Journals can't be
+    renamed: their name is their date and their file
+    `journals/YYYY_MM_DD.md`. *Delete* asks first in a modal (danger-styled
+    Delete, Cancel; Esc or a backdrop click cancels, Enter does nothing),
+    then removes the file (no trash, v1), the page, its tabs (with the same
+    neighbour rule as closing a tab) and its favorites/recent entries.
+    Journals can be deleted (today's comes back on Ctrl-J or at startup),
+    but the last remaining page can't: the app always has a page to show.
+    *Undo:* neither can be undone, and both clear the undo/redo history,
+    because a snapshot holds whole pages under their titles and restoring
+    one saves them all, so it would write the old file back. *Copy page
+    title* writes the title with `cx.write_to_clipboard`.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

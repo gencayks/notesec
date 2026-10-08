@@ -413,6 +413,16 @@ impl Page {
         }
     }
 
+    /// Give the page a new title. Pages are identified by title, so its id
+    /// and every block's `page_id` change with it.
+    pub fn rename(&mut self, title: &str) {
+        self.id = title.to_string();
+        self.title = title.to_string();
+        for block in &mut self.blocks {
+            block.page_id = title.to_string();
+        }
+    }
+
     /// A new page containing a single empty block, so there is something to
     /// click into. Used when a `[[link]]` points at a page that doesn't exist.
     pub fn with_empty_block(title: &str) -> Self {
@@ -765,6 +775,15 @@ fn parse_bullet(line: &str) -> Option<(usize, &str)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rename_updates_title_id_and_blocks() {
+        let mut page = super::Page::from_markdown("Old", false, "- a\n  - b\n");
+        page.rename("New");
+        assert_eq!((page.id.as_str(), page.title.as_str()), ("New", "New"));
+        assert!(page.blocks.iter().all(|b| b.page_id == "New"));
+        assert_eq!(page.to_markdown(), "- a\n  - b\n");
+    }
+
     use super::*;
 
     fn template() -> Page {

@@ -14,15 +14,15 @@ use crate::model::{
 };
 use crate::search::{search, search_templates, Command, Hit, Target};
 use crate::state::UiState;
-use crate::storage::{today_title, Storage, Template};
+use crate::storage::{today_title, validate_title, Storage, Template};
 use crate::tabs::{TabTarget, Tabs};
 use crate::ui::{block_row, favorite_star, fold_arrow, fold_badge, task_checkbox, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
-    Bounds, ClickEvent, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hsla, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels,
-    ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
+    Bounds, ClickEvent, ClipboardItem, Context, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hsla,
+    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
     UnderlineStyle, Window,
 };
 use std::collections::HashSet;
@@ -102,6 +102,9 @@ pub fn bind_keys(cx: &mut App) {
         // While the settings panel is open the root's key context is
         // "Settings" instead, so Esc closes the panel.
         KeyBinding::new("escape", Escape, Some("Settings")),
+        // Likewise "PageMenu" while a page's context menu or its delete
+        // confirmation is open (renaming uses "BlockEditor": it types).
+        KeyBinding::new("escape", Escape, Some("PageMenu")),
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-n", NewPage, None),
@@ -178,6 +181,29 @@ struct SettingsState {
     fonts: Vec<String>,
 }
 
+/// A sidebar page's right-click menu, and the rename / delete steps it
+/// leads to. The page is held by title: indices shift when pages re-sort.
+struct PageMenu {
+    title: String,
+    /// Where the right-click happened, in window coordinates.
+    position: gpui::Point<Pixels>,
+    step: MenuStep,
+}
+
+enum MenuStep {
+    /// The menu: Rename, Delete, Copy page title.
+    Menu,
+    /// Typing the new name: the menu turns into a text field in place. It
+    /// reuses `EditorState` like the palette's query box.
+    Rename {
+        editor: EditorState,
+        /// Why the last Enter was refused, shown under the field.
+        error: Option<String>,
+    },
+    /// The confirm dialog before deleting.
+    ConfirmDelete { error: Option<String> },
+}
+
 /// The "/" block-type menu while it is open (see `editor::SlashMenu`).
 struct SlashState {
     menu: SlashMenu,
@@ -223,6 +249,9 @@ pub struct NoteSec {
     slash: Option<SlashState>,
     /// `Some` while the settings panel is open.
     settings: Option<SettingsState>,
+    /// `Some` while a page's context menu (or its rename / delete step) is
+    /// open.
+    page_menu: Option<PageMenu>,
     /// True between a mouse-down in the edited block and the mouse-up: mouse
     /// moves in between extend the selection.
     selecting: bool,
@@ -320,6 +349,7 @@ impl NoteSec {
             search: None,
             slash: None,
             settings: None,
+            page_menu: None,
             selecting: false,
             collapsed: HashSet::new(),
             undo_stack: Vec::new(),
@@ -342,19 +372,51 @@ impl NoteSec {
     // --- which editor is active ----------------------------------------------
 
     /// The text editor currently receiving input: the search box while the
-    /// overlay is open, otherwise the block editor.
+    /// overlay is open, the rename field while renaming a page, otherwise
+    /// the block editor.
     fn active_editor(&self) -> &EditorState {
-        match &self.search {
-            Some(s) => &s.query,
-            None => &self.editor,
+        match (&self.search, &self.page_menu) {
+            (Some(s), _) => &s.query,
+            (
+                None,
+                Some(PageMenu {
+                    step: MenuStep::Rename { editor, .. },
+                    ..
+                }),
+            ) => editor,
+            _ => &self.editor,
         }
     }
 
     fn active_editor_mut(&mut self) -> &mut EditorState {
-        match &mut self.search {
-            Some(s) => &mut s.query,
-            None => &mut self.editor,
+        match (&mut self.search, &mut self.page_menu) {
+            (Some(s), _) => &mut s.query,
+            (
+                None,
+                Some(PageMenu {
+                    step: MenuStep::Rename { editor, .. },
+                    ..
+                }),
+            ) => editor,
+            _ => &mut self.editor,
         }
+    }
+
+    /// True while the rename field of the page menu takes the typing.
+    fn renaming(&self) -> bool {
+        matches!(
+            self.page_menu,
+            Some(PageMenu {
+                step: MenuStep::Rename { .. },
+                ..
+            })
+        )
+    }
+
+    /// The palette's query box or the rename field has the keyboard (not a
+    /// block): typing there records no undo history.
+    fn text_input_open(&self) -> bool {
+        self.search.is_some() || self.renaming()
     }
 
     // --- settings --------------------------------------------------------------
@@ -426,6 +488,7 @@ impl NoteSec {
         // Save the edited block and close the palette: the panel covers both.
         self.stop_edit(cx);
         self.close_search(cx);
+        self.page_menu = None;
         let fonts = cx.text_system().all_font_names();
         self.settings = Some(SettingsState { fonts });
         cx.notify();
@@ -535,6 +598,14 @@ impl NoteSec {
         if let Some(s) = &mut self.search {
             s.selected = 0;
         }
+        // A refused name's message goes away once the name is edited.
+        if let Some(PageMenu {
+            step: MenuStep::Rename { error, .. },
+            ..
+        }) = &mut self.page_menu
+        {
+            *error = None;
+        }
     }
 
     fn toggle_search(&mut self, _: &ToggleSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -547,6 +618,7 @@ impl NoteSec {
         let insert_after = self.editing;
         self.stop_edit(cx);
         self.settings = None;
+        self.page_menu = None;
         self.search = Some(SearchState {
             query: EditorState::default(),
             selected: 0,
@@ -636,7 +708,7 @@ impl NoteSec {
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() {
+        if self.search.is_some() || self.page_menu.is_some() {
             return;
         }
         self.close_slash_as_typing();
@@ -647,7 +719,7 @@ impl NoteSec {
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() {
+        if self.search.is_some() || self.page_menu.is_some() {
             return;
         }
         self.close_slash_as_typing();
@@ -1002,10 +1074,10 @@ impl NoteSec {
         self.apply_tab(cx);
     }
 
-    /// The Ctrl-K palette or the settings panel covers the page. Both are
-    /// modal, so the tab keys do nothing while one is open.
+    /// The Ctrl-K palette, the settings panel or a page menu covers the
+    /// page. All are modal, so the tab keys do nothing while one is open.
     fn overlay_open(&self) -> bool {
-        self.search.is_some() || self.settings.is_some()
+        self.search.is_some() || self.settings.is_some() || self.page_menu.is_some()
     }
 
     /// Ctrl+W. Ignored while an overlay is open.
@@ -1057,6 +1129,230 @@ impl NoteSec {
         }
         let ix = self.find_journal(&today).unwrap_or(0);
         self.show_page(ix, cx);
+    }
+
+    // --- page context menu: rename, delete, copy title ----------------------
+
+    /// Right-click on a sidebar page: open its menu at `position`.
+    fn open_page_menu(
+        &mut self,
+        title: String,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        // Save the edited block first: Rename and Delete act on the file.
+        self.stop_edit(cx);
+        self.page_menu = Some(PageMenu {
+            title,
+            position,
+            step: MenuStep::Menu,
+        });
+        cx.notify();
+    }
+
+    fn close_page_menu(&mut self, cx: &mut Context<Self>) {
+        if self.page_menu.take().is_some() {
+            // The rename field's layout is stale now.
+            self.last_layout = None;
+            self.last_bounds = None;
+        }
+        cx.notify();
+    }
+
+    /// Journals are named by their date (`journals/YYYY_MM_DD.md`), so only
+    /// regular pages can be renamed.
+    fn can_rename(&self, title: &str) -> bool {
+        self.find_page(title)
+            .is_some_and(|ix| !self.pages[ix].is_journal)
+    }
+
+    /// The last page can't be deleted: there is always a page to show.
+    fn can_delete(&self) -> bool {
+        self.pages.len() > 1
+    }
+
+    /// "Rename": turn the menu into a text field holding the title, all
+    /// selected so typing replaces it.
+    fn start_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(title) = self.page_menu.as_ref().map(|m| m.title.clone()) else {
+            return;
+        };
+        if !self.can_rename(&title) {
+            return;
+        }
+        let mut editor = EditorState::new(&title);
+        editor.select_home();
+        if let Some(menu) = &mut self.page_menu {
+            menu.step = MenuStep::Rename {
+                editor,
+                error: None,
+            };
+        }
+        cx.notify();
+    }
+
+    /// Enter in the rename field: rename, or show why not and stay open.
+    fn confirm_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(PageMenu {
+            title,
+            step: MenuStep::Rename { editor, .. },
+            ..
+        }) = &self.page_menu
+        else {
+            return;
+        };
+        let (old, new) = (title.clone(), editor.text.clone());
+        match self.rename_page(&old, &new, cx) {
+            Ok(()) => self.close_page_menu(cx),
+            Err(message) => {
+                if let Some(PageMenu {
+                    step: MenuStep::Rename { error, .. },
+                    ..
+                }) = &mut self.page_menu
+                {
+                    *error = Some(message);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Rename the page called `old` to `new`: its file, its title, and
+    /// everything that refers to it by title (selection, tabs, favorites,
+    /// recent). `[[links]]` to the old name are left as they are (v1).
+    /// Returns a message for the user if the name can't be used.
+    fn rename_page(&mut self, old: &str, new: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let new = validate_title(new)?;
+        let ix = self
+            .find_page(old)
+            .ok_or_else(|| "This page no longer exists".to_string())?;
+        if self.pages[ix].is_journal {
+            return Err("Journal pages are named by their date".into());
+        }
+        let old = self.pages[ix].title.clone();
+        if new == old {
+            return Ok(());
+        }
+        // Another page with that name, ignoring case like links do (a
+        // case-only rename of this page is fine).
+        if self.find_page(&new).is_some_and(|other| other != ix) {
+            return Err(format!("A page named \u{201c}{new}\u{201d} already exists"));
+        }
+        self.stop_edit(cx);
+        self.storage
+            .rename(&self.pages[ix], &new)
+            .map_err(|err| format!("Could not rename the file: {err}"))?;
+
+        let current = &self.pages[self.selected];
+        let current = (
+            if self.selected == ix {
+                new.clone()
+            } else {
+                current.title.clone()
+            },
+            current.is_journal,
+        );
+        self.pages[ix].rename(&new);
+        sort_pages(&mut self.pages);
+        self.selected = self
+            .pages
+            .iter()
+            .position(|p| p.title == current.0 && p.is_journal == current.1)
+            .unwrap_or(0);
+        self.tabs.rename(&old, &new);
+        if self.state.rename(&old, &new) {
+            self.save_state();
+        }
+        self.forget_history();
+        if self.mode == Mode::Graph {
+            self.refresh_graph(cx);
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    /// "Delete" -> the confirm dialog.
+    fn ask_delete(&mut self, cx: &mut Context<Self>) {
+        if !self.can_delete() {
+            return;
+        }
+        if let Some(menu) = &mut self.page_menu {
+            menu.step = MenuStep::ConfirmDelete { error: None };
+        }
+        cx.notify();
+    }
+
+    /// The confirm dialog's Delete button.
+    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(title) = self.page_menu.as_ref().map(|m| m.title.clone()) else {
+            return;
+        };
+        match self.delete_page(&title, cx) {
+            Ok(()) => self.close_page_menu(cx),
+            Err(message) => {
+                if let Some(PageMenu {
+                    step: MenuStep::ConfirmDelete { error },
+                    ..
+                }) = &mut self.page_menu
+                {
+                    *error = Some(message);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Delete the page called `title`: its file (no trash in v1), the page,
+    /// its tabs (the neighbour tab takes focus, as when closing a tab) and
+    /// its favorites/recent entries.
+    fn delete_page(&mut self, title: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let ix = self
+            .find_page(title)
+            .ok_or_else(|| "This page no longer exists".to_string())?;
+        if !self.can_delete() {
+            return Err("The only page can't be deleted".into());
+        }
+        self.stop_edit(cx);
+        self.storage
+            .delete(&self.pages[ix])
+            .map_err(|err| format!("Could not delete the file: {err}"))?;
+
+        let current = &self.pages[self.selected];
+        let current = (current.title.clone(), current.is_journal);
+        let removed = self.pages.remove(ix);
+        // Keep `selected` valid; if it was the deleted page, `apply_tab`
+        // below moves it to whatever the focused tab shows.
+        self.selected = self
+            .pages
+            .iter()
+            .position(|p| p.title == current.0 && p.is_journal == current.1)
+            .unwrap_or(ix.min(self.pages.len() - 1));
+        self.tabs
+            .retain(|t| !matches!(t, TabTarget::Page(p) if *p == removed.title));
+        if self.state.forget(&removed.title) {
+            self.save_state();
+        }
+        self.forget_history();
+        self.apply_tab(cx);
+        Ok(())
+    }
+
+    /// Undo snapshots hold whole pages under their titles, and restoring
+    /// one saves every page in it, so replaying a snapshot from before a
+    /// rename or delete would write the old file back. Those two actions
+    /// can't be undone (v1), and edits from before them can't either.
+    fn forget_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.text_history_active = false;
+    }
+
+    /// "Copy page title": put the title on the clipboard.
+    fn copy_page_title(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = &self.page_menu {
+            cx.write_to_clipboard(ClipboardItem::new_string(menu.title.clone()));
+        }
+        self.close_page_menu(cx);
     }
 
     // --- graph view ------------------------------------------------------------
@@ -1194,8 +1490,10 @@ impl NoteSec {
     }
 
     fn start_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        // Never edit under the settings panel (e.g. Ctrl-N while it is open).
+        // Never edit under the settings panel or a page menu (e.g. Ctrl-N
+        // while one is open).
         self.settings = None;
+        self.page_menu = None;
         self.commit();
         self.text_history_active = false;
         self.load_editor(ix, false);
@@ -1225,6 +1523,10 @@ impl NoteSec {
 
     /// Enter: split the block at the cursor; the right half becomes a new block.
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming() {
+            self.confirm_rename(cx);
+            return;
+        }
         if self.search.is_some() {
             self.confirm_search(window, cx);
             return;
@@ -1280,7 +1582,7 @@ impl NoteSec {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() {
+        if self.text_input_open() {
             self.active_editor_mut().backspace();
             self.text_changed();
             cx.notify();
@@ -1322,10 +1624,10 @@ impl NoteSec {
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
         // With the menu open, the "/query" becomes text before deleting.
         self.close_slash_as_typing();
-        if self.editing.is_some() || self.search.is_some() {
+        if self.editing.is_some() || self.text_input_open() {
             self.text_history_active = false;
             let before = self.history_state();
-            if self.active_editor_mut().delete() && self.search.is_none() {
+            if self.active_editor_mut().delete() && !self.text_input_open() {
                 self.record_state(before);
             }
             self.text_changed();
@@ -1470,7 +1772,10 @@ impl NoteSec {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.page_menu.is_some() {
+            // Closes the menu, cancels a rename or a delete.
+            self.close_page_menu(cx);
+        } else if self.settings.is_some() {
             self.close_settings(cx);
         } else if self.search.is_some() {
             self.close_search(cx);
@@ -2196,6 +2501,204 @@ impl NoteSec {
     }
 }
 
+impl NoteSec {
+    /// The page menu overlay: the right-click menu (or the rename field it
+    /// turns into) at the click position, or the delete confirmation. A
+    /// full-window backdrop closes it on any click outside (left or right);
+    /// `occlude` keeps clicks inside the panel from reaching the backdrop.
+    fn render_page_menu(&self, menu: &PageMenu, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let panel = || {
+            div()
+                .occlude()
+                .flex()
+                .flex_col()
+                .p_1()
+                .rounded_lg()
+                .bg(theme.sidebar_bg)
+                .border_1()
+                .border_color(theme.border)
+                .shadow_lg()
+        };
+
+        if let MenuStep::ConfirmDelete { error } = &menu.step {
+            // A modal like the settings panel: dimmed backdrop, centred box.
+            let title = menu.title.clone();
+            return div()
+                .id("confirm-delete-backdrop")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(gpui::black().opacity(0.45))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(160.0))
+                .on_click(cx.listener(|this, _e, _window, cx| this.close_page_menu(cx)))
+                .child(
+                    panel()
+                        .id("confirm-delete")
+                        .debug_selector(|| "confirm-delete".to_string())
+                        .w(px(420.0))
+                        .gap_2()
+                        .p_4()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::BOLD)
+                                .child(format!("Delete \u{201c}{title}\u{201d}?")),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.muted)
+                                .child("Its file is deleted from the graph. This can't be undone."),
+                        )
+                        .when_some(error.clone(), |d, error| {
+                            d.child(div().text_color(theme.danger).child(error))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("confirm-delete-cancel")
+                                        .debug_selector(|| "confirm-delete-cancel".to_string())
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(theme.selected_bg))
+                                        .on_click(cx.listener(|this, _e, _window, cx| {
+                                            this.close_page_menu(cx)
+                                        }))
+                                        .child("Cancel"),
+                                )
+                                .child(
+                                    div()
+                                        .id("confirm-delete-ok")
+                                        .debug_selector(|| "confirm-delete-ok".to_string())
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(theme.danger)
+                                        .text_color(theme.bg)
+                                        .font_weight(FontWeight::BOLD)
+                                        .cursor_pointer()
+                                        .hover(|d| d.opacity(0.85))
+                                        .on_click(cx.listener(|this, _e, _window, cx| {
+                                            this.confirm_delete(cx)
+                                        }))
+                                        .child("Delete"),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
+
+        let content = match &menu.step {
+            MenuStep::Rename { error, .. } => panel()
+                .w(px(300.0))
+                .gap_1()
+                .p_2()
+                .child(div().px_1().text_color(theme.muted).child("Rename page"))
+                .child(
+                    div()
+                        .debug_selector(|| "rename-input".to_string())
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.accent)
+                        .bg(theme.bg)
+                        .child(BlockText { app: cx.entity() }),
+                )
+                .when_some(error.clone(), |d, error| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "rename-error".to_string())
+                            .px_1()
+                            .text_color(theme.danger)
+                            .child(error),
+                    )
+                })
+                .child(
+                    div()
+                        .px_1()
+                        .text_color(theme.muted)
+                        .child("Enter to rename, Esc to cancel"),
+                )
+                .into_any_element(),
+            _ => {
+                // One menu row; a disabled one is muted and has no handler.
+                let item = |id: &'static str, label: &'static str, enabled: bool| {
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.to_string())
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .text_color(if enabled { theme.text } else { theme.muted })
+                        .when(enabled, |d| {
+                            d.cursor_pointer().hover(|d| d.bg(theme.selected_bg))
+                        })
+                        .child(label)
+                };
+                let can_rename = self.can_rename(&menu.title);
+                let can_delete = self.can_delete();
+                panel()
+                    .id("page-menu")
+                    .debug_selector(|| "page-menu".to_string())
+                    .w(px(200.0))
+                    .child(
+                        item("page-menu-rename", "Rename", can_rename).when(can_rename, |d| {
+                            d.on_click(cx.listener(|this, _e, _window, cx| this.start_rename(cx)))
+                        }),
+                    )
+                    .child(item("page-menu-delete", "Delete\u{2026}", can_delete).when(
+                        can_delete,
+                        |d| {
+                            d.text_color(theme.danger)
+                                .on_click(cx.listener(|this, _e, _window, cx| this.ask_delete(cx)))
+                        },
+                    ))
+                    .child(
+                        item("page-menu-copy", "Copy page title", true).on_click(
+                            cx.listener(|this, _e, _window, cx| this.copy_page_title(cx)),
+                        ),
+                    )
+                    .into_any_element()
+            }
+        };
+
+        div()
+            .id("page-menu-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, _window, cx| this.close_page_menu(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _e, _window, cx| this.close_page_menu(cx)),
+            )
+            // Window coordinates of the click; `anchored` flips or shifts the
+            // panel so it stays inside the window.
+            .child(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(content),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for NoteSec {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -2224,6 +2727,7 @@ impl Render for NoteSec {
             let is_favorite = self.state.is_favorite(&page.title);
             let title = page.title.clone();
             let star_title = page.title.clone();
+            let menu_title = page.title.clone();
             div()
                 // Interactive elements need a stable id; (name, index) is the idiom.
                 .id(("page", ix))
@@ -2259,6 +2763,13 @@ impl Render for NoteSec {
                     };
                     this.show_page(ix, cx);
                 }))
+                // Right-click: Rename / Delete / Copy page title.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        this.open_page_menu(menu_title.clone(), event.position, cx)
+                    }),
+                )
                 .child(div().flex_1().overflow_hidden().child(page.title.clone()))
                 .child(
                     favorite_star(&theme, is_favorite)
@@ -2288,6 +2799,7 @@ impl Render for NoteSec {
         let shortcut_row = |id: ElementId, selector: String, title: &str| {
             let is_current = current_title.as_deref() == Some(title.to_lowercase().as_str());
             let target = title.to_string();
+            let menu_title = title.to_string();
             div()
                 .id(id)
                 .debug_selector(move || selector)
@@ -2307,6 +2819,12 @@ impl Render for NoteSec {
                 .on_click(cx.listener(move |this, _e, _window, cx| {
                     this.open_page(&target, cx);
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        this.open_page_menu(menu_title.clone(), event.position, cx)
+                    }),
+                )
                 .child(div().flex_1().overflow_hidden().child(title.to_string()))
         };
         let existing = |titles: &[String]| -> Vec<(usize, String)> {
@@ -3111,8 +3629,14 @@ impl Render for NoteSec {
             .as_ref()
             .map(|state| self.render_settings(state, cx));
 
-        let is_editing = self.editing.is_some() || self.search.is_some();
+        let page_menu_overlay = self
+            .page_menu
+            .as_ref()
+            .map(|menu| self.render_page_menu(menu, cx));
+
+        let is_editing = self.editing.is_some() || self.text_input_open();
         let settings_open = self.settings.is_some();
+        let page_menu_open = self.page_menu.is_some() && !is_editing;
         div()
             .size_full()
             .relative()
@@ -3130,6 +3654,9 @@ impl Render for NoteSec {
             .when(settings_open, |d| d.key_context("Settings"))
             .when(!settings_open && is_editing, |d| {
                 d.key_context("BlockEditor")
+            })
+            .when(!settings_open && page_menu_open, |d| {
+                d.key_context("PageMenu")
             })
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::tab))
@@ -3173,6 +3700,7 @@ impl Render for NoteSec {
             .child(content)
             .children(overlay)
             .children(settings_overlay)
+            .children(page_menu_overlay)
     }
 }
 
@@ -6014,6 +6542,270 @@ mod tests {
         assert_ne!(before, after, "the edit shifted the sidebar rows");
         tabs_are(&view, cx, &["Test", "Beta"], 1);
         recent_starts_with(&view, cx, &["Beta"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- page context menu -------------------------------------------------
+
+    /// Right-click (press and release) the middle of `selector`'s element.
+    fn right_click(cx: &mut VisualTestContext, selector: &str) -> Point<Pixels> {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        let at = cx.debug_bounds(selector).expect(selector).center();
+        cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::none());
+        cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+        at
+    }
+
+    fn right_click_page(view: &Entity<NoteSec>, cx: &mut VisualTestContext, title: &str) {
+        let row = page_row(view, cx, "page", title);
+        right_click(cx, &row);
+    }
+
+    fn menu_title(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Option<String> {
+        view.update(cx, |app, _| app.page_menu.as_ref().map(|m| m.title.clone()))
+    }
+
+    fn non_journal_titles(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        view.update(cx, |app, _| {
+            app.pages
+                .iter()
+                .filter(|p| !p.is_journal)
+                .map(|p| p.title.clone())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn right_click_opens_the_page_menu_and_esc_or_outside_click_closes_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-open", &tab_pages(), "Test");
+        assert!(!has(cx, "page-menu"));
+
+        let row = page_row(&view, cx, "page", "Alpha");
+        let at = right_click(cx, &row);
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Alpha"));
+        for item in [
+            "page-menu",
+            "page-menu-rename",
+            "page-menu-delete",
+            "page-menu-copy",
+        ] {
+            assert!(has(cx, item), "{item}");
+        }
+        // It opens where the click was, and the click didn't open the page.
+        let menu = cx.debug_bounds("page-menu").unwrap();
+        assert!((menu.origin.x - at.x).abs() < px(2.) && (menu.origin.y - at.y).abs() < px(2.));
+        assert_eq!(selected_title(&view, cx), "Test");
+
+        cx.simulate_keystrokes("escape");
+        assert!(menu_title(&view, cx).is_none() && !has(cx, "page-menu"));
+
+        // A click outside closes it without reaching what is underneath.
+        right_click_page(&view, cx, "Alpha");
+        let beta = page_row(&view, cx, "page", "Beta");
+        click_on(cx, &beta);
+        assert!(menu_title(&view, cx).is_none());
+        assert_eq!(selected_title(&view, cx), "Test");
+        // So does a right-click outside.
+        right_click_page(&view, cx, "Alpha");
+        cx.simulate_mouse_down(
+            point(px(900.), px(600.)),
+            MouseButton::Right,
+            Modifiers::none(),
+        );
+        assert!(menu_title(&view, cx).is_none());
+
+        // FAVORITES rows have the same menu.
+        view.update(cx, |app, cx| app.toggle_favorite("Beta", cx));
+        cx.run_until_parked();
+        right_click(cx, "fav-0");
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Beta"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn rename_moves_the_file_and_selection_tabs_and_lists_follow(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-rename", &tab_pages(), "Test");
+        click_sidebar_page(&view, cx, "Alpha");
+        view.update(cx, |app, cx| app.toggle_favorite("Alpha", cx));
+        // An unsaved edit on the page is saved before the file moves.
+        click_block(cx, 0);
+        cx.simulate_input(" edited");
+
+        right_click_page(&view, cx, "Alpha");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        click_on(cx, "page-menu-rename");
+        assert!(has(cx, "rename-input") && !has(cx, "page-menu"));
+        // The old name is selected, so typing replaces it.
+        cx.simulate_input("Gamma");
+        cx.simulate_keystrokes("enter");
+
+        assert!(menu_title(&view, cx).is_none() && !has(cx, "rename-input"));
+        assert!(!page_file(&dir, "Alpha").exists());
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Gamma")).unwrap(),
+            "- alpha edited\n"
+        );
+        // Still sorted, and the selection and the open tab follow.
+        assert_eq!(non_journal_titles(&view, cx), ["Beta", "Gamma", "Test"]);
+        let gamma = page_row(&view, cx, "page", "Gamma");
+        assert!(has(cx, &gamma));
+        assert_eq!(selected_title(&view, cx), "Gamma");
+        tabs_are(&view, cx, &["Test", "Gamma"], 1);
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.favorites, vec!["Gamma".to_string()]);
+            assert_eq!(app.state.recent[0], "Gamma");
+            assert!(!app.state.recent.iter().any(|t| t == "Alpha"));
+            assert_eq!(UiState::load(&dir), app.state);
+        });
+        // Rename isn't undoable, and undo can't bring the old file back.
+        cx.simulate_keystrokes("ctrl-z");
+        assert!(!page_file(&dir, "Alpha").exists());
+        assert_eq!(selected_title(&view, cx), "Gamma");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn rename_refuses_taken_empty_and_unmappable_names(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-rename-bad", &tab_pages(), "Test");
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-rename");
+
+        let error = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| match &app.page_menu {
+                Some(PageMenu {
+                    step: MenuStep::Rename { error, .. },
+                    ..
+                }) => error.clone(),
+                _ => panic!("rename field closed"),
+            })
+        };
+        // Another page's name, in any case.
+        cx.simulate_input("beta");
+        cx.simulate_keystrokes("enter");
+        assert!(error(&view, cx).unwrap().contains("already exists"));
+        assert!(has(cx, "rename-error"));
+        // Editing the name clears the message.
+        cx.simulate_keystrokes("shift-home backspace");
+        assert_eq!(error(&view, cx), None);
+        cx.simulate_input("   ");
+        cx.simulate_keystrokes("enter");
+        assert!(error(&view, cx).unwrap().contains("empty"));
+        cx.simulate_keystrokes("shift-home backspace");
+        cx.simulate_input("a___b");
+        cx.simulate_keystrokes("enter");
+        assert!(error(&view, cx).unwrap().contains("___"));
+
+        cx.simulate_keystrokes("escape");
+        assert!(menu_title(&view, cx).is_none());
+        assert_eq!(non_journal_titles(&view, cx), ["Alpha", "Beta", "Test"]);
+        assert!(page_file(&dir, "Alpha").exists() && page_file(&dir, "Beta").exists());
+
+        // Journals are named by their date: Rename is disabled for them.
+        let today = view.update(cx, |app, _| app.find_journal(&today_title()).unwrap());
+        right_click(cx, &format!("page-{today}"));
+        click_on(cx, "page-menu-rename");
+        assert!(has(cx, "page-menu") && !has(cx, "rename-input"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn delete_after_confirm_removes_file_page_and_tab(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-delete", &tab_pages(), "Test");
+        click_sidebar_page(&view, cx, "Alpha");
+        click_sidebar_page(&view, cx, "Beta");
+        click_on(cx, "tab-1");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 1);
+        view.update(cx, |app, cx| app.toggle_favorite("Alpha", cx));
+
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-delete");
+        assert!(has(cx, "confirm-delete") && !has(cx, "page-menu"));
+        // Enter doesn't confirm a destructive action.
+        cx.simulate_keystrokes("enter");
+        assert!(has(cx, "confirm-delete") && page_file(&dir, "Alpha").exists());
+
+        click_on(cx, "confirm-delete-ok");
+        assert!(menu_title(&view, cx).is_none() && !has(cx, "confirm-delete"));
+        assert!(!page_file(&dir, "Alpha").exists());
+        assert_eq!(non_journal_titles(&view, cx), ["Beta", "Test"]);
+        // Its tab closed and the neighbour that took its place has focus.
+        tabs_are(&view, cx, &["Test", "Beta"], 1);
+        view.update(cx, |app, _| {
+            assert!(!app.state.favorites.iter().any(|t| t == "Alpha"));
+            assert!(!app.state.recent.iter().any(|t| t == "Alpha"));
+            assert_eq!(UiState::load(&dir), app.state);
+        });
+        // Deleting a page with no tab leaves the tabs alone.
+        right_click_page(&view, cx, "Test");
+        click_on(cx, "page-menu-delete");
+        click_on(cx, "confirm-delete-ok");
+        tabs_are(&view, cx, &["Beta"], 0);
+        assert!(!page_file(&dir, "Test").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn cancelling_a_delete_keeps_the_file(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-delete-cancel", &tab_pages(), "Test");
+        let ask = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            right_click_page(view, cx, "Beta");
+            click_on(cx, "page-menu-delete");
+            assert!(has(cx, "confirm-delete"));
+        };
+        ask(&view, cx);
+        click_on(cx, "confirm-delete-cancel");
+        assert!(!has(cx, "confirm-delete"));
+        ask(&view, cx);
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "confirm-delete"));
+        ask(&view, cx);
+        let dialog = cx.debug_bounds("confirm-delete").unwrap();
+        cx.simulate_click(dialog.origin - point(px(20.), px(20.)), Modifiers::none());
+        assert!(menu_title(&view, cx).is_none());
+
+        assert!(page_file(&dir, "Beta").exists());
+        assert_eq!(non_journal_titles(&view, cx), ["Alpha", "Beta", "Test"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn todays_journal_can_be_deleted_but_not_the_last_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "menu-delete-journal", "- hi\n");
+        let today = view.update(cx, |app, _| app.find_journal(&today_title()).unwrap());
+        right_click(cx, &format!("page-{today}"));
+        click_on(cx, "page-menu-delete");
+        click_on(cx, "confirm-delete-ok");
+        assert!(!todays_journal_file(&dir).exists());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages.len(), 1);
+            assert_eq!(app.pages[app.selected].title, "Test");
+        });
+
+        // The last page: Delete is disabled.
+        right_click_page(&view, cx, "Test");
+        click_on(cx, "page-menu-delete");
+        assert!(has(cx, "page-menu") && !has(cx, "confirm-delete"));
+        cx.simulate_keystrokes("escape");
+        assert!(file(&dir).contains("hi"));
+
+        // Ctrl-J brings today's journal back.
+        cx.simulate_keystrokes("ctrl-j");
+        assert!(todays_journal_file(&dir).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn copy_page_title_puts_it_on_the_clipboard(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-copy", &tab_pages(), "Test");
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-copy");
+        assert!(menu_title(&view, cx).is_none());
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("Alpha")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -94,6 +94,15 @@ impl Tabs {
         }
     }
 
+    /// A page was renamed: tabs showing `old` now show `new`.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        for tab in &mut self.tabs {
+            if matches!(tab, TabTarget::Page(t) if t == old) {
+                *tab = TabTarget::Page(new.to_string());
+            }
+        }
+    }
+
     /// Close every tab for which `keep` is false (e.g. pages that no longer
     /// exist), with the same focus rule as [`Tabs::close`].
     pub fn retain(&mut self, keep: impl Fn(&TabTarget) -> bool) {
@@ -176,6 +185,17 @@ mod tests {
         assert_eq!(tabs.active, Some(0));
         tabs.cycle(false);
         assert_eq!(tabs.active, Some(2));
+    }
+
+    #[test]
+    fn rename_keeps_position_and_focus() {
+        let mut tabs = Tabs::new(page("A"));
+        tabs.open(page("B"));
+        tabs.open(TabTarget::Graph);
+        tabs.select(1);
+        tabs.rename("B", "C");
+        assert_eq!(tabs.tabs, [page("A"), page("C"), TabTarget::Graph]);
+        assert_eq!(tabs.active, Some(1));
     }
 
     #[test]

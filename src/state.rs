@@ -96,6 +96,34 @@ impl UiState {
         }
     }
 
+    /// A page was renamed: entries for `old` (ignoring case) now say `new`.
+    /// Returns whether anything changed.
+    pub fn rename(&mut self, old: &str, new: &str) -> bool {
+        let mut changed = false;
+        for list in [&mut self.favorites, &mut self.recent] {
+            if let Some(i) = position(list, old) {
+                list[i] = new.to_string();
+                changed = true;
+            }
+            // A stale entry for a deleted page may already have the new name.
+            dedupe(list);
+        }
+        changed
+    }
+
+    /// A page was deleted: drop it from both lists. Returns whether anything
+    /// changed.
+    pub fn forget(&mut self, title: &str) -> bool {
+        let mut changed = false;
+        for list in [&mut self.favorites, &mut self.recent] {
+            if let Some(i) = position(list, title) {
+                list.remove(i);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Note that `title` was just opened: move it to the front of `recent`
     /// (dropping any other spelling of it) and keep at most `MAX_RECENT`.
     /// Returns whether the list changed, so callers only save when needed.
@@ -217,6 +245,23 @@ mod tests {
         assert_eq!(state.recent.len(), MAX_RECENT);
         assert_eq!(state.recent[0], "P19");
         assert_eq!(state.recent[MAX_RECENT - 1], "P10");
+    }
+
+    #[test]
+    fn rename_and_forget_follow_pages() {
+        let mut state = UiState {
+            favorites: titles(&["Old", "B"]),
+            recent: titles(&["B", "old", "New"]),
+        };
+        assert!(state.rename("OLD", "New"));
+        assert_eq!(state.favorites, titles(&["New", "B"]));
+        // The stale "New" entry merges with the renamed one.
+        assert_eq!(state.recent, titles(&["B", "New"]));
+        assert!(!state.rename("Missing", "X"));
+        assert!(state.forget("new"));
+        assert_eq!(state.favorites, titles(&["B"]));
+        assert_eq!(state.recent, titles(&["B"]));
+        assert!(!state.forget("new"));
     }
 
     #[test]

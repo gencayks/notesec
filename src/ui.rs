@@ -21,6 +21,8 @@ pub struct Theme {
     /// Translucent background behind selected text, so the text colour
     /// (including link and tag colours) shows through.
     pub selection: Rgba,
+    /// Destructive actions (Delete) and error messages.
+    pub danger: Rgba,
 }
 
 impl Theme {
@@ -42,6 +44,7 @@ impl Theme {
             selected_bg: rgb(0x313244),
             border: rgb(0x313244),
             selection: rgba(0x89b4fa55),
+            danger: rgb(0xf38ba8),
         }
     }
 }
@@ -58,6 +61,7 @@ impl Theme {
             selected_bg: rgb(0xccd0da),
             border: rgb(0xccd0da),
             selection: rgba(0x1e66f540),
+            danger: rgb(0xd20f39),
         }
     }
 }
