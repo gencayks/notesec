@@ -16,13 +16,16 @@ use crate::search::{search, search_templates, Command, Hit, Target};
 use crate::state::UiState;
 use crate::storage::{today_title, Storage, Template};
 use crate::tabs::{TabTarget, Tabs};
-use crate::ui::{block_row, favorite_star, fold_arrow, fold_badge, task_checkbox, Theme};
+use crate::ui::{
+    block_row, drag_handle, drop_line, favorite_star, fold_arrow, fold_badge, task_checkbox,
+    BlockDragPreview, Theme,
+};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
-    Bounds, ClickEvent, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hsla, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels,
-    ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
+    Bounds, ClickEvent, Context, DragMoveEvent, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hsla,
+    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
     UnderlineStyle, Window,
 };
 use std::collections::HashSet;
@@ -55,6 +58,8 @@ actions!(
         Bold,
         Italic,
         CycleTask,
+        MoveBlockUp,
+        MoveBlockDown,
         CloseTab,
         NextTab,
         PrevTab,
@@ -99,6 +104,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-b", Bold, ctx),
         KeyBinding::new("ctrl-i", Italic, ctx),
         KeyBinding::new("ctrl-enter", CycleTask, ctx),
+        KeyBinding::new("alt-up", MoveBlockUp, ctx),
+        KeyBinding::new("alt-down", MoveBlockDown, ctx),
         // While the settings panel is open the root's key context is
         // "Settings" instead, so Esc closes the panel.
         KeyBinding::new("escape", Escape, Some("Settings")),
@@ -124,6 +131,23 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
+}
+
+/// The value carried by a block drag (see `BlockDragPreview` for what is
+/// drawn under the mouse): the dragged block, by id so it is found again
+/// even if indices shift.
+#[derive(Clone, Debug)]
+struct DraggedBlock {
+    id: Uuid,
+}
+
+/// Where a dragged block would land if dropped now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropGap {
+    /// Just before this block, as its sibling.
+    Before(Uuid),
+    /// After every block, at the top level.
+    End,
 }
 
 /// Which main view is showing.
@@ -229,6 +253,9 @@ pub struct NoteSec {
     /// Ids of folded blocks (their descendants are hidden). UI-only: not
     /// saved, and block ids are regenerated on load anyway.
     collapsed: HashSet<Uuid>,
+    /// While a block is being dragged by its bullet: where it would land.
+    /// Only meaningful while GPUI has an active drag.
+    block_drop: Option<DropGap>,
     undo_stack: Vec<HistoryState>,
     redo_stack: Vec<HistoryState>,
     text_history_active: bool,
@@ -322,6 +349,7 @@ impl NoteSec {
             settings: None,
             selecting: false,
             collapsed: HashSet::new(),
+            block_drop: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             text_history_active: false,
@@ -1275,6 +1303,93 @@ impl NoteSec {
             self.save_page();
             // Indenting under a folded block unfolds it.
             self.reveal(ix);
+        }
+        cx.notify();
+    }
+
+    fn on_move_block_up(&mut self, _: &MoveBlockUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_edited_block(true, cx);
+    }
+
+    fn on_move_block_down(&mut self, _: &MoveBlockDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_edited_block(false, cx);
+    }
+
+    /// Alt+Up / Alt+Down: swap the edited block (and its children) with its
+    /// previous / next sibling. Editing continues in the moved block.
+    fn move_edited_block(&mut self, up: bool, cx: &mut Context<Self>) {
+        let Some(ix) = self.editing else { return };
+        if self.search.is_some() {
+            return;
+        }
+        self.close_slash_as_typing();
+        self.text_history_active = false;
+        let before = self.history_state();
+        self.sync_content();
+        let page = &mut self.pages[self.selected];
+        let moved = if up {
+            page.move_up(ix)
+        } else {
+            page.move_down(ix)
+        };
+        if let Some(new_ix) = moved {
+            self.record_state(before);
+            self.editing = Some(new_ix);
+            self.save_page();
+            self.reveal(new_ix);
+        }
+        cx.notify();
+    }
+
+    /// A block drag moved over the gap `gap`: show the drop line there,
+    /// unless dropping there would put the block inside itself.
+    fn set_block_drop(&mut self, dragged: Uuid, gap: Option<DropGap>, cx: &mut Context<Self>) {
+        let page = &self.pages[self.selected];
+        let gap = gap.filter(
+            |gap| match (gap, page.blocks.iter().position(|b| b.id == dragged)) {
+                (DropGap::Before(target), Some(from)) => {
+                    let end = page.subtree_end(from);
+                    !page.blocks[from..end].iter().any(|b| b.id == *target)
+                }
+                (DropGap::End, Some(_)) => true,
+                (_, None) => false,
+            },
+        );
+        if self.block_drop != gap {
+            self.block_drop = gap;
+            cx.notify();
+        }
+    }
+
+    /// Drop of a dragged block: move it (with its children) to the gap the
+    /// drop line shows. One undo step; the page is saved, so the new order
+    /// survives a restart. A block being edited stays in edit mode.
+    fn drop_block(&mut self, dragged: Uuid, cx: &mut Context<Self>) {
+        let Some(gap) = self.block_drop.take() else {
+            return;
+        };
+        self.close_slash_as_typing();
+        self.text_history_active = false;
+        let before = self.history_state();
+        self.sync_content();
+        let page = &self.pages[self.selected];
+        let editing_id = self.editing.map(|ix| page.blocks[ix].id);
+        let Some(from) = page.blocks.iter().position(|b| b.id == dragged) else {
+            return;
+        };
+        let target = match gap {
+            DropGap::Before(id) => match page.blocks.iter().position(|b| b.id == id) {
+                Some(ix) => Some(ix),
+                None => return,
+            },
+            DropGap::End => None,
+        };
+        let page = &mut self.pages[self.selected];
+        if let Some(new_ix) = page.move_subtree(from, target) {
+            self.editing = editing_id.and_then(|id| page.blocks.iter().position(|b| b.id == id));
+            self.record_state(before);
+            self.save_page();
+            self.reveal(new_ix);
         }
         cx.notify();
     }
@@ -2573,6 +2688,17 @@ impl Render for NoteSec {
         #[cfg(test)]
         let mut reading_layouts = Vec::new();
         let visible = page.visible_blocks(&self.collapsed);
+        // The drop gap below each row's lower half: just before the next
+        // visible row, or the end of the page after the last one.
+        let gap_below: Vec<DropGap> = (0..page.blocks.len())
+            .map(|ix| {
+                (ix + 1..page.blocks.len())
+                    .find(|&i| visible[i])
+                    .map_or(DropGap::End, |i| DropGap::Before(page.blocks[i].id))
+            })
+            .collect();
+        let dragging = cx.has_active_drag();
+        let block_drop = if dragging { self.block_drop } else { None };
         let rows: Vec<AnyElement> = page
             .blocks
             .iter()
@@ -2711,7 +2837,54 @@ impl Render for NoteSec {
                         )
                         .into_any_element()
                 });
-                let row = block_row(&theme, depth, font_size, kind, content, fold)
+                // Dragging the bullet moves the block. The press on the handle
+                // stops there, so it never starts editing the row.
+                let block_id = block.id;
+                let handle = {
+                    let preview_text: SharedString = block
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                        .into();
+                    drag_handle()
+                        .id(("handle", ix))
+                        .debug_selector(move || format!("handle-{ix}"))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_drag(DraggedBlock { id: block_id }, move |_, _, _, cx| {
+                            cx.new(|_| BlockDragPreview {
+                                text: preview_text.clone(),
+                                theme,
+                            })
+                        })
+                        .into_any_element()
+                };
+                let below = gap_below[ix];
+                let on_drag_move =
+                    cx.listener(move |this, event: &DragMoveEvent<DraggedBlock>, _, cx| {
+                        let position = event.event.position;
+                        if !event.bounds.contains(&position) {
+                            return;
+                        }
+                        let gap = if position.y < event.bounds.center().y {
+                            DropGap::Before(block_id)
+                        } else {
+                            below
+                        };
+                        let dragged = event.drag(cx).id;
+                        this.set_block_drop(dragged, Some(gap), cx);
+                    });
+                let drop_here = block_drop == Some(DropGap::Before(block_id));
+                let row = block_row(&theme, depth, font_size, kind, content, fold, handle)
+                    .relative()
+                    .when(drop_here, |d| {
+                        d.child(
+                            drop_line(&theme, depth)
+                                .debug_selector(move || format!("drop-before-{ix}")),
+                        )
+                    })
+                    .on_drag_move(on_drag_move)
                     .when(folded, |d| {
                         d.child(
                             fold_badge(&theme, font_size, hidden_count)
@@ -2834,6 +3007,28 @@ impl Render for NoteSec {
                     .child(page.title.clone()),
             )
             .children(rows)
+            // The drop line for "after the last block".
+            .when(block_drop == Some(DropGap::End), |d| {
+                d.child(
+                    div()
+                        .relative()
+                        .h(px(0.))
+                        .child(drop_line(&theme, 0).debug_selector(|| "drop-end".to_string())),
+                )
+            })
+            // Leaving the page area hides the drop line; dropping anywhere on
+            // the page moves the block to where the line is.
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedBlock>, _, cx| {
+                    if !event.bounds.contains(&event.event.position) {
+                        let dragged = event.drag(cx).id;
+                        this.set_block_drop(dragged, None, cx);
+                    }
+                }),
+            )
+            .on_drop(
+                cx.listener(|this, dragged: &DraggedBlock, _, cx| this.drop_block(dragged.id, cx)),
+            )
             .children(backlinks_panel)
             // Empty space below the blocks: clicking it leaves edit mode.
             .child(
@@ -3155,6 +3350,8 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::bold))
             .on_action(cx.listener(Self::italic))
             .on_action(cx.listener(Self::cycle_task))
+            .on_action(cx.listener(Self::on_move_block_up))
+            .on_action(cx.listener(Self::on_move_block_down))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::on_new_page))
             .on_action(cx.listener(Self::on_open_today))
@@ -6014,6 +6211,158 @@ mod tests {
         assert_ne!(before, after, "the edit shifted the sidebar rows");
         tabs_are(&view, cx, &["Test", "Beta"], 1);
         recent_starts_with(&view, cx, &["Beta"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn bounds_of(cx: &mut VisualTestContext, selector: &str) -> Bounds<Pixels> {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} was not rendered"))
+    }
+
+    /// Press on block `from`'s bullet handle and drag (without releasing)
+    /// to `to`.
+    fn start_block_drag(cx: &mut VisualTestContext, from: usize, to: Point<Pixels>) {
+        let handle = bounds_of(cx, &format!("handle-{from}")).center();
+        cx.simulate_mouse_down(handle, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        // Past GPUI's drag threshold, then to the target.
+        let nudge = point(handle.x, handle.y + px(6.));
+        cx.simulate_mouse_move(nudge, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn release_block_drag(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// A point in the upper (`upper == true`) or lower half of block `ix`.
+    fn row_half(cx: &mut VisualTestContext, ix: usize, upper: bool) -> Point<Pixels> {
+        let b = bounds_of(cx, &format!("block-{ix}"));
+        let y = if upper {
+            b.top() + px(2.)
+        } else {
+            b.bottom() - px(2.)
+        };
+        point(b.center().x, y)
+    }
+
+    #[gpui::test]
+    fn dragging_a_block_down_moves_it_with_its_children(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "drag-down", "- a\n  - a1\n- b\n- c\n");
+
+        // Lower half of "b": the line shows just before "c".
+        let target = row_half(cx, 2, false);
+        start_block_drag(cx, 0, target);
+        assert!(has(cx, "drop-before-3"), "drop line before c");
+        assert!(!has(cx, "drop-before-2"));
+        release_block_drag(cx, target);
+
+        assert_eq!(file(&dir), "- b\n- a\n  - a1\n- c\n");
+        assert!(!has(cx, "drop-before-3"), "line gone after the drop");
+        view.update(cx, |app, _| {
+            // Pressing the handle never started editing.
+            assert_eq!(app.editing, None);
+            assert_eq!(app.block_drop, None);
+        });
+
+        // The whole move is one undo step.
+        cx.simulate_keystrokes("ctrl-z");
+        cx.run_until_parked();
+        assert_eq!(file(&dir), "- a\n  - a1\n- b\n- c\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn dragging_a_block_up_moves_it_before_the_target(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(cx, "drag-up", "- a\n  - a1\n- b\n- c\n");
+
+        // Upper half of "a1": "c" becomes a1's sibling, before it.
+        let target = row_half(cx, 1, true);
+        start_block_drag(cx, 3, target);
+        assert!(has(cx, "drop-before-1"));
+        release_block_drag(cx, target);
+        assert_eq!(file(&dir), "- a\n  - c\n  - a1\n- b\n");
+
+        // Upper half of the first block: to the very top.
+        let target = row_half(cx, 0, true);
+        start_block_drag(cx, 3, target);
+        release_block_drag(cx, target);
+        assert_eq!(file(&dir), "- b\n- a\n  - c\n  - a1\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_block_cannot_be_dropped_into_itself_and_can_go_to_the_end(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(cx, "drag-self", "- a\n  - a1\n- b\n");
+
+        // Over its own child: no line, and dropping changes nothing.
+        let target = row_half(cx, 1, true);
+        start_block_drag(cx, 0, target);
+        assert!(!has(cx, "drop-before-1"));
+        assert!(!has(cx, "drop-end"));
+        release_block_drag(cx, target);
+        assert_eq!(file(&dir), "- a\n  - a1\n- b\n");
+
+        // Lower half of the last row: the end of the page, at the top level.
+        let target = row_half(cx, 2, false);
+        start_block_drag(cx, 1, target);
+        assert!(has(cx, "drop-end"));
+        release_block_drag(cx, target);
+        assert_eq!(file(&dir), "- a\n- b\n- a1\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn alt_arrows_move_the_edited_block_and_keep_editing_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "alt-arrows", "- a\n  - a1\n- b\n- c\n");
+        click_block(cx, 0);
+        cx.simulate_input("!");
+
+        cx.simulate_keystrokes("alt-down");
+        assert_eq!(file(&dir), "- b\n- a!\n  - a1\n- c\n");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.text, "a!");
+        });
+
+        cx.simulate_keystrokes("alt-down");
+        assert_eq!(file(&dir), "- b\n- c\n- a!\n  - a1\n");
+        // Already last: nothing happens.
+        cx.simulate_keystrokes("alt-down");
+        assert_eq!(file(&dir), "- b\n- c\n- a!\n  - a1\n");
+
+        cx.simulate_keystrokes("alt-up alt-up");
+        assert_eq!(file(&dir), "- a!\n  - a1\n- b\n- c\n");
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+        // Already first: nothing happens.
+        cx.simulate_keystrokes("alt-up");
+        assert_eq!(file(&dir), "- a!\n  - a1\n- b\n- c\n");
+
+        // A child only moves among its siblings.
+        click_block(cx, 1);
+        cx.simulate_keystrokes("alt-up");
+        assert_eq!(file(&dir), "- a!\n  - a1\n- b\n- c\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn moved_block_order_survives_a_restart(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(cx, "drag-persist", "- a\n  - a1\n- b\n- c\n");
+        let target = row_half(cx, 3, false);
+        start_block_drag(cx, 0, target);
+        release_block_drag(cx, target);
+
+        // A fresh load from disk, as on the next start.
+        let pages = Storage::open(dir.clone()).unwrap().load_all();
+        let page = pages.iter().find(|p| p.title == "Test").unwrap();
+        let contents: Vec<&str> = page.blocks.iter().map(|b| b.content.as_str()).collect();
+        assert_eq!(contents, ["b", "c", "a", "a1"]);
+        assert_eq!(page.blocks[3].parent_id, Some(page.blocks[2].id));
+        assert_eq!(page.to_markdown(), "- b\n- c\n- a\n  - a1\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

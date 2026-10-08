@@ -5,7 +5,10 @@
 
 use crate::config::ThemeKind;
 use crate::model::{BlockKind, TaskState};
-use gpui::{div, prelude::*, px, rgb, rgba, AnyElement, Div, FontWeight, Rgba};
+use gpui::{
+    div, prelude::*, px, rgb, rgba, AnyElement, Context, Div, FontWeight, Rgba, SharedString,
+    Window,
+};
 
 /// Colours used across the UI. Every colour comes from here, so switching
 /// theme is just swapping this struct.
@@ -151,6 +154,7 @@ pub fn fold_badge(theme: &Theme, font_size: f32, count: usize) -> Div {
 /// `font_size` (in px) is the configured size; `kind` scales it for headings
 /// and styles quotes, in both modes, so editing a block doesn't make it jump.
 /// `fold` is the fold arrow of a block with children (see [`fold_arrow`]).
+/// `handle` is the drag handle laid over the bullet (see [`drag_handle`]).
 pub fn block_row(
     theme: &Theme,
     depth: usize,
@@ -158,6 +162,7 @@ pub fn block_row(
     kind: BlockKind,
     content: impl IntoElement,
     fold: Option<AnyElement>,
+    handle: AnyElement,
 ) -> Div {
     let size = font_size * kind_scale(kind);
     let line_height = size * LINE_HEIGHT_RATIO;
@@ -199,9 +204,62 @@ pub fn block_row(
                 .flex_shrink_0()
                 .rounded_full()
                 .bg(theme.muted)
-                .children(fold),
+                .children(fold)
+                .child(handle),
         )
         .child(body)
+}
+
+/// An invisible square laid over a block's bullet that you drag to move the
+/// block. It is a bit bigger than the 6px dot so it is easy to grab, but
+/// stays clear of the fold arrow on its left and the text on its right.
+/// `app.rs` adds the drag handlers.
+pub fn drag_handle() -> Div {
+    div()
+        .absolute()
+        .left(px(-4.0))
+        .top(px(-4.0))
+        .size(px(14.0))
+        .rounded_sm()
+        .cursor_grab()
+}
+
+/// The accent line showing where a dragged block will land, laid across
+/// the top of a row (or under the last one), indented to `depth`.
+pub fn drop_line(theme: &Theme, depth: usize) -> Div {
+    div()
+        .absolute()
+        .top(px(-1.0))
+        .left(px(24.0 * depth as f32))
+        .right_0()
+        .h(px(2.0))
+        .rounded_full()
+        .bg(theme.accent)
+}
+
+/// What follows the mouse while a block is dragged: its text in a small
+/// translucent card.
+pub struct BlockDragPreview {
+    pub text: SharedString,
+    pub theme: Theme,
+}
+
+impl Render for BlockDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(320.0))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.sidebar_bg)
+            .text_color(self.theme.text)
+            .opacity(0.85)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(self.text.clone())
+    }
 }
 
 /// The star on a sidebar page row: a filled accent `★` for a favorite, an

@@ -607,6 +607,25 @@ that mutate, and data races are essentially impossible.
     "System default". Choosing "System default" removes `font_family` from
     the file; a configured family that isn't installed is kept in the file
     and named in the panel, but the system font is used, as at startup.
+23. **Blocks move by dragging their bullet, as one subtree, through one
+    model method**: `Page::move_subtree(from, before)` cuts out the block
+    and its descendants (they are contiguous in the flat list) and splices
+    them in just before `before`, taking `before`'s parent, or at the end of
+    the top level for `None`. It refuses a target inside the moved subtree.
+    Drag-and-drop and Alt+Up / Alt+Down (`move_up` / `move_down`, which only
+    swap with a sibling, so a child never leaves its parent) all go through
+    it, then save the page like any edit (so the new order is in the file
+    and survives a restart) and push one undo step. The drag uses GPUI's
+    own drag and drop: an invisible 14px handle over the 6px bullet has
+    `on_drag` with a `DraggedBlock { id }` value (`BlockDragPreview` draws
+    the first line under the mouse) and stops the mouse-down, so grabbing a
+    bullet never starts editing. Every row listens with `on_drag_move`: the
+    upper half of a row means "before this row", the lower half "before the
+    next visible row" (or the end of the page), stored by block id as
+    `block_drop` so it can't go stale if indices shift. A 2px accent line is
+    drawn there at the target's indent, only while `cx.has_active_drag()`.
+    Dropping anywhere on the page moves the block to the line; leaving the
+    page hides the line and makes the drop a no-op.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

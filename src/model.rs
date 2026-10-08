@@ -596,6 +596,62 @@ impl Page {
         true
     }
 
+    /// Move block `from` together with its whole subtree so it lands just
+    /// before block `before`, as `before`'s sibling (it takes `before`'s
+    /// parent). `None` appends it at the end of the page, at the top level.
+    /// Returns the block's new index, or `None` (nothing changes) when
+    /// `before` is inside the moved subtree: a block can't go inside itself.
+    pub fn move_subtree(&mut self, from: usize, before: Option<usize>) -> Option<usize> {
+        let end = self.subtree_end(from);
+        if before.is_some_and(|b| (from..end).contains(&b)) {
+            return None;
+        }
+        let parent_id = before.and_then(|b| self.blocks[b].parent_id);
+        let moved: Vec<Block> = self.blocks.drain(from..end).collect();
+        let len = moved.len();
+        // Indices after the removed range shift down by its length.
+        let at = match before {
+            Some(b) if b >= end => b - len,
+            Some(b) => b,
+            None => self.blocks.len(),
+        };
+        self.blocks.splice(at..at, moved);
+        // Only the moved root changes parent; its descendants still point
+        // at it (or at each other), so their nesting comes along.
+        self.blocks[at].parent_id = parent_id;
+        self.renumber();
+        Some(at)
+    }
+
+    /// Index of the sibling of block `index` that comes `delta` places
+    /// later (`1`) or earlier (`-1`), if there is one.
+    fn sibling(&self, index: usize, delta: isize) -> Option<usize> {
+        let block = &self.blocks[index];
+        let order = block.order.checked_add_signed(delta)?;
+        self.blocks
+            .iter()
+            .position(|b| b.parent_id == block.parent_id && b.order == order)
+    }
+
+    /// Alt+Up: swap block `index` (with its children) with the previous
+    /// sibling (with its children). Returns its new index, or `None` for a
+    /// first child.
+    pub fn move_up(&mut self, index: usize) -> Option<usize> {
+        let prev = self.sibling(index, -1)?;
+        self.move_subtree(index, Some(prev))
+    }
+
+    /// Alt+Down: swap block `index` (with its children) with the next
+    /// sibling (with its children). Returns its new index, or `None` for a
+    /// last child.
+    pub fn move_down(&mut self, index: usize) -> Option<usize> {
+        let next = self.sibling(index, 1)?;
+        let next_len = self.subtree_end(next) - next;
+        // Moving the next sibling up in front of us is the same swap.
+        self.move_subtree(next, Some(index))?;
+        Some(index + next_len)
+    }
+
     /// Delete a block that has no children. Returns false if it has children.
     pub fn delete_leaf(&mut self, index: usize) -> bool {
         if self.subtree_end(index) > index + 1 {
@@ -1106,6 +1162,71 @@ mod tests {
         );
         assert_eq!(page.blocks[1].order, 0);
         assert_eq!(page.blocks[3].order, 2);
+    }
+
+    #[test]
+    fn move_down_swaps_with_the_next_sibling() {
+        let mut page = Page::from_markdown("p", false, "- a\n- b\n- c\n");
+        assert_eq!(page.move_down(0), Some(1));
+        assert_eq!(page.to_markdown(), "- b\n- a\n- c\n");
+        assert_eq!(page.move_down(1), Some(2));
+        assert_eq!(page.to_markdown(), "- b\n- c\n- a\n");
+        // The last sibling can't go further down.
+        assert_eq!(page.move_down(2), None);
+        assert_eq!(page.to_markdown(), "- b\n- c\n- a\n");
+        assert_eq!(
+            page.blocks.iter().map(|b| b.order).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn move_up_swaps_with_the_previous_sibling() {
+        let mut page = Page::from_markdown("p", false, "- a\n- b\n- c\n");
+        assert_eq!(page.move_up(2), Some(1));
+        assert_eq!(page.to_markdown(), "- a\n- c\n- b\n");
+        assert_eq!(page.move_up(1), Some(0));
+        assert_eq!(page.to_markdown(), "- c\n- a\n- b\n");
+        // The first sibling can't go further up.
+        assert_eq!(page.move_up(0), None);
+    }
+
+    #[test]
+    fn moving_a_block_takes_its_children_along() {
+        let md = "- a\n  - a1\n    - a11\n  - a2\n- b\n  - b1\n- c\n";
+        let mut page = Page::from_markdown("p", false, md);
+        // a (with a1, a11, a2) swaps with b (with b1).
+        assert_eq!(page.move_down(0), Some(2));
+        assert_eq!(
+            page.to_markdown(),
+            "- b\n  - b1\n- a\n  - a1\n    - a11\n  - a2\n- c\n"
+        );
+        // And back up.
+        assert_eq!(page.move_up(2), Some(0));
+        assert_eq!(page.to_markdown(), md);
+        // Children move among their own siblings only.
+        assert_eq!(page.move_down(1), Some(2));
+        assert_eq!(
+            page.to_markdown(),
+            "- a\n  - a2\n  - a1\n    - a11\n- b\n  - b1\n- c\n"
+        );
+    }
+
+    #[test]
+    fn move_subtree_reparents_onto_the_target_and_refuses_itself() {
+        let md = "- a\n  - a1\n- b\n  - b1\n";
+        let mut page = Page::from_markdown("p", false, md);
+        // Drop a (with a1) just before b1: it becomes b's first child.
+        assert_eq!(page.move_subtree(0, Some(3)), Some(1));
+        assert_eq!(page.to_markdown(), "- b\n  - a\n    - a1\n  - b1\n");
+        assert_eq!(page.blocks[1].parent_id, Some(page.blocks[0].id));
+        assert_eq!((page.blocks[1].order, page.blocks[3].order), (0, 1));
+        // A block can't be dropped inside its own subtree.
+        assert_eq!(page.move_subtree(1, Some(2)), None);
+        assert_eq!(page.move_subtree(1, Some(1)), None);
+        // `None` appends it at the top level.
+        assert_eq!(page.move_subtree(1, None), Some(2));
+        assert_eq!(page.to_markdown(), "- b\n  - b1\n- a\n  - a1\n");
     }
 
     #[test]
