@@ -16,6 +16,7 @@ editor.rs      — text-editing state machine (NO ui code here)
 display.rs     — reading view of a block: hidden markup + offset map (NO ui code)
 search.rs      — fuzzy matcher, pure functions (NO ui code here)
 tabs.rs        — open tabs: open/focus/close/cycle rules (NO ui code here)
+export.rs      — a page as one self-contained HTML string (NO ui code here)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -964,6 +965,65 @@ that mutate, and data races are essentially impossible.
     should put `.trash/` in the graph's `.gitignore` (the history already
     keeps deleted content, and the trash would double it); split panes can
     show the trash in either pane like any tab target.
+38. **Export: the current page to one self-contained HTML file.** The
+    palette's "Export page to HTML" (`ExportHtml`; keywords export, html,
+    save, share, web page; no key; `Needs::Page`, so it is hidden on the
+    graph, agenda and trash tabs, and the action does nothing there)
+    saves the block being edited, then writes
+    `<graph>/exports/<page file name>.html` (`Area___Sub.html`,
+    `2026_10_08.html` for a journal: `Storage::export_path` reuses
+    `path_for`, so one page always lands on one file and re-exporting
+    replaces it, atomically via `write_atomic`). `exports/` is outside
+    `pages/` and `journals/`, so exports are never loaded as pages.
+    *Pure builder*: `export::page_html(page, resolve_ref, load_image)`
+    returns the whole document as a `String`; it touches no files and no
+    GPUI. The two closures are the only outside facts: `resolve_ref` maps
+    a block id to the referenced block's text (`find_block` over the
+    loaded pages) and `load_image` reads image bytes (`assets::resolve` +
+    `is_image_path`), so unit tests pass fakes. *Same meaning as the app*:
+    it reuses the reading view's parsers (`split_code`, `parse_table`,
+    `parse_images`, `DisplayBlock::with_refs` and its `segments`), so a
+    block can't export differently from how it reads. Blocks become nested
+    `<ul class="outline"><li>` by depth (a jump of more than one level is
+    clamped, like the outline). Folded blocks are exported unfolded: a
+    file has no fold button, and hiding content in an export would lose
+    it. Headings become `heading1-3` blocks, `>` quotes `quote`, paired
+    `*`/`**` `<em>`/`<strong>`; task keywords are badges
+    (`<span class="task task-todo">TODO</span>`) and a DONE block is
+    struck through, as in the app. `[[links]]` and `#tags` are styled
+    spans with the page name in `data-page`, not `<a>`: the pages they
+    point at aren't exported, and a dead link is worse than none. Block
+    references show the referenced text (`<span class="ref">`); an
+    unknown id shows what the reading view shows. `SCHEDULED:` /
+    `DEADLINE:` lines (those `agenda::parse_dates` accepts, never a
+    block's first line) get their own muted line with the keyword in bold.
+    Fenced code becomes `<pre><code>` with its language label; tables keep
+    their column alignment. Inline `` `code` `` is not special, because
+    the reading view doesn't support it either; when it does, the export
+    should follow. *Escaping*: every piece of user text goes through
+    `export::escape` (`& < > " '`), including attributes and code.
+    *Self-contained*: one inline `<style>` (light, dark through
+    `prefers-color-scheme`, and `@media print` without backgrounds), no
+    scripts, no external links, and a Content-Security-Policy meta
+    (`default-src 'none'; img-src data:; style-src 'unsafe-inline'`), so
+    a browser refuses anything else even if a bug let it in. Images are
+    embedded as `data:` URIs (`export::base64`, a small RFC 4648 encoder
+    tested against the RFC's vectors; no new crate). PNG, JPEG, GIF, WebP,
+    BMP and TIFF are embedded; web images (`https://...`) are not fetched,
+    and missing or unknown files show a note ("Image not found: ...").
+    *Status message*: `NoteSec::status` shows "Exported to <path>" (or
+    "Export failed: <error>" in the danger colour) at the bottom right
+    (`status-toast`) for `STATUS_FOR` (5 s); a newer message replaces the
+    timer, like the copy button's "Copied". Other features can reuse
+    `show_status`. *PDF: not done.* GPUI has no print or PDF API; the
+    platform calls it offers here are `open_url`, `open_with_system` and
+    `reveal_path`. Those could open the HTML in a browser but not reach a
+    print dialog, and rendering PDF ourselves would need a new crate and a
+    second layout engine. Instead the export prints well: the browser's
+    Print -> Save as PDF uses the `@media print` styles. *Git backup*:
+    `exports/` should go in the graph's `.gitignore`, like `.trash/`. It
+    is derived output that one command re-creates, and embedded images
+    would bloat the history.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

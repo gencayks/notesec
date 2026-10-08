@@ -8,6 +8,7 @@
 //! <graph>/templates/<name>.md         (notesec only; Logseq ignores it)
 //! <graph>/.trash/<millis>/pages/<title>.md        (deleted pages, see below)
 //! <graph>/.trash/<millis>/journals/YYYY_MM_DD.md
+//! <graph>/exports/<page file name>.html          (Export page to HTML)
 //! ```
 //!
 //! The markdown files are the source of truth; nothing is cached elsewhere.
@@ -342,6 +343,24 @@ impl Storage {
         Ok(entries.len())
     }
 
+    /// Where "Export page to HTML" writes `page`: `<graph>/exports/` and
+    /// the page file's name with `.html` (`Area___Sub.html`,
+    /// `2026_10_08.html`), so the same page always lands on the same file.
+    pub fn export_path(&self, page: &Page) -> PathBuf {
+        let file = self.path_for(page).with_extension("html");
+        let name = file.file_name().map(PathBuf::from).unwrap_or_default();
+        self.root.join(EXPORTS_DIR).join(name)
+    }
+
+    /// Write `html` as `page`'s export (atomically, replacing an earlier
+    /// export), creating `exports/` if needed. Returns the path written.
+    pub fn write_export(&self, page: &Page, html: &str) -> io::Result<PathBuf> {
+        let path = self.export_path(page);
+        fs::create_dir_all(self.root.join(EXPORTS_DIR))?;
+        write_atomic(&path, html)?;
+        Ok(path)
+    }
+
     /// The trashed file of `entry`.
     fn trash_file(&self, entry: &TrashEntry) -> PathBuf {
         self.trash_dir().join(&entry.id).join(&entry.relative)
@@ -369,6 +388,10 @@ impl Storage {
 /// The trash folder inside the graph. Hidden (a dot folder), and outside
 /// `pages/` and `journals/`, so its files are never loaded as pages.
 pub const TRASH_DIR: &str = ".trash";
+
+/// Where page exports go, inside the graph. Not `pages/` or `journals/`,
+/// so exports are never loaded as pages.
+pub const EXPORTS_DIR: &str = "exports";
 
 /// A deleted page in the trash (see the module docs for the layout).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -761,6 +784,31 @@ mod tests {
         assert!(trash.join("notes/pages/Keep.md").exists());
         assert!(trash.join("README.txt").exists() && trash.join("42").exists());
         assert_eq!(storage.empty_trash().unwrap(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exports_go_to_one_file_per_page_and_are_not_pages() {
+        let root = temp_root("exports");
+        let storage = Storage::open(root.clone()).unwrap();
+        let page = Page::from_markdown("Area/Sub", false, "- x\n");
+        let journal = Page::from_markdown("2026-10-08", true, "- day\n");
+        storage.save(&page).unwrap();
+        assert_eq!(
+            storage.export_path(&page),
+            root.join("exports/Area___Sub.html")
+        );
+        assert_eq!(
+            storage.export_path(&journal),
+            root.join("exports/2026_10_08.html")
+        );
+        let path = storage.write_export(&page, "<p>one</p>").unwrap();
+        assert_eq!(path, root.join("exports/Area___Sub.html"));
+        // Exporting again replaces the file.
+        storage.write_export(&page, "<p>two</p>").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "<p>two</p>");
+        let titles: Vec<String> = storage.load_all().into_iter().map(|p| p.title).collect();
+        assert_eq!(titles, ["Area/Sub"]);
         let _ = fs::remove_dir_all(root);
     }
 

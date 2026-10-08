@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod display;
 mod editor;
+mod export;
 mod graph;
 mod graph_view;
 mod model;

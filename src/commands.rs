@@ -91,6 +91,7 @@ commands! {
     RenamePage => "Rename current page", ["title", "name"], Page;
     DeletePage => "Delete current page", ["remove", "trash"], Page;
     CopyPageTitle => "Copy page title", ["clipboard", "name"], Page;
+    ExportHtml => "Export page to HTML", ["export", "html", "save", "share", "web page"], Page;
     ToggleFavorite => "Toggle favorite", ["star", "unstar", "bookmark", "favourite"], Page;
     SortPagesAz => "Sort pages A-Z", ["alphabetical", "order"], Nothing;
     // Editing

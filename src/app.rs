@@ -87,6 +87,7 @@ actions!(
         // ShowShortcuts, Ctrl+/).
         OpenAgenda,
         OpenTrash,
+        ExportHtml,
         RenamePage,
         DeletePage,
         CopyPageTitle,
@@ -388,6 +389,15 @@ enum TrashConfirm {
     Empty,
 }
 
+/// A short message at the bottom right (e.g. where an export was
+/// written), shown for `STATUS_FOR`.
+#[derive(Clone, Debug, PartialEq)]
+struct Status {
+    text: String,
+    /// Shown in the danger colour.
+    error: bool,
+}
+
 /// What a confirmation dialog says (see `NoteSec::render_confirm`).
 struct Confirm {
     /// Debug selector and element id prefix.
@@ -529,6 +539,10 @@ pub struct NoteSec {
     /// Why the last trash action failed (e.g. Restore with the name
     /// taken), shown at the top of the trash view until the next one.
     trash_error: Option<String>,
+    /// The status message on screen, if any, and the timer that clears it
+    /// (dropping it cancels it, so a newer message gets its full time).
+    status: Option<Status>,
+    status_task: Option<Task<()>>,
     /// Where the page being dragged in the sidebar would land. Only
     /// meaningful while a drag is active; `render` clears it otherwise.
     page_drop: Option<PageDrop>,
@@ -651,6 +665,8 @@ impl NoteSec {
             trash,
             trash_confirm: None,
             trash_error: None,
+            status: None,
+            status_task: None,
             page_drop: None,
             selecting: false,
             collapsed: HashSet::new(),
@@ -1222,6 +1238,12 @@ impl NoteSec {
 
     fn on_open_trash(&mut self, _: &OpenTrash, _: &mut Window, cx: &mut Context<Self>) {
         self.show_trash(cx);
+    }
+
+    fn on_export_html(&mut self, _: &ExportHtml, _: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page().is_some() {
+            self.export_html(cx);
+        }
     }
 
     fn on_sort_pages_az(&mut self, _: &SortPagesAz, _: &mut Window, cx: &mut Context<Self>) {
@@ -2272,6 +2294,52 @@ impl NoteSec {
         cx.notify();
     }
 
+    // --- export, status message ------------------------------------------------
+
+    /// "Export page to HTML": write the page on screen as one
+    /// self-contained HTML file (`export::page_html`) to
+    /// `<graph>/exports/<page file>.html`, replacing an earlier export, and
+    /// say where. The block being edited is saved first. Folded blocks are
+    /// exported unfolded; images are embedded.
+    fn export_html(&mut self, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+        let page = &self.pages[self.selected];
+        let pages = &self.pages;
+        let resolve_ref =
+            |id| find_block(pages, id).map(|(p, b)| pages[p].blocks[b].content.clone());
+        let root = self.storage.root();
+        let load_image = |target: &str| {
+            resolve(root, target)
+                .filter(|path| is_image_path(path))
+                .and_then(|path| std::fs::read(path).ok())
+        };
+        let html = crate::export::page_html(page, &resolve_ref, &load_image);
+        let status = match self.storage.write_export(page, &html) {
+            Ok(path) => Status {
+                text: format!("Exported to {}", path.display()),
+                error: false,
+            },
+            Err(err) => Status {
+                text: format!("Export failed: {err}"),
+                error: true,
+            },
+        };
+        self.show_status(status, cx);
+    }
+
+    /// Show `status` at the bottom right for `STATUS_FOR`.
+    fn show_status(&mut self, status: Status, cx: &mut Context<Self>) {
+        self.status = Some(status);
+        self.status_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATUS_FOR).await;
+            let _ = this.update(cx, |this, cx| {
+                this.status = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     // --- graph view ------------------------------------------------------------
 
     /// Open (or focus) the graph tab, creating the graph on first use.
@@ -3315,6 +3383,9 @@ fn mono_font(cx: &App) -> Option<SharedString> {
 
 /// The tallest an image in a block is drawn, in pixels.
 const IMAGE_MAX_HEIGHT: f32 = 320.0;
+/// How long a status message (`NoteSec::show_status`) stays on screen.
+const STATUS_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long a copy button says "Copied".
 const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
@@ -6247,6 +6318,34 @@ impl Render for NoteSec {
             .as_ref()
             .map(|confirm| self.render_trash_confirm(confirm, cx));
 
+        // The status message: a small box at the bottom right, over the
+        // page but under any dialog.
+        let status_toast = self.status.as_ref().map(|status| {
+            div()
+                .debug_selector(|| "status-toast".to_string())
+                .absolute()
+                .bottom(px(16.0))
+                .right(px(16.0))
+                .max_w(px(560.0))
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(theme.sidebar_bg)
+                .border_1()
+                .border_color(if status.error {
+                    theme.danger
+                } else {
+                    theme.border
+                })
+                .text_color(if status.error {
+                    theme.danger
+                } else {
+                    theme.text
+                })
+                .shadow_md()
+                .child(status.text.clone())
+        });
+
         let is_editing = self.editing.is_some() || self.text_input_open();
         let shortcuts_open = self.shortcuts_open;
         let settings_open = self.settings.is_some() && !shortcuts_open;
@@ -6322,6 +6421,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_open_agenda))
             .on_action(cx.listener(Self::on_open_trash))
+            .on_action(cx.listener(Self::on_export_html))
             .on_action(cx.listener(Self::on_rename_page))
             .on_action(cx.listener(Self::on_delete_page))
             .on_action(cx.listener(Self::on_copy_page_title))
@@ -6336,6 +6436,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_show_shortcuts))
             .child(sidebar)
             .child(content)
+            .children(status_toast)
             .children(overlay)
             .children(settings_overlay)
             .children(page_menu_overlay)
@@ -10935,6 +11036,8 @@ mod tests {
             ("trash", Command::OpenTrash),
             ("recycle", Command::OpenTrash),
             ("undelete", Command::OpenTrash),
+            ("export html", Command::ExportHtml),
+            ("html", Command::ExportHtml),
             ("col all", Command::CollapseAll),
             ("exp all", Command::ExpandAll),
             ("new page", Command::NewPage),
@@ -11093,6 +11196,7 @@ mod tests {
         assert_eq!(hint(Command::CycleTask).as_deref(), Some("Ctrl+Enter"));
         assert_eq!(hint(Command::OpenAgenda), None);
         assert_eq!(hint(Command::OpenTrash), None);
+        assert_eq!(hint(Command::ExportHtml), None);
         assert_eq!(hint(Command::MoveBlockUp).as_deref(), Some("Alt+Up"));
         assert_eq!(hint(Command::MoveBlockDown).as_deref(), Some("Alt+Down"));
         assert_eq!(hint(Command::Paste).as_deref(), Some("Ctrl+V"));
@@ -11488,5 +11592,104 @@ mod tests {
             deleted_label(millis, later(12, 9)),
             "Deleted 2026-10-09 14:05"
         );
+    }
+
+    // --- export --------------------------------------------------------------
+
+    const EXPORT_REF: &str = "6f1c2a3b-0000-4000-8000-00000000abcd";
+
+    fn export_pages() -> [(&'static str, &'static str); 2] {
+        [
+            (
+                "Test",
+                "- TODO see [[Alpha]] & <b>\n  - hidden child ((6f1c2a3b-0000-4000-8000-00000000abcd))\n- ![pic](../assets/p.png)\n",
+            ),
+            ("Alpha", "- quoted text\n  id:: 6f1c2a3b-0000-4000-8000-00000000abcd\n"),
+        ]
+    }
+
+    fn status_text(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Option<String> {
+        view.update(cx, |app, _| app.status.as_ref().map(|s| s.text.clone()))
+    }
+
+    #[gpui::test]
+    fn export_writes_the_page_as_html_and_says_where(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "export", &export_pages(), "Test");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets/p.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
+        // A folded block is exported unfolded.
+        click_on(cx, "fold-0");
+        assert!(!has(cx, "block-1"));
+        assert!(!has(cx, "status-toast"));
+
+        run_in_palette(cx, "export page to html");
+        let path = dir.join("exports/Test.html");
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("<h1 class=\"page-title\">Test</h1>"));
+        assert!(html.contains("<span class=\"task task-todo\">TODO</span>"));
+        assert!(html.contains("[[Alpha]]</span> &amp; &lt;b&gt;"));
+        assert!(html.contains("hidden child"));
+        // The block reference shows the referenced block's text.
+        assert!(html.contains("<span class=\"ref\">quoted text</span>"));
+        assert!(!html.contains(EXPORT_REF));
+        // The image is embedded.
+        assert!(html.contains("src=\"data:image/png;base64,"));
+        assert!(!html.contains("p.png\""));
+
+        // The status says where, then goes away.
+        assert!(has(cx, "status-toast"));
+        let expected = format!("Exported to {}", path.display());
+        assert_eq!(status_text(&view, cx), Some(expected));
+        cx.executor().advance_clock(STATUS_FOR);
+        cx.run_until_parked();
+        assert!(!has(cx, "status-toast") && status_text(&view, cx).is_none());
+
+        // Exporting again (after an edit) replaces the file; the export is
+        // never loaded as a page and the page file is untouched.
+        click_on(cx, "fold-0");
+        click_block(cx, 1);
+        cx.simulate_input(" zqnew");
+        run_in_palette(cx, "export page to html");
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(html.contains("zqnew"));
+        assert_eq!(std::fs::read_dir(dir.join("exports")).unwrap().count(), 1);
+        assert!(file(&dir).contains("zqnew"));
+        assert!(!non_journal_titles(&view, cx)
+            .iter()
+            .any(|t| t.contains("html")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn export_is_offered_only_with_a_page_on_screen(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "export-hidden", &export_pages(), "Test");
+        let offered = view.update(cx, |app, _| app.available_commands());
+        assert!(offered.contains(&Command::ExportHtml));
+        // The journal on screen exports under its file name.
+        view.update(cx, |app, cx| app.open_today(cx));
+        cx.run_until_parked();
+        run_in_palette(cx, "export page to html");
+        let journal = todays_journal_file(&dir).with_extension("html");
+        let name = journal.file_name().unwrap();
+        assert!(dir.join("exports").join(name).exists());
+
+        // On the graph or trash tab there is no page: no command, and the
+        // action does nothing.
+        for tab in ["graph", "trash"] {
+            match tab {
+                "graph" => cx.simulate_keystrokes("ctrl-g"),
+                _ => click_on(cx, "sidebar-trash"),
+            }
+            let offered = view.update(cx, |app, _| app.available_commands());
+            assert!(!offered.contains(&Command::ExportHtml), "{tab}");
+            cx.simulate_keystrokes("ctrl-k");
+            cx.simulate_input("export page to html");
+            assert!(!has(cx, "command-ExportHtml"));
+            cx.simulate_keystrokes("escape");
+            cx.dispatch_action(ExportHtml);
+            assert_eq!(std::fs::read_dir(dir.join("exports")).unwrap().count(), 1);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
