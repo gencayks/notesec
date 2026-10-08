@@ -6,7 +6,7 @@
 //! the block and the page is saved to disk.
 
 use crate::config::Config;
-use crate::editor::{EditorState, SlashMenu};
+use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::model::{backlinks, parse_references, tag_counts, BlockKind, Page};
 use crate::search::{search, Command, Hit, Target};
@@ -44,6 +44,8 @@ actions!(
         SelectHome,
         SelectEnd,
         Paste,
+        Bold,
+        Italic,
         ToggleSearch,
         NewPage,
         Undo,
@@ -80,6 +82,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-home", SelectHome, ctx),
         KeyBinding::new("shift-end", SelectEnd, ctx),
         KeyBinding::new("ctrl-v", Paste, ctx),
+        KeyBinding::new("ctrl-b", Bold, ctx),
+        KeyBinding::new("ctrl-i", Italic, ctx),
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-n", NewPage, None),
@@ -1066,6 +1070,30 @@ impl NoteSec {
             cx.notify();
         }
     }
+
+    fn bold(&mut self, _: &Bold, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_emphasis(Emphasis::Bold, cx);
+    }
+
+    fn italic(&mut self, _: &Italic, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_emphasis(Emphasis::Italic, cx);
+    }
+
+    /// Ctrl+B / Ctrl+I in a block (not the search box). One undo step of its
+    /// own; saved with the rest of the text when editing ends, like typing.
+    fn toggle_emphasis(&mut self, emphasis: Emphasis, cx: &mut Context<Self>) {
+        if self.search.is_some() || self.editing.is_none() {
+            return;
+        }
+        self.close_slash_as_typing();
+        self.text_history_active = false;
+        let before = self.history_state();
+        self.editor.toggle_emphasis(emphasis);
+        if self.editor.text != before.editor.text {
+            self.record_state(before);
+        }
+        cx.notify();
+    }
 }
 
 /// Journals first (newest first, since `YYYY-MM-DD` sorts lexically), then
@@ -1994,6 +2022,8 @@ impl Render for NoteSec {
             .on_mouse_move(cx.listener(Self::on_text_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_text_mouse_up))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::bold))
+            .on_action(cx.listener(Self::italic))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::on_new_page))
             .on_action(cx.listener(Self::on_undo))
@@ -3385,6 +3415,76 @@ mod tests {
         cx.simulate_keystrokes("backspace");
         view.update(cx, |app, _| {
             assert_eq!(app.pages[app.selected].blocks.len(), 2);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn ctrl_b_and_ctrl_i_toggle_the_selection_in_one_undo_step_each(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "fmt-sel", "- hello world\n");
+        select_tail(cx, 0, 5);
+        cx.simulate_keystrokes("ctrl-b");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello **world**"));
+        assert_eq!(selection(&view, cx), Some(8..13), "still on \"world\"");
+        cx.simulate_keystrokes("ctrl-i");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "hello ***world***")
+        });
+        assert_eq!(selection(&view, cx), Some(9..14));
+
+        // Each shortcut is its own undo step, selection included.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello **world**"));
+        assert_eq!(selection(&view, cx), Some(8..13));
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello world"));
+        assert_eq!(selection(&view, cx), Some(6..11));
+        cx.simulate_keystrokes("ctrl-y");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello **world**"));
+
+        // Bold again toggles it off; the result is saved on leaving the block.
+        cx.simulate_keystrokes("ctrl-b");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello world"));
+        assert_eq!(selection(&view, cx), Some(6..11));
+        cx.simulate_keystrokes("ctrl-i escape escape");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), "- hello *world*\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn ctrl_b_wraps_the_word_or_inserts_empty_markers(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "fmt-word", "- héllo wörld\n");
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end ctrl-b");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "héllo **wörld**");
+            assert_eq!(app.editor.cursor, "héllo **wörld".len());
+        });
+
+        // Outside any word: empty markers, typing goes between them.
+        cx.simulate_keystrokes("end");
+        cx.simulate_input(" ");
+        cx.simulate_keystrokes("ctrl-i");
+        cx.simulate_input("ünï");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "héllo **wörld** *ünï*")
+        });
+
+        // Typing after a shortcut is a separate undo step.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "héllo **wörld** **")
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "héllo **wörld** "));
+
+        // The search box ignores the shortcuts.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("ab");
+        cx.simulate_keystrokes("ctrl-b");
+        view.update(cx, |app, _| {
+            assert_eq!(app.search.as_ref().unwrap().query.text, "ab");
         });
         let _ = std::fs::remove_dir_all(dir);
     }

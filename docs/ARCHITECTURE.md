@@ -400,6 +400,21 @@ that mutate, and data races are essentially impossible.
     deleting the "/") restores it exactly, selection included. If the menu
     closes any other way (no match, arrows, click), the "/query" is applied
     as ordinary typing, i.e. it replaces the selection, as one undo step.
+14. **Ctrl+B / Ctrl+I write Logseq's own markers: `**bold**`, `*italic*`** —
+    Logseq's `frontend/config.cljs` (`get-bold` / `get-italic`, checked on
+    master and tag 0.10.9) uses `**` and `*` for markdown, so italic is `*`,
+    not `_`. The shortcut wraps the selection, else the word at the cursor
+    (Unicode word boundaries; between two words the left one wins), else
+    inserts empty markers with the cursor between them. It toggles: the `*`
+    runs at both edges of the target (stars just inside the selection plus
+    stars just outside it) decide whether the style is already there. A run
+    of 1 is italic, 2 bold, 3 both, so `**` is never taken for italic and
+    Ctrl+I inside `**x**` gives `***x***`. Removing takes the stars next to
+    the text; the selection (or the cursor's place in the word) still covers
+    the same text afterwards. Each press is one undo step and the text is
+    saved when editing ends, like typing. Display mode still shows the
+    markers as typed: hiding them would need a display-to-source offset map
+    for click-to-cursor and link hit-testing.
 
 ---
 

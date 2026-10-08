@@ -20,6 +20,33 @@ use crate::search::fuzzy_score;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Inline Markdown emphasis applied by Ctrl+B / Ctrl+I. Both use `*` runs, as
+/// Logseq writes them: `**bold**`, `*italic*` (and `***both***`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Emphasis {
+    Bold,
+    Italic,
+}
+
+impl Emphasis {
+    pub fn marker(self) -> &'static str {
+        match self {
+            Emphasis::Bold => "**",
+            Emphasis::Italic => "*",
+        }
+    }
+
+    /// Whether `*` runs of `left` and `right` stars around some text already
+    /// apply this emphasis. A run of 1 is italic, 2 is bold, 3 is both, so
+    /// `**` bold is never mistaken for `*` italic.
+    fn is_applied(self, left: usize, right: usize) -> bool {
+        match self {
+            Emphasis::Bold => left >= 2 && right >= 2,
+            Emphasis::Italic => left % 2 == 1 && right % 2 == 1,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct EditorState {
     pub text: String,
@@ -192,6 +219,89 @@ impl EditorState {
         let rest = self.text.split_off(self.cursor);
         self.marked = None;
         rest
+    }
+
+    // --- inline formatting -----------------------------------------------------
+
+    /// Ctrl+B / Ctrl+I: toggle `emphasis` on the selection, or else on the
+    /// word at the cursor, or else insert empty markers with the cursor
+    /// between them.
+    ///
+    /// "Already applied" looks at the `*` runs at both edges of the target,
+    /// counting stars just inside it (a selection that includes the markers)
+    /// and just outside it (markers around a selection or word). Removing
+    /// takes the stars next to the text; adding puts them right around it.
+    /// Afterwards the selection (or the cursor, within the word) still covers
+    /// the same text.
+    pub fn toggle_emphasis(&mut self, emphasis: Emphasis) {
+        let selection = self.selection();
+        let reversed = self.selection_reversed();
+        let target = selection
+            .clone()
+            .or_else(|| self.word_at_cursor())
+            .unwrap_or(self.cursor..self.cursor);
+        let piece = &self.text[target.clone()];
+        let stars = |s: &str| s.len() - s.trim_start_matches('*').len();
+        // Stars inside the target's edges (not when it is all stars).
+        let (inside_left, inside_right) = if piece.trim_matches('*').is_empty() {
+            (0, 0)
+        } else {
+            (
+                stars(piece),
+                piece.len() - piece.trim_end_matches('*').len(),
+            )
+        };
+        let outside_left = {
+            let before = &self.text[..target.start];
+            before.len() - before.trim_end_matches('*').len()
+        };
+        let outside_right = stars(&self.text[target.end..]);
+        // The text itself, without the star runs at its edges.
+        let start = target.start + inside_left;
+        let end = target.end - inside_right;
+
+        let marker = emphasis.marker();
+        let k = marker.len();
+        let (new_start, new_end) =
+            if emphasis.is_applied(inside_left + outside_left, inside_right + outside_right) {
+                self.text.replace_range(end..end + k, "");
+                self.text.replace_range(start - k..start, "");
+                (start - k, end - k)
+            } else {
+                self.text.insert_str(end, marker);
+                self.text.insert_str(start, marker);
+                (start + k, end + k)
+            };
+        self.marked = None;
+        if selection.is_some() {
+            let (anchor, cursor) = if reversed {
+                (new_end, new_start)
+            } else {
+                (new_start, new_end)
+            };
+            self.anchor = Some(anchor);
+            self.cursor = cursor;
+        } else {
+            // Keep the cursor at the same place in the word.
+            let offset = self.cursor.clamp(start, end) - start;
+            self.cursor = new_start + offset;
+            self.anchor = None;
+        }
+    }
+
+    /// The word containing (or touching) the cursor, using Unicode word
+    /// boundaries. When the cursor sits between two words, the left one wins.
+    /// Punctuation, spaces and `*` are not words.
+    fn word_at_cursor(&self) -> Option<Range<usize>> {
+        self.text
+            .split_word_bound_indices()
+            .map(|(i, w)| (i..i + w.len(), w))
+            .find(|(r, w)| {
+                r.start <= self.cursor
+                    && self.cursor <= r.end
+                    && w.chars().any(char::is_alphanumeric)
+            })
+            .map(|(r, _)| r)
     }
 
     // --- UTF-8 <-> UTF-16 offset conversion --------------------------------
@@ -532,6 +642,105 @@ mod tests {
             selected: 0,
         };
         assert_eq!(menu.query(&e), Some("q"));
+    }
+
+    fn selected(text: &str, range: Range<usize>) -> EditorState {
+        let mut e = EditorState::new(text);
+        e.cursor = range.start;
+        e.select_to(range.end);
+        e
+    }
+
+    #[test]
+    fn bold_wraps_the_selection_and_keeps_it_on_the_text() {
+        let mut e = selected("say hello now", 4..9);
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!(e.text, "say **hello** now");
+        assert_eq!(e.selection(), Some(6..11));
+        assert_eq!(&e.text[6..11], "hello");
+        e.toggle_emphasis(Emphasis::Italic);
+        assert_eq!(e.text, "say ***hello*** now");
+        assert_eq!(&e.text[e.selection().unwrap()], "hello");
+    }
+
+    #[test]
+    fn emphasis_toggles_off() {
+        // Markers just outside the selection...
+        let mut e = selected("say **hello** now", 6..11);
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!(e.text, "say hello now");
+        assert_eq!(e.selection(), Some(4..9));
+        // ...or inside it.
+        let mut e = selected("say **hello** now", 4..13);
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!(e.text, "say hello now");
+        assert_eq!(e.selection(), Some(4..9));
+        // Italic off; a reversed selection stays reversed.
+        let mut e = selected("*hi*", 3..1);
+        e.toggle_emphasis(Emphasis::Italic);
+        assert_eq!(e.text, "hi");
+        assert_eq!((e.anchor, e.cursor), (Some(2), 0));
+        // Bold and italic don't mistake each other's markers.
+        let mut e = selected("**hi**", 2..4);
+        e.toggle_emphasis(Emphasis::Italic);
+        assert_eq!(e.text, "***hi***", "italic added, bold kept");
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!(e.text, "*hi*", "bold removed, italic kept");
+        e.toggle_emphasis(Emphasis::Bold);
+        e.toggle_emphasis(Emphasis::Italic);
+        assert_eq!(e.text, "**hi**");
+    }
+
+    #[test]
+    fn emphasis_wraps_the_word_at_the_cursor() {
+        let mut e = EditorState::new("say hello now");
+        e.cursor = 6; // "he|llo"
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!(e.text, "say **hello** now");
+        assert_eq!((e.cursor, e.selection()), (8, None), "still he|llo");
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!((e.text.as_str(), e.cursor), ("say hello now", 6));
+        // Touching the end of a word counts; between words the left wins.
+        let mut e = EditorState::new("one two");
+        e.cursor = 3;
+        e.toggle_emphasis(Emphasis::Italic);
+        assert_eq!((e.text.as_str(), e.cursor), ("*one* two", 4));
+    }
+
+    #[test]
+    fn emphasis_inserts_empty_markers_outside_words() {
+        let mut e = EditorState::new("a  b");
+        e.cursor = 2;
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!((e.text.as_str(), e.cursor), ("a **** b", 4));
+        // Toggling again right away removes them.
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!((e.text.as_str(), e.cursor), ("a  b", 2));
+        let mut e = EditorState::new("");
+        e.toggle_emphasis(Emphasis::Italic);
+        assert_eq!((e.text.as_str(), e.cursor), ("**", 1));
+    }
+
+    #[test]
+    fn emphasis_is_unicode_safe() {
+        // Accented, CJK and emoji text; offsets stay on grapheme boundaries.
+        let mut e = EditorState::new("café 😀 naïve");
+        e.cursor = 2; // inside "café"
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!(e.text, "**café** 😀 naïve");
+        let mut e = EditorState::new("naïve");
+        e.cursor = e.text.len();
+        e.toggle_emphasis(Emphasis::Italic);
+        assert_eq!(e.text, "*naïve*");
+        assert_eq!(e.cursor, e.text.len() - 1);
+        let mut e = selected("😀👍🏽", 0.."😀👍🏽".len());
+        e.toggle_emphasis(Emphasis::Italic);
+        assert_eq!(e.text, "*😀👍🏽*");
+        assert_eq!(&e.text[e.selection().unwrap()], "😀👍🏽");
+        // The cursor next to an emoji (not a word) inserts empty markers.
+        let mut e = EditorState::new("😀");
+        e.toggle_emphasis(Emphasis::Bold);
+        assert_eq!((e.text.as_str(), e.cursor), ("😀****", "😀**".len()));
     }
 
     #[test]
