@@ -13,8 +13,9 @@ use crate::model::{
     backlinks, cycle_task, parse_references, tag_counts, BlockKind, Page, TaskState,
 };
 use crate::search::{search, search_templates, Command, Hit, Target};
+use crate::state::UiState;
 use crate::storage::{today_title, Storage, Template};
-use crate::ui::{block_row, fold_arrow, fold_badge, task_checkbox, Theme};
+use crate::ui::{block_row, favorite_star, fold_arrow, fold_badge, task_checkbox, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
@@ -167,6 +168,8 @@ pub struct NoteSec {
     selected: usize,
     /// Persisted user settings (`config.toml`).
     config: Config,
+    /// Favorite and recently opened pages (`state.toml`).
+    state: UiState,
     /// Colours for `config.theme`, kept in sync by `apply_theme`.
     theme: Theme,
     /// The font family actually in use: `config.font_family` if that font is
@@ -265,12 +268,15 @@ impl NoteSec {
             }
         });
 
-        NoteSec {
+        let state = UiState::load(storage.root());
+
+        let mut app = NoteSec {
             storage,
             pages,
             selected,
             theme: Theme::from_kind(config.theme),
             config,
+            state,
             font_family,
             focus_handle,
             editing: None,
@@ -289,7 +295,10 @@ impl NoteSec {
             last_bounds: None,
             #[cfg(test)]
             reading_layouts: Vec::new(),
-        }
+        };
+        // The startup page counts as opened.
+        app.record_recent();
+        app
     }
 
     // --- which editor is active ----------------------------------------------
@@ -316,6 +325,30 @@ impl NoteSec {
         if let Err(err) = self.config.save(self.storage.root()) {
             eprintln!("notesec: failed to save config: {err}");
         }
+    }
+
+    fn save_state(&self) {
+        if let Err(err) = self.state.save(self.storage.root()) {
+            eprintln!("notesec: failed to save state: {err}");
+        }
+    }
+
+    /// Put the selected page at the front of the RECENT list, saving
+    /// `state.toml` only if that changed anything.
+    fn record_recent(&mut self) {
+        let Some(page) = self.pages.get(self.selected) else {
+            return;
+        };
+        if self.state.record_recent(&page.title) {
+            self.save_state();
+        }
+    }
+
+    /// Star or unstar the page called `title` (sidebar star buttons).
+    fn toggle_favorite(&mut self, title: &str, cx: &mut Context<Self>) {
+        self.state.toggle_favorite(title);
+        self.save_state();
+        cx.notify();
     }
 
     fn toggle_theme(&mut self, cx: &mut Context<Self>) {
@@ -538,8 +571,8 @@ impl NoteSec {
         }
         self.pages.push(page);
         sort_pages(&mut self.pages);
-        self.selected = self.find_page(&title).unwrap_or(0);
-        self.mode = Mode::Notes;
+        let ix = self.find_page(&title).unwrap_or(0);
+        self.show_page(ix, cx);
         self.start_edit(0, window, cx);
     }
 
@@ -779,8 +812,17 @@ impl NoteSec {
                 self.find_page(title).unwrap_or(0)
             }
         };
+        self.show_page(ix, cx);
+    }
+
+    /// Show page `ix` in the main pane. Every navigation to a page (sidebar
+    /// rows, favorites/recent, links, search, graph, Today, new page) ends
+    /// here, so the RECENT list sees all of them. Callers leave edit mode
+    /// first (`stop_edit`), since saving can add pages and shift indices.
+    fn show_page(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.selected = ix;
         self.mode = Mode::Notes;
+        self.record_recent();
         cx.notify();
     }
 
@@ -805,9 +847,8 @@ impl NoteSec {
             let page = create_journal(&self.storage, &today);
             self.add_page(page);
         }
-        self.selected = self.find_journal(&today).unwrap_or(0);
-        self.mode = Mode::Notes;
-        cx.notify();
+        let ix = self.find_journal(&today).unwrap_or(0);
+        self.show_page(ix, cx);
     }
 
     // --- graph view ------------------------------------------------------------
@@ -1739,12 +1780,24 @@ impl Render for NoteSec {
         // --- Sidebar: one clickable row per page ---------------------------
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = ix == self.selected;
+            let is_favorite = self.state.is_favorite(&page.title);
+            let title = page.title.clone();
+            let star_title = page.title.clone();
             div()
                 // Interactive elements need a stable id; (name, index) is the idiom.
                 .id(("page", ix))
+                .debug_selector(|| format!("page-{ix}"))
+                // Every row uses the same group name (Zed's idiom): the star's
+                // `group_hover` resolves to the row it sits in.
+                .group("page-row")
                 .px_3()
                 .py_1()
                 .rounded_md()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_2()
                 .cursor_pointer()
                 .text_color(if is_selected {
                     theme.accent
@@ -1755,13 +1808,110 @@ impl Render for NoteSec {
                 .hover(|d| d.bg(theme.selected_bg))
                 // `cx.listener` turns a closure over `&mut Self` into a GPUI handler.
                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.stop_edit(cx); // save the block being edited first
-                    this.selected = ix;
-                    this.mode = Mode::Notes;
-                    cx.notify(); // ask GPUI to re-render this view
+                    // Save the block being edited first. Saving can add pages
+                    // and re-sort, shifting indices, so find the row's page again.
+                    this.stop_edit(cx);
+                    let ix = match this.pages.get(ix) {
+                        Some(p) if p.title == title => ix,
+                        _ => this.find_page(&title).unwrap_or(0),
+                    };
+                    this.show_page(ix, cx);
                 }))
-                .child(page.title.clone())
+                .child(div().flex_1().overflow_hidden().child(page.title.clone()))
+                .child(
+                    favorite_star(&theme, is_favorite)
+                        .id(("star", ix))
+                        .debug_selector(|| format!("star-{ix}"))
+                        // Outline stars only show while the row is hovered.
+                        .when(!is_favorite, |d| {
+                            d.invisible().group_hover("page-row", |s| s.visible())
+                        })
+                        .on_click(cx.listener(move |this, _e, _window, cx| {
+                            // Starring must not also open the page.
+                            cx.stop_propagation();
+                            this.toggle_favorite(&star_title, cx);
+                        })),
+                )
         });
+
+        // FAVORITES and RECENT: pages by title, skipping titles whose page no
+        // longer exists (they stay in `state.toml`). Clicking opens the page.
+        let current_title = (self.mode == Mode::Notes)
+            .then(|| {
+                self.pages
+                    .get(self.selected)
+                    .map(|p| p.title.to_lowercase())
+            })
+            .flatten();
+        let shortcut_row = |id: ElementId, selector: String, title: &str| {
+            let is_current = current_title.as_deref() == Some(title.to_lowercase().as_str());
+            let target = title.to_string();
+            div()
+                .id(id)
+                .debug_selector(move || selector)
+                .group("page-row")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .cursor_pointer()
+                .text_color(if is_current { theme.accent } else { theme.text })
+                .when(is_current, |d| d.bg(theme.selected_bg))
+                .hover(|d| d.bg(theme.selected_bg))
+                .on_click(cx.listener(move |this, _e, _window, cx| {
+                    this.open_page(&target, cx);
+                }))
+                .child(div().flex_1().overflow_hidden().child(title.to_string()))
+        };
+        let existing = |titles: &[String]| -> Vec<(usize, String)> {
+            titles
+                .iter()
+                .filter_map(|t| self.find_page(t).map(|ix| self.pages[ix].title.clone()))
+                .enumerate()
+                .collect()
+        };
+        let favorite_rows: Vec<AnyElement> = existing(&self.state.favorites)
+            .into_iter()
+            .map(|(i, title)| {
+                let star_title = title.clone();
+                shortcut_row(ElementId::from(("fav", i)), format!("fav-{i}"), &title)
+                    .child(
+                        favorite_star(&theme, true)
+                            .id(("fav-star", i))
+                            .debug_selector(|| format!("fav-star-{i}"))
+                            .invisible()
+                            .group_hover("page-row", |s| s.visible())
+                            .on_click(cx.listener(move |this, _e, _window, cx| {
+                                cx.stop_propagation();
+                                this.toggle_favorite(&star_title, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let recent_rows: Vec<AnyElement> = existing(&self.state.recent)
+            .into_iter()
+            .map(|(i, title)| {
+                shortcut_row(
+                    ElementId::from(("recent", i)),
+                    format!("recent-{i}"),
+                    &title,
+                )
+                .into_any_element()
+            })
+            .collect();
+        let section_header = |label: &'static str| {
+            div()
+                .mt_2()
+                .px_3()
+                .py_2()
+                .text_color(theme.muted)
+                .child(label)
+        };
 
         // Tag index: every tag in the graph with how many blocks use it.
         // Clicking one opens its page, whose backlinks panel lists the uses.
@@ -1873,6 +2023,12 @@ impl Render for NoteSec {
             .overflow_y_scroll()
             .child(today_item)
             .child(graph_item)
+            .when(!favorite_rows.is_empty(), |d| {
+                d.child(section_header("FAVORITES")).children(favorite_rows)
+            })
+            .when(!recent_rows.is_empty(), |d| {
+                d.child(section_header("RECENT")).children(recent_rows)
+            })
             .child(pages_header)
             .children(sidebar_items)
             .when(has_tags, |d| {
@@ -2410,6 +2566,7 @@ impl Render for NoteSec {
 mod tests {
     use super::*;
     use crate::config::ThemeKind;
+    use crate::state::MAX_RECENT;
     use gpui::{
         Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
         VisualTestContext,
@@ -4509,6 +4666,195 @@ mod tests {
             assert_eq!(app.pages[app.selected].title, "Test")
         });
         assert_eq!(shown(cx, 3), [0, 1, 2]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- favorites and recent pages ----------------------------------------
+
+    /// Selector of the sidebar row (or, with `prefix = "star"`, its star) for
+    /// the page called `title`.
+    fn page_row(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        prefix: &str,
+        title: &str,
+    ) -> String {
+        let ix = view.update(cx, |app, _| app.find_page(title).expect(title));
+        format!("{prefix}-{ix}")
+    }
+
+    fn selected_title(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> String {
+        view.update(cx, |app, _| app.pages[app.selected].title.clone())
+    }
+
+    /// Move the mouse onto `selector`'s element, as a real pointer does
+    /// before a click. Outline stars are only painted (and so only clickable)
+    /// while their row is hovered.
+    fn hover(cx: &mut VisualTestContext, selector: &str) {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        let bounds = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn clicking_a_page_row_records_it_in_recent_and_persists(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "recent-click",
+            &[("Alpha", "- a\n"), ("Beta", "- b\n")],
+            "Alpha",
+        );
+        // Startup counts as opening today's journal.
+        let today = today_title();
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.recent, vec![today.clone()])
+        });
+
+        let row = page_row(&view, cx, "page", "Beta");
+        click_on(cx, &row);
+
+        assert_eq!(selected_title(&view, cx), "Beta");
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.recent, vec!["Beta".to_string(), today.clone()]);
+            assert_eq!(UiState::load(&dir), app.state);
+        });
+        // config.toml is not touched by navigation.
+        assert!(!Config::path(&dir).exists());
+
+        // The RECENT section lists them, most recent first; a row opens its page.
+        assert!(has(cx, "recent-0") && has(cx, "recent-1") && !has(cx, "recent-2"));
+        click_on(cx, "recent-1");
+        assert_eq!(selected_title(&view, cx), today);
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.recent, vec![today.clone(), "Beta".to_string()])
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn recent_is_most_recent_first_deduped_and_capped(cx: &mut TestAppContext) {
+        let titles: Vec<String> = (0..12).map(|i| format!("P{i:02}")).collect();
+        let pages: Vec<(&str, &str)> = titles.iter().map(|t| (t.as_str(), "- x\n")).collect();
+        let (view, cx, dir) = setup_pages(cx, "recent-cap", &pages, "P00");
+
+        for title in &titles {
+            let row = page_row(&view, cx, "page", title);
+            click_on(cx, &row);
+        }
+        // Reopening a page moves it to the front without duplicating it,
+        // whichever route opened it (here: a search for it, via `open_page`).
+        view.update(cx, |app, cx| app.open_page("p05", cx));
+
+        let expected: Vec<String> = [
+            "P05", "P11", "P10", "P09", "P08", "P07", "P06", "P04", "P03", "P02",
+        ]
+        .map(String::from)
+        .to_vec();
+        view.update(cx, |app, _| assert_eq!(app.state.recent, expected));
+        assert_eq!(UiState::load(&dir).recent, expected);
+        cx.run_until_parked();
+        assert!(has(cx, &format!("recent-{}", MAX_RECENT - 1)));
+        assert!(!has(cx, &format!("recent-{MAX_RECENT}")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn star_favorites_without_navigating_and_favorites_open_the_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "favorite-star",
+            &[("Alpha", "- a\n"), ("Beta", "- b\n")],
+            "Alpha",
+        );
+        assert!(!has(cx, "fav-0"));
+
+        let row = page_row(&view, cx, "page", "Beta");
+        let star = page_row(&view, cx, "star", "Beta");
+        hover(cx, &row);
+        click_on(cx, &star);
+
+        // Starred, but still on Alpha (the row's own click did not run).
+        assert_eq!(selected_title(&view, cx), "Alpha");
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.favorites, vec!["Beta".to_string()]);
+            assert!(!app.state.recent.contains(&"Beta".to_string()));
+        });
+        assert_eq!(UiState::load(&dir).favorites, vec!["Beta".to_string()]);
+
+        // The FAVORITES section appears, and its row opens the page.
+        assert!(has(cx, "fav-0") && !has(cx, "fav-1"));
+        click_on(cx, "fav-0");
+        assert_eq!(selected_title(&view, cx), "Beta");
+        view.update(cx, |app, _| assert_eq!(app.state.recent[0], "Beta"));
+
+        // A favorite's star in the PAGES list is always shown; clicking it
+        // unstars without navigating.
+        cx.simulate_mouse_move(point(px(900.), px(900.)), None, Modifiers::none());
+        let alpha = page_row(&view, cx, "page", "Alpha");
+        click_on(cx, &alpha);
+        let star = page_row(&view, cx, "star", "Beta");
+        click_on(cx, &star);
+        assert_eq!(selected_title(&view, cx), "Alpha");
+        view.update(cx, |app, _| assert!(app.state.favorites.is_empty()));
+        assert!(!has(cx, "fav-0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn favorites_star_unfavorites_and_missing_pages_are_skipped(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "favorite-unstar",
+            &[("Alpha", "- a\n"), ("Beta", "- b\n")],
+            "Alpha",
+        );
+        view.update(cx, |app, cx| {
+            app.toggle_favorite("Gone", cx); // no such page
+            app.toggle_favorite("beta", cx); // case differs from the page
+        });
+        cx.run_until_parked();
+        // Only the existing page is listed, under its real title.
+        assert!(has(cx, "fav-0") && !has(cx, "fav-1"));
+
+        hover(cx, "fav-0");
+        click_on(cx, "fav-star-0");
+
+        assert_eq!(selected_title(&view, cx), "Alpha");
+        view.update(cx, |app, _| {
+            // The missing page's entry is kept, not cleaned up.
+            assert_eq!(app.state.favorites, vec!["Gone".to_string()]);
+        });
+        assert_eq!(UiState::load(&dir).favorites, vec!["Gone".to_string()]);
+        assert!(!has(cx, "fav-0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn state_reloads_into_a_fresh_window(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "state-reload",
+            &[("Alpha", "- a\n"), ("Beta", "- b\n")],
+            "Alpha",
+        );
+        view.update(cx, |app, cx| {
+            app.toggle_favorite("Alpha", cx);
+            app.open_page("Beta", cx);
+        });
+        let saved = view.update(cx, |app, _| app.state.clone());
+
+        let storage = Storage::open(dir.clone()).unwrap();
+        let (view2, cx2) = cx
+            .cx
+            .add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
+        cx2.run_until_parked();
+        view2.update(cx2, |app, _| {
+            assert_eq!(app.state.favorites, saved.favorites);
+            // Startup opens today's journal, which moves to the front.
+            assert_eq!(app.state.recent, vec![today_title(), "Beta".to_string()]);
+        });
+        assert!(has(cx2, "fav-0") && has(cx2, "recent-1"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

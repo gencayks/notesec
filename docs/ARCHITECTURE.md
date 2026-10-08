@@ -327,6 +327,10 @@ too, and "nothing is focused" is a real bug class.
   parsing. `#[serde(rename_all = "lowercase")]` maps `Dark` to `"dark"`.
   Missing keys fall back to defaults, so old config files never break.
 
+- **`state.rs` — UI state, not settings.** Favorite and recent page titles
+  in `state.toml`, with the same load/save rules as `config.rs` (see
+  decision 21).
+
 - **`main.rs` — boring on purpose.** Declare modules, open storage, load config,
   open an 1100x700 window, hand control to GPUI's event loop. If `main` is long,
   something's wrong.
@@ -508,6 +512,30 @@ that mutate, and data races are essentially impossible.
     replaced instead of leaving a stray empty bullet. The template's own
     nesting is kept, every copy gets fresh IDs, and the whole insert is one
     undo step.
+21. **Favorites and recent pages live in `state.toml`, and every navigation
+    goes through `show_page`**: hovering a sidebar page row shows a `☆`;
+    clicking it stars the page (its click handler calls
+    `cx.stop_propagation()`, so the row's own click doesn't also open the
+    page). Starred pages show a filled `★` and are listed under FAVORITES
+    (right after Today / Graph view, only when non-empty; hovering a row
+    shows the `★` that unstars it). RECENT (between FAVORITES and PAGES)
+    lists the last 10 opened pages, most recent first, deduped ignoring case.
+    Both are stored by page title in `<graph>/state.toml` (`state.rs`), not in
+    `config.toml`: RECENT changes on every page you open, and rewriting the
+    hand-edited settings file that often would be rude. `state.rs` copies
+    `config.rs`'s rules (serde defaults, atomic write, a missing file means
+    empty lists, an invalid one is copied to `state.toml.bak`), cleans
+    hand-edits on load (blank titles, duplicates, more than 10 recent), and
+    is only written when something actually changed. Titles whose page no
+    longer exists are skipped in the sidebar but kept in the file (the page
+    may come back, e.g. from a sync or `git checkout`). Navigation is
+    centralized: `NoteSec::show_page(ix)` sets `selected`, switches to the
+    notes view and records the page in RECENT. The sidebar page rows,
+    `open_page` (links, tags, backlinks, search, graph nodes, favorites and
+    recent rows), `open_today` and `new_page` all end there, and startup
+    records its page too. Undo/redo and `add_page` move `selected` without
+    going through it, since they aren't the user opening a page. Anything
+    new that opens a page (e.g. tabs) should call `show_page` or `open_page`.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

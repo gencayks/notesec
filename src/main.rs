@@ -6,6 +6,7 @@ mod graph;
 mod graph_view;
 mod model;
 mod search;
+mod state;
 mod storage;
 mod ui;
 
