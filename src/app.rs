@@ -50,6 +50,7 @@ actions!(
         Italic,
         ToggleSearch,
         NewPage,
+        OpenToday,
         Undo,
         Redo,
         ToggleTheme,
@@ -89,6 +90,7 @@ pub fn bind_keys(cx: &mut App) {
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-n", NewPage, None),
+        KeyBinding::new("ctrl-j", OpenToday, None),
         KeyBinding::new("ctrl-z", Undo, None),
         KeyBinding::new("ctrl-shift-z", Redo, None),
         KeyBinding::new("ctrl-y", Redo, None),
@@ -207,12 +209,7 @@ impl NoteSec {
         // Auto-create today's journal if it doesn't exist yet.
         let today = today_title();
         if !pages.iter().any(|p| p.is_journal && p.title == today) {
-            let mut page = Page::from_markdown(&today, true, "- \n");
-            page.blocks[0].content.clear();
-            if let Err(err) = storage.save(&page) {
-                eprintln!("notesec: could not create journal {today}: {err}");
-            }
-            pages.push(page);
+            pages.push(create_journal(&storage, &today));
         }
 
         // First run: give the user something to look at.
@@ -528,6 +525,10 @@ impl NoteSec {
         self.new_page(window, cx);
     }
 
+    fn on_open_today(&mut self, _: &OpenToday, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_today(cx);
+    }
+
     fn on_undo(&mut self, action: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.undo(action, window, cx);
     }
@@ -695,6 +696,32 @@ impl NoteSec {
             }
         };
         self.selected = ix;
+        self.mode = Mode::Notes;
+        cx.notify();
+    }
+
+    /// Index of the journal page for `title` (`YYYY-MM-DD`). Only journals
+    /// match, so a regular page that happens to have a date as its name is
+    /// never mistaken for the daily note.
+    fn find_journal(&self, title: &str) -> Option<usize> {
+        self.pages
+            .iter()
+            .position(|p| p.is_journal && p.title == title)
+    }
+
+    /// Show today's journal ("Today" button / Ctrl-J), creating it if it
+    /// doesn't exist yet. Startup already creates it, but the app may have been
+    /// left open past midnight, or the file deleted behind our back.
+    fn open_today(&mut self, cx: &mut Context<Self>) {
+        // Save the block being edited first (this may add pages and reorder
+        // the sidebar, so look the journal up afterwards).
+        self.stop_edit(cx);
+        let today = today_title();
+        if self.find_journal(&today).is_none() {
+            let page = create_journal(&self.storage, &today);
+            self.add_page(page);
+        }
+        self.selected = self.find_journal(&today).unwrap_or(0);
         self.mode = Mode::Notes;
         cx.notify();
     }
@@ -1132,6 +1159,19 @@ fn reading_highlights(
             (range, style)
         })
         .collect()
+}
+
+/// Create and save an empty journal page for `title` (`YYYY-MM-DD`). Storage
+/// turns the title into Logseq's `journals/YYYY_MM_DD.md` file name. A failed
+/// save is reported but the page is still returned, so the user can type and
+/// the next save can retry.
+fn create_journal(storage: &Storage, title: &str) -> Page {
+    let mut page = Page::from_markdown(title, true, "- \n");
+    page.blocks[0].content.clear();
+    if let Err(err) = storage.save(&page) {
+        eprintln!("notesec: could not create journal {title}: {err}");
+    }
+    page
 }
 
 /// Journals first (newest first, since `YYYY-MM-DD` sorts lexically), then
@@ -1591,6 +1631,31 @@ impl Render for NoteSec {
             .collect();
         let has_tags = !tag_rows.is_empty();
 
+        // "Today" button at the very top: one click to today's journal.
+        // Highlighted while that journal is the page on screen.
+        let today = today_title();
+        let on_today = self.mode == Mode::Notes
+            && self
+                .pages
+                .get(self.selected)
+                .is_some_and(|p| p.is_journal && p.title == today);
+        let today_item = div()
+            .id("today")
+            .debug_selector(|| "today".to_string())
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .cursor_pointer()
+            .text_color(if on_today { theme.accent } else { theme.text })
+            .when(on_today, |d| d.bg(theme.selected_bg))
+            .hover(|d| d.bg(theme.selected_bg))
+            .on_click(cx.listener(|this, _e, _window, cx| this.open_today(cx)))
+            .child("Today")
+            .child(div().text_color(theme.muted).child("Ctrl-J"));
+
         // "Graph view" entry above the page list; highlighted while open.
         let in_graph = self.mode == Mode::Graph;
         let graph_item = div()
@@ -1644,6 +1709,7 @@ impl Render for NoteSec {
             .border_r_1()
             .border_color(theme.border)
             .overflow_y_scroll()
+            .child(today_item)
             .child(graph_item)
             .child(pages_header)
             .children(sidebar_items)
@@ -2074,6 +2140,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::italic))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::on_new_page))
+            .on_action(cx.listener(Self::on_open_today))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_toggle_theme))
@@ -2193,6 +2260,124 @@ mod tests {
             std::fs::read_to_string(dir.join("pages/Untitled.md")).unwrap(),
             "- \n"
         );
+    }
+
+    /// Path of today's journal file in `dir` (Logseq naming: `YYYY_MM_DD.md`).
+    fn todays_journal_file(dir: &std::path::Path) -> PathBuf {
+        dir.join(format!("journals/{}.md", today_title().replace('-', "_")))
+    }
+
+    /// Like `setup`, but today's journal already exists on disk with
+    /// `journal_markdown` before the app starts.
+    fn setup_with_journal<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        journal_markdown: &str,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("notesec-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        std::fs::write(dir.join("pages/Test.md"), "- hello\n").unwrap();
+        std::fs::write(todays_journal_file(&dir), journal_markdown).unwrap();
+
+        cx.update(bind_keys);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
+        view.update(cx, |app, cx| {
+            app.selected = app.pages.iter().position(|p| p.title == "Test").unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (view, cx, dir)
+    }
+
+    #[gpui::test]
+    fn today_button_opens_the_existing_journal(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_with_journal(cx, "today-existing", "- morning notes\n");
+        let button = cx.debug_bounds("today").expect("Today button rendered");
+
+        cx.simulate_click(button.center(), Modifiers::none());
+
+        let today = today_title();
+        view.update(cx, |app, _| {
+            let page = &app.pages[app.selected];
+            assert!(page.is_journal);
+            assert_eq!(page.title, today);
+            assert_eq!(page.blocks[0].content, "morning notes");
+            assert_eq!(
+                app.pages.iter().filter(|p| p.is_journal && p.title == today).count(),
+                1,
+                "no duplicate journal created"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(todays_journal_file(&dir)).unwrap(),
+            "- morning notes\n",
+            "existing journal left untouched"
+        );
+    }
+
+    #[gpui::test]
+    fn today_button_creates_a_missing_journal(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "today-missing", "- hello\n");
+        // Simulate the journal not existing (e.g. the app was left open past
+        // midnight, or the file was deleted): drop it from memory and disk.
+        let today = today_title();
+        view.update(cx, |app, cx| {
+            app.pages.retain(|p| !(p.is_journal && p.title == today));
+            app.selected = app.find_page("Test").unwrap();
+            cx.notify();
+        });
+        std::fs::remove_file(todays_journal_file(&dir)).unwrap();
+        cx.run_until_parked();
+
+        let button = cx.debug_bounds("today").expect("Today button rendered");
+        cx.simulate_click(button.center(), Modifiers::none());
+
+        view.update(cx, |app, _| {
+            let page = &app.pages[app.selected];
+            assert!(page.is_journal);
+            assert_eq!(page.title, today);
+            assert_eq!(app.mode, Mode::Notes);
+            // Journals sort first, so it is back at the top of the sidebar.
+            assert_eq!(app.selected, 0);
+        });
+        assert_eq!(
+            std::fs::read_to_string(todays_journal_file(&dir)).unwrap(),
+            "- \n",
+            "journal file created with Logseq naming"
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_j_opens_today_and_saves_the_edited_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "today-ctrl-j", "- hello\n");
+        click_block(cx, 0);
+        cx.simulate_input(" world");
+
+        cx.simulate_keystrokes("ctrl-j");
+
+        view.update(cx, |app, _| {
+            let page = &app.pages[app.selected];
+            assert!(page.is_journal);
+            assert_eq!(page.title, today_title());
+            assert_eq!(app.editing, None);
+        });
+        assert_eq!(file(&dir), "- hello world\n");
+    }
+
+    #[gpui::test]
+    fn ctrl_j_leaves_the_graph_view(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = setup(cx, "today-from-graph", "- hello\n");
+        cx.simulate_keystrokes("ctrl-g");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+
+        cx.simulate_keystrokes("ctrl-j");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Notes);
+            assert_eq!(app.pages[app.selected].title, today_title());
+        });
     }
 
     #[gpui::test]
