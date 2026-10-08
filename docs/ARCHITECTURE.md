@@ -709,6 +709,32 @@ that mutate, and data races are essentially impossible.
     keeps for the session, so it survives leaving and reopening the graph
     but not a restart (not saved; it is a way of looking, not a setting).
     The palette's "Toggle local graph" shows the graph and flips the mode.
+32. **Agenda: open tasks by date, as a tab.** `SCHEDULED:` /
+    `DEADLINE:` markers are Logseq's: a line of the block (a continuation
+    line under the task) that starts with either keyword and a date in
+    angle brackets (`SCHEDULED: <2026-10-09 Fri>`, weekday and time
+    optional, Logseq repeaters ignored). Both markers may share a line;
+    the first valid one of each kind wins. The format is documented in
+    `agenda.rs`. Open tasks are `TODO`/`DOING`/`LATER`/`NOW` (`DONE` is
+    finished). A task's date is the earlier of its scheduled and deadline
+    dates; a task on a journal page gets no date from the journal (only a
+    marker counts, as in Logseq). Grouping relative to today is pure
+    (`Agenda::build` in `agenda.rs`): Overdue, Today, Upcoming (one day
+    header each, soonest first) and Unscheduled (open tasks with no
+    marker, last). Within a group (or day), started tasks come first, then
+    by page title. The agenda is a tab (`TabTarget::Agenda`, mode
+    `Mode::Agenda`), like the graph: the sidebar's "Agenda" entry
+    (`sidebar-agenda`) and the palette's "Open agenda" open or focus it;
+    no keyboard shortcut (Ctrl keys are already taken). Built from the
+    pages on every render, so finishing or dating a task shows up when
+    you come back (or when you focus the tab again). Clicking an item
+    opens its page in a new (or existing) page tab — the agenda tab
+    stays, like the graph's — and unfolds the task's block; it is not
+    put in edit mode, because the date lives on a second line and the
+    editor is still single-line on this branch. Reading view leaves the
+    marker lines as plain text for now: stripping them in `DisplayBlock`
+    and drawing a chip would be nicer, but it is not free and the agenda
+    itself already shows the date.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

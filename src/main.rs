@@ -1,3 +1,4 @@
+mod agenda;
 mod app;
 mod config;
 mod display;

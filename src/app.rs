@@ -5,6 +5,7 @@
 //! stops (Escape, click elsewhere, switching pages) the text is written back to
 //! the block and the page is saved to disk.
 
+use crate::agenda::{day_label, Agenda, AgendaItem};
 use crate::config::{Config, ThemeKind};
 use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
@@ -136,6 +137,8 @@ enum Mode {
     Notes,
     /// The page graph.
     Graph,
+    /// The agenda: open tasks by date.
+    Agenda,
     /// No tab is open: an empty state with hints.
     Empty,
 }
@@ -586,6 +589,7 @@ impl NoteSec {
             Command::OpenSettings => self.open_settings(cx),
             Command::SortPagesAz => self.sort_pages_az(cx),
             Command::ToggleLocalGraph => self.toggle_local_graph(cx),
+            Command::OpenAgenda => self.show_agenda(cx),
         }
     }
 
@@ -749,7 +753,7 @@ impl NoteSec {
         let pages = &self.pages;
         self.tabs.retain(|t| match t {
             TabTarget::Page(title) => pages.iter().any(|p| p.title == *title),
-            TabTarget::Graph => true,
+            TabTarget::Graph | TabTarget::Agenda => true,
         });
         if self.editing.is_some() || matches!(self.tabs.active_target(), Some(TabTarget::Page(_))) {
             // Not `show_page`: undo/redo isn't the user opening a page, so
@@ -1127,6 +1131,11 @@ impl NoteSec {
             Some(TabTarget::Graph) => {
                 self.refresh_graph(cx);
                 self.mode = Mode::Graph;
+                cx.notify();
+            }
+            // Built from the pages on every render, so it is never stale.
+            Some(TabTarget::Agenda) => {
+                self.mode = Mode::Agenda;
                 cx.notify();
             }
             None => {
@@ -1509,6 +1518,37 @@ impl NoteSec {
             self.state.page_order.clear();
             self.save_state();
             self.sort_pages();
+        }
+        cx.notify();
+    }
+
+    // --- agenda ----------------------------------------------------------------
+
+    /// "Open agenda" (palette, sidebar): open or focus the agenda tab.
+    fn show_agenda(&mut self, cx: &mut Context<Self>) {
+        // Save the block being edited so the agenda sees it.
+        self.stop_edit(cx);
+        self.tabs.open(TabTarget::Agenda);
+        self.apply_tab(cx);
+    }
+
+    /// The agenda as of now.
+    fn agenda(&self) -> Agenda {
+        Agenda::build(&self.pages, chrono::Local::now().date_naive())
+    }
+
+    /// Clicking an agenda item: open its page in a tab (the agenda tab
+    /// stays, like the graph's) and unfold the task's block. It is not put
+    /// in edit mode: the block holds the date marker on a second line, and
+    /// the editor is single-line on this branch.
+    fn open_agenda_item(&mut self, page: &str, block: uuid::Uuid, cx: &mut Context<Self>) {
+        self.navigate(page, Nav::Tab, cx);
+        if let Some(ix) = self.pages[self.selected]
+            .blocks
+            .iter()
+            .position(|b| b.id == block)
+        {
+            self.reveal(ix);
         }
         cx.notify();
     }
@@ -2894,6 +2934,171 @@ impl NoteSec {
     }
 }
 
+impl NoteSec {
+    /// The agenda tab: open tasks in Overdue, Today, Upcoming (one header
+    /// per day) and Unscheduled sections. Rows are numbered top to bottom
+    /// (`agenda-item-{i}`).
+    fn render_agenda(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let agenda = self.agenda();
+        let today = chrono::Local::now().date_naive();
+        let mut children: Vec<AnyElement> = Vec::new();
+        let mut next: usize = 0;
+
+        let header = |id: &'static str, label: String, color: gpui::Rgba| {
+            div()
+                .debug_selector(move || id.to_string())
+                .mt_4()
+                .px_3()
+                .py_1()
+                .text_color(color)
+                .child(label)
+                .into_any_element()
+        };
+        let mut row =
+            |item: &AgendaItem| {
+                let i = next;
+                next += 1;
+                let (page, block) = (item.page.clone(), item.block);
+                let started = item.state.is_started();
+                let date = |kind: &str, d: Option<crate::agenda::AgendaDate>, late: bool| {
+                    d.map(|d| {
+                        div()
+                            .flex_shrink_0()
+                            .text_color(if late { theme.danger } else { theme.muted })
+                            .child(format!("{kind} {}", d.label()))
+                    })
+                };
+                div()
+                    .id(("agenda-item", i))
+                    .debug_selector(move || format!("agenda-item-{i}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.selected_bg))
+                    .on_click(cx.listener(move |this, _e, _window, cx| {
+                        this.open_agenda_item(&page, block, cx)
+                    }))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if started { theme.accent } else { theme.border })
+                            .text_color(if started { theme.accent } else { theme.muted })
+                            .child(item.state.keyword()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.text)
+                            .child(item.text.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .max_w(px(180.0))
+                            .truncate()
+                            .text_color(theme.muted)
+                            .child(item.page.clone()),
+                    )
+                    .children(date(
+                        "Scheduled",
+                        item.dates.scheduled,
+                        item.dates.scheduled.is_some_and(|d| d.date < today),
+                    ))
+                    .children(date(
+                        "Deadline",
+                        item.dates.deadline,
+                        item.dates.deadline.is_some_and(|d| d.date < today),
+                    ))
+                    .into_any_element()
+            };
+
+        if !agenda.overdue.is_empty() {
+            children.push(header(
+                "agenda-group-overdue",
+                format!("OVERDUE \u{b7} {}", agenda.overdue.len()),
+                theme.danger,
+            ));
+            children.extend(agenda.overdue.iter().map(&mut row));
+        }
+        if !agenda.today.is_empty() {
+            children.push(header(
+                "agenda-group-today",
+                format!("TODAY \u{b7} {}", day_label(today)),
+                theme.accent,
+            ));
+            children.extend(agenda.today.iter().map(&mut row));
+        }
+        if !agenda.upcoming.is_empty() {
+            children.push(header(
+                "agenda-group-upcoming",
+                "UPCOMING".to_string(),
+                theme.muted,
+            ));
+            for (day, items) in &agenda.upcoming {
+                children.push(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .text_color(theme.text)
+                        .child(day_label(*day))
+                        .into_any_element(),
+                );
+                children.extend(items.iter().map(&mut row));
+            }
+        }
+        if !agenda.unscheduled.is_empty() {
+            children.push(header(
+                "agenda-group-unscheduled",
+                format!("UNSCHEDULED \u{b7} {}", agenda.unscheduled.len()),
+                theme.muted,
+            ));
+            children.extend(agenda.unscheduled.iter().map(&mut row));
+        }
+        if agenda.is_empty() {
+            children.push(
+                div()
+                    .mt_4()
+                    .px_3()
+                    .text_color(theme.muted)
+                    .child(
+                        "No open tasks. Start a block with TODO; date it with a line \
+                         SCHEDULED: <2026-10-09> or DEADLINE: <2026-10-09> under it.",
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .id("agenda")
+            .debug_selector(|| "agenda".to_string())
+            .flex_1()
+            .h_full()
+            .overflow_y_scroll()
+            .p_8()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(px(self.config.font_size * 1.9))
+                    .text_color(theme.text)
+                    .child("Agenda"),
+            )
+            .children(children)
+            .into_any_element()
+    }
+}
+
 impl Render for NoteSec {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A drag released outside the sidebar just ends (GPUI drops it), so
@@ -3188,6 +3393,21 @@ impl Render for NoteSec {
             .on_click(cx.listener(|this, _e, _window, cx| this.toggle_graph(cx)))
             .child("Graph view");
 
+        // "Agenda" entry: open tasks by date; highlighted while open.
+        let in_agenda = self.mode == Mode::Agenda;
+        let agenda_item = div()
+            .id("sidebar-agenda")
+            .debug_selector(|| "sidebar-agenda".to_string())
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(if in_agenda { theme.accent } else { theme.text })
+            .when(in_agenda, |d| d.bg(theme.selected_bg))
+            .hover(|d| d.bg(theme.selected_bg))
+            .on_click(cx.listener(|this, _e, _window, cx| this.show_agenda(cx)))
+            .child("Agenda");
+
         let pages_header = div()
             .px_3()
             .py_2()
@@ -3261,6 +3481,7 @@ impl Render for NoteSec {
             .overflow_y_scroll()
             .child(today_item)
             .child(graph_item)
+            .child(agenda_item)
             .when(!favorite_rows.is_empty(), |d| {
                 d.child(section_header("FAVORITES")).children(favorite_rows)
             })
@@ -3767,6 +3988,7 @@ impl Render for NoteSec {
                 let label = match tab {
                     TabTarget::Page(title) => title.clone(),
                     TabTarget::Graph => "Graph".to_string(),
+                    TabTarget::Agenda => "Agenda".to_string(),
                 };
                 div()
                     .id(("tab", i))
@@ -3876,6 +4098,7 @@ impl Render for NoteSec {
         // state.
         let view: AnyElement = match (&self.mode, &self.graph) {
             (Mode::Graph, Some(graph)) => graph.clone().into_any_element(),
+            (Mode::Agenda, _) => self.render_agenda(cx),
             (Mode::Empty, _) => empty_state().into_any_element(),
             _ => main.into_any_element(),
         };
@@ -6164,6 +6387,7 @@ mod tests {
                 .map(|t| match t {
                     TabTarget::Page(title) => title.clone(),
                     TabTarget::Graph => "Graph".to_string(),
+                    TabTarget::Agenda => "Agenda".to_string(),
                 })
                 .collect();
             (labels, app.tabs.active)
@@ -6188,6 +6412,7 @@ mod tests {
         assert!(!has(cx, &format!("tab-{}", labels.len())));
         view.update(cx, |app, _| match labels[active] {
             "Graph" => assert_eq!(app.mode, Mode::Graph),
+            "Agenda" => assert_eq!(app.mode, Mode::Agenda),
             title => {
                 assert_eq!(app.mode, Mode::Notes);
                 assert_eq!(app.pages[app.selected].title, title);
@@ -7476,6 +7701,121 @@ mod tests {
             assert_eq!(app.state.page_order, order);
             assert_eq!(UiState::load(&dir).page_order, order);
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- agenda --------------------------------------------------------------
+
+    #[gpui::test]
+    fn agenda_groups_dated_tasks_and_clicking_one_opens_its_page(cx: &mut TestAppContext) {
+        let today = chrono::Local::now().date_naive();
+        let fmt = |d: chrono::NaiveDate| d.format("%Y-%m-%d").to_string();
+        let (yesterday, tomorrow) = (
+            fmt(today - chrono::Days::new(1)),
+            fmt(today + chrono::Days::new(1)),
+        );
+        let today = fmt(today);
+        let work = format!(
+            "- TODO late report\n  DEADLINE: <{yesterday}>\n\
+             - TODO due today\n  SCHEDULED: <{today}>\n\
+             - DONE finished\n  SCHEDULED: <{today}>\n\
+             - TODO next up\n  SCHEDULED: <{tomorrow} 09:00>\n"
+        );
+        let home =
+            format!("- DOING someday\n- parent\n  - TODO nested today\n    SCHEDULED: <{today}>\n");
+        let pages = [
+            ("Test", "- hello\n"),
+            ("Work", work.as_str()),
+            ("Home", home.as_str()),
+        ];
+        let (view, cx, dir) = setup_pages(cx, "agenda", &pages, "Test");
+        assert!(!has(cx, "agenda"));
+
+        click_on(cx, "sidebar-agenda");
+        tabs_are(&view, cx, &["Test", "Agenda"], 1);
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Agenda));
+
+        // Top to bottom: each group header, then its items. Within Today the
+        // pages sort by title (Home before Work); DONE is left out.
+        let top = |cx: &mut VisualTestContext, s: &str| bounds_of(cx, s).top();
+        let order = [
+            "agenda-group-overdue",
+            "agenda-item-0",
+            "agenda-group-today",
+            "agenda-item-1",
+            "agenda-item-2",
+            "agenda-group-upcoming",
+            "agenda-item-3",
+            "agenda-group-unscheduled",
+            "agenda-item-4",
+        ];
+        for pair in order.windows(2) {
+            assert!(top(cx, pair[0]) < top(cx, pair[1]), "{pair:?}");
+        }
+        assert!(!has(cx, "agenda-item-5"), "the DONE task is not listed");
+        view.update(cx, |app, _| {
+            let agenda = app.agenda();
+            assert_eq!(agenda.overdue[0].text, "late report");
+            let today_items: Vec<&str> = agenda.today.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(today_items, vec!["nested today", "due today"]);
+            assert_eq!(agenda.upcoming[0].1[0].text, "next up");
+            assert_eq!(agenda.unscheduled[0].text, "someday");
+        });
+
+        // Clicking an item opens its page in a new tab (the agenda tab
+        // stays) and unfolds the task's block.
+        view.update(cx, |app, _| {
+            let home = app.find_page("Home").unwrap();
+            let parent = app.pages[home].blocks[1].id;
+            app.collapsed.insert(parent);
+        });
+        click_on(cx, "agenda-item-1");
+        tabs_are(&view, cx, &["Test", "Agenda", "Home"], 2);
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Notes);
+            assert_eq!(app.pages[app.selected].title, "Home");
+            assert!(app.collapsed.is_empty(), "the task's parent is unfolded");
+            assert_eq!(app.editing, None);
+        });
+        // The page with its two-line task renders in the reading view.
+        assert!(has(cx, "block-2"));
+
+        // The palette command focuses the agenda again; it is rebuilt from
+        // the pages, so a task finished meanwhile is gone.
+        view.update(cx, |app, _| {
+            let work = app.find_page("Work").unwrap();
+            let block = &mut app.pages[work].blocks[0];
+            block.content = block.content.replacen("TODO", "DONE", 1);
+        });
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("open agenda");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.search_results()[0].target,
+                Target::Command(Command::OpenAgenda)
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        tabs_are(&view, cx, &["Test", "Agenda", "Home"], 1);
+        assert!(!has(cx, "agenda-group-overdue"));
+        assert!(has(cx, "agenda-group-today"));
+
+        click_on(cx, "agenda-item-1");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Work")
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn empty_agenda_shows_no_groups(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "agenda-empty", "- hello\n");
+        view.update(cx, |app, cx| app.show_agenda(cx));
+        assert!(has(cx, "agenda"));
+        assert!(!has(cx, "agenda-item-0"));
+        for group in ["overdue", "today", "upcoming", "unscheduled"] {
+            assert!(!has(cx, &format!("agenda-group-{group}")));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

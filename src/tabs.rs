@@ -12,6 +12,8 @@ pub enum TabTarget {
     Page(String),
     /// The page graph.
     Graph,
+    /// The agenda (open tasks by date).
+    Agenda,
 }
 
 #[derive(Clone, Debug, Default)]

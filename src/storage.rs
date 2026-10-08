@@ -264,6 +264,38 @@ mod tests {
     use crate::model::{cycle_task, task_split, TaskState};
 
     #[test]
+    fn scheduled_and_deadline_lines_round_trip_through_storage() {
+        use crate::agenda::parse_dates;
+        let dir =
+            std::env::temp_dir().join(format!("notesec-storage-dates-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        // Logseq's layout: the markers are continuation lines of the task,
+        // also under a nested task.
+        let original = "- TODO report\n  SCHEDULED: <2026-10-09 Fri>\n  DEADLINE: <2026-10-12 Mon 17:00>\n  - DOING part\n    SCHEDULED: <2026-10-10 Sat>\n- plain\n";
+        fs::write(dir.join("pages/Dates.md"), original).unwrap();
+
+        let pages = storage.load_all();
+        let page = &pages[0];
+        assert_eq!(
+            page.blocks[0].content,
+            "TODO report\nSCHEDULED: <2026-10-09 Fri>\nDEADLINE: <2026-10-12 Mon 17:00>"
+        );
+        assert_eq!(page.depth_of(1), 1);
+        let dates = parse_dates(&page.blocks[0].content);
+        assert!(dates.scheduled.is_some() && dates.deadline.is_some());
+        assert!(parse_dates(&page.blocks[1].content).scheduled.is_some());
+
+        // Saved back byte for byte.
+        storage.save(page).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Dates.md")).unwrap(),
+            original
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn task_states_round_trip_through_storage() {
         let dir =
             std::env::temp_dir().join(format!("notesec-storage-tasks-{}", std::process::id()));

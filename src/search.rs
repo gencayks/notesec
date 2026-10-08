@@ -113,10 +113,12 @@ pub enum Command {
     SortPagesAz,
     /// Shows the graph, switched between global and local.
     ToggleLocalGraph,
+    /// Opens (or focuses) the agenda tab.
+    OpenAgenda,
 }
 
 impl Command {
-    pub const ALL: [Command; 9] = [
+    pub const ALL: [Command; 10] = [
         Command::ToggleTheme,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
@@ -126,6 +128,7 @@ impl Command {
         Command::OpenSettings,
         Command::SortPagesAz,
         Command::ToggleLocalGraph,
+        Command::OpenAgenda,
     ];
 
     pub fn label(self) -> &'static str {
@@ -139,6 +142,7 @@ impl Command {
             Command::OpenSettings => "Open settings",
             Command::SortPagesAz => "Sort pages A-Z",
             Command::ToggleLocalGraph => "Toggle local graph",
+            Command::OpenAgenda => "Open agenda",
         }
     }
 
@@ -150,6 +154,7 @@ impl Command {
             Command::OpenSettings => &["preferences", "theme", "font"],
             Command::SortPagesAz => &["alphabetical", "order"],
             Command::ToggleLocalGraph => &["global graph", "neighbours"],
+            Command::OpenAgenda => &["tasks", "todo", "scheduled", "deadline"],
             _ => &[],
         }
     }
