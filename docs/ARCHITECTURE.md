@@ -328,6 +328,10 @@ too, and "nothing is focused" is a real bug class.
   parsing. `#[serde(rename_all = "lowercase")]` maps `Dark` to `"dark"`.
   Missing keys fall back to defaults, so old config files never break.
 
+- **`state.rs` — UI state, not settings.** Favorite and recent page titles
+  in `state.toml`, with the same load/save rules as `config.rs` (see
+  decision 21).
+
 - **`main.rs` — boring on purpose.** Declare modules, open storage, load config,
   open an 1100x700 window, hand control to GPUI's event loop. If `main` is long,
   something's wrong.
@@ -539,7 +543,8 @@ that mutate, and data races are essentially impossible.
     modifiers must match exactly. GPUI's Linux backend maps both `Tab` and
     `ISO_Left_Tab` (what Shift+Tab sends on X11) to "tab", and Zed's own Linux
     keymap uses ctrl-tab, ctrl-shift-tab and ctrl-w, so they arrive. They do
-    nothing while the Ctrl-K palette is open (it's modal). Closing the
+    nothing while the Ctrl-K palette or the settings panel (decision 22) is
+    open, since both are modal overlays. Closing the
     active tab focuses the tab that takes its place, else the one to its
     left; closing another tab keeps the active one.
     *Per-tab state* is just the page. Every tab switch, close or cycle saves
@@ -549,6 +554,59 @@ that mutate, and data races are essentially impossible.
     a page list without a page created later; tabs on pages that no longer
     exist are closed, and the restored page is brought into a tab when a page
     was on screen or a block is being edited.
+21. **Favorites and recent pages live in `state.toml`, and every navigation
+    goes through `show_page`**: hovering a sidebar page row shows a `☆`;
+    clicking it stars the page (its click handler calls
+    `cx.stop_propagation()`, so the row's own click doesn't also open the
+    page). Starred pages show a filled `★` and are listed under FAVORITES
+    (right after Today / Graph view, only when non-empty; hovering a row
+    shows the `★` that unstars it). RECENT (between FAVORITES and PAGES)
+    lists the last 10 opened pages, most recent first, deduped ignoring case.
+    Both are stored by page title in `<graph>/state.toml` (`state.rs`), not in
+    `config.toml`: RECENT changes on every page you open, and rewriting the
+    hand-edited settings file that often would be rude. `state.rs` copies
+    `config.rs`'s rules (serde defaults, atomic write, a missing file means
+    empty lists, an invalid one is copied to `state.toml.bak`), cleans
+    hand-edits on load (blank titles, duplicates, more than 10 recent), and
+    is only written when something actually changed. Titles whose page no
+    longer exists are skipped in the sidebar but kept in the file (the page
+    may come back, e.g. from a sync or `git checkout`). Navigation is
+    centralized: `NoteSec::show_page(ix)` sets `selected`, switches to the
+    notes view and records the page in RECENT. The sidebar page rows,
+    `open_page` (links, tags, backlinks, search, graph nodes, favorites and
+    recent rows), `open_today` and `new_page` all end there, and startup
+    records its page too. Undo/redo and `add_page` move `selected` without
+    going through it, since they aren't the user opening a page. Anything
+    new that opens a page should call `show_page` or `open_page`.
+    *With tabs* (decision 20), `show_page(ix)` opens or focuses the page's
+    tab, and `show_page_in(ix, nav)` is the general form that `open_page`
+    (`Nav::Replace`) uses. Both end in `enter_page`, which sets `selected`
+    and the mode and records RECENT. Focusing an existing page tab (a tab
+    click, Ctrl+Tab / Ctrl+Shift+Tab, or the neighbour taking over after a
+    close) also counts as opening that page, so `apply_tab` calls
+    `enter_page` too. The graph tab and the empty state are never recorded.
+    The sidebar row click re-finds its page by title after `stop_edit`
+    (saving can re-sort the pages) before calling `show_page`.
+22. **Settings are an overlay in the main window, not a second window**:
+    the panel reuses the Ctrl-K palette's pattern (a dimming backdrop that
+    closes on click, an `occlude`d panel on top) and opens from the
+    "Settings" row pinned under the sidebar's scrolling list, from Ctrl-,
+    (Zed's binding), or from "Open settings" in the palette (also found by
+    "preferences", "theme" and "font": `Command::keywords` match at a
+    penalty, so a label match like "Toggle dark/light theme" still ranks
+    first). While it is open the root's key context is `Settings` instead of
+    `BlockEditor`, which is how Esc closes it; opening it saves the edited
+    block and closes the palette, and anything that starts editing (e.g.
+    Ctrl-N) closes it. Every control applies at once and writes
+    `config.toml` through one small method each (`set_theme`,
+    `change_font_size` / `reset_font_size`, `set_font_family`), which also
+    re-render and push the style into the graph view, exactly like the
+    keyboard shortcuts. The font list comes from GPUI's
+    `TextSystem::all_font_names()` (sorted and deduped by GPUI), read once
+    when the panel opens and shown in a fixed-height scrolling list after
+    "System default". Choosing "System default" removes `font_family` from
+    the file; a configured family that isn't installed is kept in the file
+    and named in the panel, but the system font is used, as at startup.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

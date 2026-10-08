@@ -203,3 +203,17 @@ pub fn block_row(
         )
         .child(body)
 }
+
+/// The star on a sidebar page row: a filled accent `★` for a favorite, an
+/// outline `☆` otherwise. `app.rs` adds the click handler and hides the
+/// outline star until its row is hovered.
+pub fn favorite_star(theme: &Theme, filled: bool) -> Div {
+    div()
+        .flex_shrink_0()
+        .px_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .text_color(if filled { theme.accent } else { theme.muted })
+        .hover(|d| d.text_color(theme.accent))
+        .child(if filled { "★" } else { "☆" })
+}

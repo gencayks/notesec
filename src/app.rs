@@ -5,7 +5,7 @@
 //! stops (Escape, click elsewhere, switching pages) the text is written back to
 //! the block and the page is saved to disk.
 
-use crate::config::Config;
+use crate::config::{Config, ThemeKind};
 use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
@@ -13,9 +13,10 @@ use crate::model::{
     backlinks, cycle_task, parse_references, tag_counts, BlockKind, Page, TaskState,
 };
 use crate::search::{search, search_templates, Command, Hit, Target};
+use crate::state::UiState;
 use crate::storage::{today_title, Storage, Template};
 use crate::tabs::{TabTarget, Tabs};
-use crate::ui::{block_row, fold_arrow, fold_badge, task_checkbox, Theme};
+use crate::ui::{block_row, favorite_star, fold_arrow, fold_badge, task_checkbox, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
@@ -67,6 +68,7 @@ actions!(
         IncreaseFont,
         DecreaseFont,
         ResetFont,
+        OpenSettings,
         Quit,
     ]
 );
@@ -97,6 +99,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-b", Bold, ctx),
         KeyBinding::new("ctrl-i", Italic, ctx),
         KeyBinding::new("ctrl-enter", CycleTask, ctx),
+        // While the settings panel is open the root's key context is
+        // "Settings" instead, so Esc closes the panel.
+        KeyBinding::new("escape", Escape, Some("Settings")),
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-n", NewPage, None),
@@ -115,6 +120,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-w", CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -162,6 +168,16 @@ struct SearchState {
 
 const MAX_HISTORY: usize = 100;
 
+/// Height of the scrollable font list in the settings panel.
+const FONT_LIST_HEIGHT: f32 = 220.0;
+
+/// State of the settings panel while it is open.
+struct SettingsState {
+    /// Installed font families (`TextSystem::all_font_names`, which sorts and
+    /// dedupes), read once when the panel opens rather than on every frame.
+    fonts: Vec<String>,
+}
+
 /// The "/" block-type menu while it is open (see `editor::SlashMenu`).
 struct SlashState {
     menu: SlashMenu,
@@ -186,6 +202,8 @@ pub struct NoteSec {
     selected: usize,
     /// Persisted user settings (`config.toml`).
     config: Config,
+    /// Favorite and recently opened pages (`state.toml`).
+    state: UiState,
     /// Colours for `config.theme`, kept in sync by `apply_theme`.
     theme: Theme,
     /// The font family actually in use: `config.font_family` if that font is
@@ -203,6 +221,8 @@ pub struct NoteSec {
     search: Option<SearchState>,
     /// `Some` while the "/" block-type menu is open on the edited block.
     slash: Option<SlashState>,
+    /// `Some` while the settings panel is open.
+    settings: Option<SettingsState>,
     /// True between a mouse-down in the edited block and the mouse-up: mouse
     /// moves in between extend the selection.
     selecting: bool,
@@ -279,29 +299,27 @@ impl NoteSec {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
-        // Only use the configured font if it is actually installed; GPUI would
-        // otherwise fall back silently and the user would not know why.
-        let font_family = config.font_family.clone().and_then(|family| {
-            if cx.text_system().all_font_names().contains(&family) {
-                Some(SharedString::from(family))
-            } else {
-                eprintln!("notesec: font {family:?} is not installed; using the system font");
-                None
-            }
-        });
+        let font_family = config
+            .font_family
+            .as_deref()
+            .and_then(|family| installed_font(family, cx));
 
-        NoteSec {
+        let state = UiState::load(storage.root());
+
+        let mut app = NoteSec {
             storage,
             pages,
             selected,
             theme: Theme::from_kind(config.theme),
             config,
+            state,
             font_family,
             focus_handle,
             editing: None,
             editor: EditorState::default(),
             search: None,
             slash: None,
+            settings: None,
             selecting: false,
             collapsed: HashSet::new(),
             undo_stack: Vec::new(),
@@ -315,7 +333,10 @@ impl NoteSec {
             last_bounds: None,
             #[cfg(test)]
             reading_layouts: Vec::new(),
-        }
+        };
+        // The startup page counts as opened.
+        app.record_recent();
+        app
     }
 
     // --- which editor is active ----------------------------------------------
@@ -344,12 +365,84 @@ impl NoteSec {
         }
     }
 
-    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        self.config.theme = self.config.theme.toggled();
-        self.theme = Theme::from_kind(self.config.theme);
+    fn save_state(&self) {
+        if let Err(err) = self.state.save(self.storage.root()) {
+            eprintln!("notesec: failed to save state: {err}");
+        }
+    }
+
+    /// Put the selected page at the front of the RECENT list, saving
+    /// `state.toml` only if that changed anything.
+    fn record_recent(&mut self) {
+        let Some(page) = self.pages.get(self.selected) else {
+            return;
+        };
+        if self.state.record_recent(&page.title) {
+            self.save_state();
+        }
+    }
+
+    /// Star or unstar the page called `title` (sidebar star buttons).
+    fn toggle_favorite(&mut self, title: &str, cx: &mut Context<Self>) {
+        self.state.toggle_favorite(title);
+        self.save_state();
+        cx.notify();
+    }
+
+    /// Switch to theme `kind`, apply it right away and save it.
+    fn set_theme(&mut self, kind: ThemeKind, cx: &mut Context<Self>) {
+        if self.config.theme == kind {
+            return;
+        }
+        self.config.theme = kind;
+        self.theme = Theme::from_kind(kind);
         self.save_config();
         self.sync_graph_style(cx);
         cx.notify();
+    }
+
+    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        self.set_theme(self.config.theme.toggled(), cx);
+    }
+
+    /// Use font `family` (`None`: the system UI font), apply it right away
+    /// and save it. A family that isn't installed is still saved, but the
+    /// system font is used, as at startup.
+    fn set_font_family(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+        let family = family.filter(|f| !f.trim().is_empty());
+        if self.config.font_family == family {
+            return;
+        }
+        self.font_family = family.as_deref().and_then(|f| installed_font(f, cx));
+        self.config.font_family = family;
+        self.save_config();
+        self.sync_graph_style(cx);
+        cx.notify();
+    }
+
+    // --- settings panel --------------------------------------------------------
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        // Save the edited block and close the palette: the panel covers both.
+        self.stop_edit(cx);
+        self.close_search(cx);
+        let fonts = cx.text_system().all_font_names();
+        self.settings = Some(SettingsState { fonts });
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings = None;
+        cx.notify();
+    }
+
+    /// Ctrl-, opens the panel, or closes it if it is already open.
+    fn on_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.close_settings(cx);
+        } else {
+            self.open_settings(cx);
+        }
     }
 
     fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -374,6 +467,7 @@ impl NoteSec {
             Command::ResetFontSize => self.reset_font_size(cx),
             Command::ToggleGraph => self.toggle_graph(cx),
             Command::InsertTemplate => self.open_template_picker(None, cx),
+            Command::OpenSettings => self.open_settings(cx),
         }
     }
 
@@ -452,6 +546,7 @@ impl NoteSec {
         // whatever block is being edited before covering it.
         let insert_after = self.editing;
         self.stop_edit(cx);
+        self.settings = None;
         self.search = Some(SearchState {
             query: EditorState::default(),
             selected: 0,
@@ -528,7 +623,11 @@ impl NoteSec {
             TabTarget::Graph => true,
         });
         if self.editing.is_some() || matches!(self.tabs.active_target(), Some(TabTarget::Page(_))) {
-            self.show_selected(Nav::Tab, cx);
+            // Not `show_page`: undo/redo isn't the user opening a page, so
+            // RECENT is left alone (decision 21).
+            let title = self.pages[self.selected].title.clone();
+            self.tabs.open(TabTarget::Page(title));
+            self.mode = Mode::Notes;
         } else {
             self.apply_tab(cx);
         }
@@ -576,8 +675,8 @@ impl NoteSec {
         }
         self.pages.push(page);
         sort_pages(&mut self.pages);
-        self.selected = self.find_page(&title).unwrap_or(0);
-        self.show_selected(Nav::Tab, cx);
+        let ix = self.find_page(&title).unwrap_or(0);
+        self.show_page(ix, cx);
         self.start_edit(0, window, cx);
     }
 
@@ -825,20 +924,44 @@ impl NoteSec {
                 self.find_page(title).unwrap_or(0)
             }
         };
-        self.selected = ix;
-        self.show_selected(nav, cx);
+        self.show_page_in(ix, nav, cx);
     }
 
-    /// Put page `selected` on screen in a tab as `nav` says. `Replace` only
-    /// replaces a page tab: from the graph tab (or with no tabs) it opens or
-    /// focuses a page tab instead, so the graph tab stays.
-    fn show_selected(&mut self, nav: Nav, cx: &mut Context<Self>) {
-        let target = TabTarget::Page(self.pages[self.selected].title.clone());
+    /// Show page `ix` in its tab, or a new tab. Every navigation to a page
+    /// (sidebar rows, favorites/recent, links, search, graph, Today, new
+    /// page) goes through `show_page_in`, so the RECENT list sees all of
+    /// them. Callers leave edit mode first (`stop_edit`), since saving can
+    /// add pages and shift indices.
+    fn show_page(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.show_page_in(ix, Nav::Tab, cx);
+    }
+
+    /// Show page `ix` in a tab as `nav` says. `Replace` only replaces a page
+    /// tab: from the graph tab (or with no tabs) it opens or focuses a page
+    /// tab instead, so the graph tab stays.
+    fn show_page_in(&mut self, ix: usize, nav: Nav, cx: &mut Context<Self>) {
+        let Some(page) = self.pages.get(ix) else {
+            return;
+        };
+        let target = TabTarget::Page(page.title.clone());
         match (nav, self.tabs.active_target()) {
             (Nav::Replace, Some(TabTarget::Page(_))) => self.tabs.replace_active(target),
             _ => self.tabs.open(target),
         }
+        self.enter_page(ix, cx);
+    }
+
+    /// `show_page_in` for page `selected`.
+    fn show_selected(&mut self, nav: Nav, cx: &mut Context<Self>) {
+        self.show_page_in(self.selected, nav, cx);
+    }
+
+    /// Put page `ix` in the main pane and record it in RECENT. The tab bar
+    /// is left alone: callers have already opened or focused its tab.
+    fn enter_page(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.selected = ix;
         self.mode = Mode::Notes;
+        self.record_recent();
         cx.notify();
     }
 
@@ -846,18 +969,21 @@ impl NoteSec {
     fn apply_tab(&mut self, cx: &mut Context<Self>) {
         match self.tabs.active_target().cloned() {
             Some(TabTarget::Page(title)) => {
-                if let Some(ix) = self.find_page(&title) {
-                    self.selected = ix;
-                }
-                self.mode = Mode::Notes;
+                // Focusing a page tab (click, Ctrl+Tab, or the neighbour after
+                // a close) counts as a visit for RECENT.
+                let ix = self.find_page(&title).unwrap_or(self.selected);
+                self.enter_page(ix, cx);
             }
             Some(TabTarget::Graph) => {
                 self.refresh_graph(cx);
                 self.mode = Mode::Graph;
+                cx.notify();
             }
-            None => self.mode = Mode::Empty,
+            None => {
+                self.mode = Mode::Empty;
+                cx.notify();
+            }
         }
-        cx.notify();
     }
 
     /// Focus tab `ix` (clicking it). The block being edited is saved and
@@ -876,9 +1002,15 @@ impl NoteSec {
         self.apply_tab(cx);
     }
 
-    /// Ctrl+W. Ignored while the search palette is open (it is modal).
+    /// The Ctrl-K palette or the settings panel covers the page. Both are
+    /// modal, so the tab keys do nothing while one is open.
+    fn overlay_open(&self) -> bool {
+        self.search.is_some() || self.settings.is_some()
+    }
+
+    /// Ctrl+W. Ignored while an overlay is open.
     fn on_close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_none() {
+        if !self.overlay_open() {
             if let Some(ix) = self.tabs.active {
                 self.close_tab(ix, cx);
             }
@@ -886,7 +1018,7 @@ impl NoteSec {
     }
 
     fn cycle_tabs(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if self.search.is_some() {
+        if self.overlay_open() {
             return;
         }
         self.stop_edit(cx);
@@ -923,8 +1055,8 @@ impl NoteSec {
             let page = create_journal(&self.storage, &today);
             self.add_page(page);
         }
-        self.selected = self.find_journal(&today).unwrap_or(0);
-        self.show_selected(Nav::Tab, cx);
+        let ix = self.find_journal(&today).unwrap_or(0);
+        self.show_page(ix, cx);
     }
 
     // --- graph view ------------------------------------------------------------
@@ -1062,6 +1194,8 @@ impl NoteSec {
     }
 
     fn start_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Never edit under the settings panel (e.g. Ctrl-N while it is open).
+        self.settings = None;
         self.commit();
         self.text_history_active = false;
         self.load_editor(ix, false);
@@ -1336,7 +1470,9 @@ impl NoteSec {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() {
+        if self.settings.is_some() {
+            self.close_settings(cx);
+        } else if self.search.is_some() {
             self.close_search(cx);
         } else if self.slash.is_some() {
             self.dismiss_slash(cx);
@@ -1452,6 +1588,22 @@ fn reading_highlights(
 /// turns the title into Logseq's `journals/YYYY_MM_DD.md` file name. A failed
 /// save is reported but the page is still returned, so the user can type and
 /// the next save can retry.
+/// `family` as a font to render with, if it is installed. GPUI would
+/// otherwise fall back silently and the user would not know why.
+fn installed_font(family: &str, cx: &App) -> Option<SharedString> {
+    if cx
+        .text_system()
+        .all_font_names()
+        .iter()
+        .any(|f| f == family)
+    {
+        Some(SharedString::from(family.to_string()))
+    } else {
+        eprintln!("notesec: font {family:?} is not installed; using the system font");
+        None
+    }
+}
+
 fn create_journal(storage: &Storage, title: &str) -> Page {
     let mut page = Page::from_markdown(title, true, "- \n");
     page.blocks[0].content.clear();
@@ -1839,6 +1991,211 @@ impl Element for BlockText {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+impl NoteSec {
+    /// The settings panel (gear, Ctrl-, or "Open settings" in the palette):
+    /// a backdrop like the palette's with theme, font size and font family.
+    /// Every control applies and saves its change right away.
+    fn render_settings(&self, state: &SettingsState, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let config = &self.config;
+
+        // A selectable button; `active` highlights the current choice.
+        let button = |id: &'static str, label: SharedString, active: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(if active { theme.accent } else { theme.border })
+                .cursor_pointer()
+                .text_color(if active { theme.accent } else { theme.text })
+                .when(active, |d| d.bg(theme.selected_bg))
+                .hover(|d| d.bg(theme.selected_bg))
+                .child(label)
+        };
+        let label = |text: &'static str| div().text_color(theme.muted).child(text);
+
+        let theme_row = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .child(
+                button("theme-dark", "Dark".into(), config.theme == ThemeKind::Dark).on_click(
+                    cx.listener(|this, _e, _window, cx| this.set_theme(ThemeKind::Dark, cx)),
+                ),
+            )
+            .child(
+                button(
+                    "theme-light",
+                    "Light".into(),
+                    config.theme == ThemeKind::Light,
+                )
+                .on_click(
+                    cx.listener(|this, _e, _window, cx| this.set_theme(ThemeKind::Light, cx)),
+                ),
+            );
+
+        // The − / + buttons are dimmed at the limits (clicking them then
+        // does nothing, as `adjust_font_size` clamps).
+        let size = config.font_size;
+        let at_min = size <= crate::config::MIN_FONT_SIZE;
+        let at_max = size >= crate::config::MAX_FONT_SIZE;
+        let size_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                button("font-size-dec", "−".into(), false)
+                    .when(at_min, |d| d.text_color(theme.muted))
+                    .on_click(cx.listener(|this, _e, _window, cx| this.change_font_size(-1.0, cx))),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "font-size-value".to_string())
+                    .min_w(px(40.0))
+                    .flex()
+                    .justify_center()
+                    .child(format!("{size}")),
+            )
+            .child(
+                button("font-size-inc", "+".into(), false)
+                    .when(at_max, |d| d.text_color(theme.muted))
+                    .on_click(cx.listener(|this, _e, _window, cx| this.change_font_size(1.0, cx))),
+            )
+            .child(
+                button(
+                    "font-size-reset",
+                    "Reset".into(),
+                    size == crate::config::DEFAULT_FONT_SIZE,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| this.reset_font_size(cx))),
+            );
+
+        // Font family: "System default", then every installed family.
+        let row = |id: ElementId, selector: String, text: String, active: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || selector)
+                .flex_shrink_0()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(if active { theme.accent } else { theme.text })
+                .when(active, |d| d.bg(theme.selected_bg))
+                .hover(|d| d.bg(theme.selected_bg))
+                .child(text)
+        };
+        let current = config.font_family.as_deref();
+        let font_rows: Vec<AnyElement> = state
+            .fonts
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let family = name.clone();
+                row(
+                    ElementId::from(("font-family", i)),
+                    format!("font-family-{i}"),
+                    name.clone(),
+                    current == Some(name.as_str()),
+                )
+                .on_click(cx.listener(move |this, _e, _window, cx| {
+                    this.set_font_family(Some(family.clone()), cx)
+                }))
+                .into_any_element()
+            })
+            .collect();
+        let no_fonts = font_rows.is_empty();
+        // A configured family that isn't installed (e.g. a typo in
+        // config.toml) is kept in the file but not used; say so.
+        let missing = current.filter(|f| !state.fonts.iter().any(|name| name == f));
+        let font_list = div()
+            .id("font-family-list")
+            .h(px(FONT_LIST_HEIGHT))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.bg)
+            .child(
+                row(
+                    ElementId::from("font-family-default"),
+                    "font-family-default".to_string(),
+                    "System default".to_string(),
+                    current.is_none(),
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| this.set_font_family(None, cx))),
+            )
+            .children(font_rows)
+            .when(no_fonts, |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_color(theme.muted)
+                        .child("No installed fonts were found"),
+                )
+            });
+
+        div()
+            .id("settings-backdrop")
+            .debug_selector(|| "settings-backdrop".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(gpui::black().opacity(0.45))
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(90.0))
+            .on_click(cx.listener(|this, _e, _window, cx| this.close_settings(cx)))
+            .child(
+                // `occlude` keeps clicks inside the panel from reaching the
+                // backdrop (which would close it).
+                div()
+                    .id("settings-panel")
+                    .debug_selector(|| "settings-panel".to_string())
+                    .occlude()
+                    .w(px(460.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .child(div().font_weight(FontWeight::BOLD).child("Settings"))
+                            .child(label("Esc to close")),
+                    )
+                    .child(label("Theme"))
+                    .child(theme_row)
+                    .child(label("Font size"))
+                    .child(size_row)
+                    .child(label("Font family"))
+                    .child(font_list)
+                    .when_some(missing, |d, family| {
+                        d.child(div().text_color(theme.muted).child(format!(
+                            "\u{201c}{family}\u{201d} is not installed; using the system font"
+                        )))
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for NoteSec {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -1864,12 +2221,24 @@ impl Render for NoteSec {
         // --- Sidebar: one clickable row per page ---------------------------
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = self.mode == Mode::Notes && ix == self.selected;
+            let is_favorite = self.state.is_favorite(&page.title);
+            let title = page.title.clone();
+            let star_title = page.title.clone();
             div()
                 // Interactive elements need a stable id; (name, index) is the idiom.
                 .id(("page", ix))
+                .debug_selector(|| format!("page-{ix}"))
+                // Every row uses the same group name (Zed's idiom): the star's
+                // `group_hover` resolves to the row it sits in.
+                .group("page-row")
                 .px_3()
                 .py_1()
                 .rounded_md()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_2()
                 .cursor_pointer()
                 .text_color(if is_selected {
                     theme.accent
@@ -1879,15 +2248,112 @@ impl Render for NoteSec {
                 .when(is_selected, |d| d.bg(theme.selected_bg))
                 .hover(|d| d.bg(theme.selected_bg))
                 // `cx.listener` turns a closure over `&mut Self` into a GPUI handler.
-                .debug_selector(move || format!("page-{ix}"))
                 // Opens the page in its tab, or a new tab.
                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.stop_edit(cx); // save the block being edited first
-                    this.selected = ix;
-                    this.show_selected(Nav::Tab, cx); // also asks GPUI to re-render
+                    // Save the block being edited first. Saving can add pages
+                    // and re-sort, shifting indices, so find the row's page again.
+                    this.stop_edit(cx);
+                    let ix = match this.pages.get(ix) {
+                        Some(p) if p.title == title => ix,
+                        _ => this.find_page(&title).unwrap_or(0),
+                    };
+                    this.show_page(ix, cx);
                 }))
-                .child(page.title.clone())
+                .child(div().flex_1().overflow_hidden().child(page.title.clone()))
+                .child(
+                    favorite_star(&theme, is_favorite)
+                        .id(("star", ix))
+                        .debug_selector(|| format!("star-{ix}"))
+                        // Outline stars only show while the row is hovered.
+                        .when(!is_favorite, |d| {
+                            d.invisible().group_hover("page-row", |s| s.visible())
+                        })
+                        .on_click(cx.listener(move |this, _e, _window, cx| {
+                            // Starring must not also open the page.
+                            cx.stop_propagation();
+                            this.toggle_favorite(&star_title, cx);
+                        })),
+                )
         });
+
+        // FAVORITES and RECENT: pages by title, skipping titles whose page no
+        // longer exists (they stay in `state.toml`). Clicking opens the page.
+        let current_title = (self.mode == Mode::Notes)
+            .then(|| {
+                self.pages
+                    .get(self.selected)
+                    .map(|p| p.title.to_lowercase())
+            })
+            .flatten();
+        let shortcut_row = |id: ElementId, selector: String, title: &str| {
+            let is_current = current_title.as_deref() == Some(title.to_lowercase().as_str());
+            let target = title.to_string();
+            div()
+                .id(id)
+                .debug_selector(move || selector)
+                .group("page-row")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .cursor_pointer()
+                .text_color(if is_current { theme.accent } else { theme.text })
+                .when(is_current, |d| d.bg(theme.selected_bg))
+                .hover(|d| d.bg(theme.selected_bg))
+                .on_click(cx.listener(move |this, _e, _window, cx| {
+                    this.open_page(&target, cx);
+                }))
+                .child(div().flex_1().overflow_hidden().child(title.to_string()))
+        };
+        let existing = |titles: &[String]| -> Vec<(usize, String)> {
+            titles
+                .iter()
+                .filter_map(|t| self.find_page(t).map(|ix| self.pages[ix].title.clone()))
+                .enumerate()
+                .collect()
+        };
+        let favorite_rows: Vec<AnyElement> = existing(&self.state.favorites)
+            .into_iter()
+            .map(|(i, title)| {
+                let star_title = title.clone();
+                shortcut_row(ElementId::from(("fav", i)), format!("fav-{i}"), &title)
+                    .child(
+                        favorite_star(&theme, true)
+                            .id(("fav-star", i))
+                            .debug_selector(|| format!("fav-star-{i}"))
+                            .invisible()
+                            .group_hover("page-row", |s| s.visible())
+                            .on_click(cx.listener(move |this, _e, _window, cx| {
+                                cx.stop_propagation();
+                                this.toggle_favorite(&star_title, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let recent_rows: Vec<AnyElement> = existing(&self.state.recent)
+            .into_iter()
+            .map(|(i, title)| {
+                shortcut_row(
+                    ElementId::from(("recent", i)),
+                    format!("recent-{i}"),
+                    &title,
+                )
+                .into_any_element()
+            })
+            .collect();
+        let section_header = |label: &'static str| {
+            div()
+                .mt_2()
+                .px_3()
+                .py_2()
+                .text_color(theme.muted)
+                .child(label)
+        };
 
         // Tag index: every tag in the graph with how many blocks use it.
         // Clicking one opens its page, whose backlinks panel lists the uses.
@@ -1984,21 +2450,42 @@ impl Render for NoteSec {
                     .child("+ New page"),
             );
 
-        let sidebar = div()
+        // Settings entry, pinned under the scrolling list.
+        let settings_item = div()
+            .id("settings-gear")
+            .debug_selector(|| "settings-gear".to_string())
+            .m_2()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .cursor_pointer()
+            .text_color(theme.text)
+            .hover(|d| d.bg(theme.selected_bg))
+            .on_click(cx.listener(|this, _e, _window, cx| this.open_settings(cx)))
+            .child("Settings")
+            .child(div().text_color(theme.muted).child("Ctrl-,"));
+
+        let sidebar_list = div()
             .id("sidebar")
-            .w(px(240.0))
-            .h_full()
-            .flex_shrink_0()
+            .debug_selector(|| "sidebar".to_string())
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .gap_1()
             .p_2()
-            .bg(theme.sidebar_bg)
-            .border_r_1()
-            .border_color(theme.border)
             .overflow_y_scroll()
             .child(today_item)
             .child(graph_item)
+            .when(!favorite_rows.is_empty(), |d| {
+                d.child(section_header("FAVORITES")).children(favorite_rows)
+            })
+            .when(!recent_rows.is_empty(), |d| {
+                d.child(section_header("RECENT")).children(recent_rows)
+            })
             .child(pages_header)
             .children(sidebar_items)
             .when(has_tags, |d| {
@@ -2012,6 +2499,22 @@ impl Render for NoteSec {
                 )
                 .children(tag_rows)
             });
+        let sidebar = div()
+            .w(px(240.0))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(theme.sidebar_bg)
+            .border_r_1()
+            .border_color(theme.border)
+            .child(sidebar_list)
+            .child(
+                div()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(settings_item),
+            );
 
         // --- "/" block-type menu (shown under the edited block) -------------
         let mut slash_menu = self.slash.as_ref().map(|state| {
@@ -2603,7 +3106,13 @@ impl Render for NoteSec {
             .child(tab_bar)
             .child(view);
 
+        let settings_overlay = self
+            .settings
+            .as_ref()
+            .map(|state| self.render_settings(state, cx));
+
         let is_editing = self.editing.is_some() || self.search.is_some();
+        let settings_open = self.settings.is_some();
         div()
             .size_full()
             .relative()
@@ -2616,8 +3125,12 @@ impl Render for NoteSec {
             .when_some(self.font_family.clone(), |d, family| d.font_family(family))
             .track_focus(&self.focus_handle)
             // The key context only exists while editing, which is what makes
-            // the "BlockEditor" key bindings conditional.
-            .when(is_editing, |d| d.key_context("BlockEditor"))
+            // the "BlockEditor" key bindings conditional. The settings panel
+            // takes over the keyboard context while it is open.
+            .when(settings_open, |d| d.key_context("Settings"))
+            .when(!settings_open && is_editing, |d| {
+                d.key_context("BlockEditor")
+            })
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::tab))
             .on_action(cx.listener(Self::shift_tab))
@@ -2655,9 +3168,11 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_increase_font))
             .on_action(cx.listener(Self::on_decrease_font))
             .on_action(cx.listener(Self::on_reset_font))
+            .on_action(cx.listener(Self::on_open_settings))
             .child(sidebar)
             .child(content)
             .children(overlay)
+            .children(settings_overlay)
     }
 }
 
@@ -2665,6 +3180,7 @@ impl Render for NoteSec {
 mod tests {
     use super::*;
     use crate::config::ThemeKind;
+    use crate::state::MAX_RECENT;
     use gpui::{
         Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
         VisualTestContext,
@@ -4979,6 +5495,525 @@ mod tests {
         cx.simulate_keystrokes("escape ctrl-z");
         view.update(cx, |app, _| assert!(app.find_page("Untitled").is_none()));
         tabs_are(&view, cx, &["Test"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- favorites and recent pages ----------------------------------------
+
+    /// Selector of the sidebar row (or, with `prefix = "star"`, its star) for
+    /// the page called `title`.
+    fn page_row(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        prefix: &str,
+        title: &str,
+    ) -> String {
+        let ix = view.update(cx, |app, _| app.find_page(title).expect(title));
+        format!("{prefix}-{ix}")
+    }
+
+    fn selected_title(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> String {
+        view.update(cx, |app, _| app.pages[app.selected].title.clone())
+    }
+
+    /// Move the mouse onto `selector`'s element, as a real pointer does
+    /// before a click. Outline stars are only painted (and so only clickable)
+    /// while their row is hovered.
+    fn hover(cx: &mut VisualTestContext, selector: &str) {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        let bounds = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// Click `selector` in the sidebar, first scrolling the list (as a user
+    /// would) if the row is below its visible part.
+    fn click_in_sidebar(cx: &mut VisualTestContext, selector: &str) {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        let list = cx.debug_bounds("sidebar").expect("sidebar rendered");
+        let row = cx.debug_bounds(selector).expect(selector);
+        if row.bottom() > list.bottom() {
+            cx.simulate_event(ScrollWheelEvent {
+                position: list.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), list.bottom() - row.bottom() - px(8.))),
+                modifiers: Modifiers::none(),
+                touch_phase: TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+        let row = cx.debug_bounds(selector).expect(selector);
+        assert!(
+            row.bottom() <= list.bottom(),
+            "{selector} scrolled into view"
+        );
+        cx.simulate_click(row.center(), Modifiers::none());
+    }
+
+    #[gpui::test]
+    fn clicking_a_page_row_records_it_in_recent_and_persists(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "recent-click",
+            &[("Alpha", "- a\n"), ("Beta", "- b\n")],
+            "Alpha",
+        );
+        // Startup counts as opening today's journal.
+        let today = today_title();
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.recent, vec![today.clone()])
+        });
+
+        let row = page_row(&view, cx, "page", "Beta");
+        click_on(cx, &row);
+
+        assert_eq!(selected_title(&view, cx), "Beta");
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.recent, vec!["Beta".to_string(), today.clone()]);
+            assert_eq!(UiState::load(&dir), app.state);
+        });
+        // config.toml is not touched by navigation.
+        assert!(!Config::path(&dir).exists());
+
+        // The RECENT section lists them, most recent first; a row opens its page.
+        assert!(has(cx, "recent-0") && has(cx, "recent-1") && !has(cx, "recent-2"));
+        click_on(cx, "recent-1");
+        assert_eq!(selected_title(&view, cx), today);
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.recent, vec![today.clone(), "Beta".to_string()])
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn recent_is_most_recent_first_deduped_and_capped(cx: &mut TestAppContext) {
+        let titles: Vec<String> = (0..12).map(|i| format!("P{i:02}")).collect();
+        let pages: Vec<(&str, &str)> = titles.iter().map(|t| (t.as_str(), "- x\n")).collect();
+        let (view, cx, dir) = setup_pages(cx, "recent-cap", &pages, "P00");
+
+        for title in &titles {
+            let row = page_row(&view, cx, "page", title);
+            click_in_sidebar(cx, &row);
+        }
+        // Reopening a page moves it to the front without duplicating it,
+        // whichever route opened it (here: a search for it, via `open_page`).
+        view.update(cx, |app, cx| app.open_page("p05", cx));
+
+        let expected: Vec<String> = [
+            "P05", "P11", "P10", "P09", "P08", "P07", "P06", "P04", "P03", "P02",
+        ]
+        .map(String::from)
+        .to_vec();
+        view.update(cx, |app, _| assert_eq!(app.state.recent, expected));
+        assert_eq!(UiState::load(&dir).recent, expected);
+        cx.run_until_parked();
+        assert!(has(cx, &format!("recent-{}", MAX_RECENT - 1)));
+        assert!(!has(cx, &format!("recent-{MAX_RECENT}")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn star_favorites_without_navigating_and_favorites_open_the_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "favorite-star",
+            &[("Alpha", "- a\n"), ("Beta", "- b\n")],
+            "Alpha",
+        );
+        assert!(!has(cx, "fav-0"));
+
+        let row = page_row(&view, cx, "page", "Beta");
+        let star = page_row(&view, cx, "star", "Beta");
+        hover(cx, &row);
+        click_on(cx, &star);
+
+        // Starred, but still on Alpha (the row's own click did not run).
+        assert_eq!(selected_title(&view, cx), "Alpha");
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.favorites, vec!["Beta".to_string()]);
+            assert!(!app.state.recent.contains(&"Beta".to_string()));
+        });
+        assert_eq!(UiState::load(&dir).favorites, vec!["Beta".to_string()]);
+
+        // The FAVORITES section appears, and its row opens the page.
+        assert!(has(cx, "fav-0") && !has(cx, "fav-1"));
+        click_on(cx, "fav-0");
+        assert_eq!(selected_title(&view, cx), "Beta");
+        view.update(cx, |app, _| assert_eq!(app.state.recent[0], "Beta"));
+
+        // A favorite's star in the PAGES list is always shown; clicking it
+        // unstars without navigating.
+        cx.simulate_mouse_move(point(px(900.), px(900.)), None, Modifiers::none());
+        let alpha = page_row(&view, cx, "page", "Alpha");
+        click_on(cx, &alpha);
+        let star = page_row(&view, cx, "star", "Beta");
+        click_on(cx, &star);
+        assert_eq!(selected_title(&view, cx), "Alpha");
+        view.update(cx, |app, _| assert!(app.state.favorites.is_empty()));
+        assert!(!has(cx, "fav-0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn favorites_star_unfavorites_and_missing_pages_are_skipped(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "favorite-unstar",
+            &[("Alpha", "- a\n"), ("Beta", "- b\n")],
+            "Alpha",
+        );
+        view.update(cx, |app, cx| {
+            app.toggle_favorite("Gone", cx); // no such page
+            app.toggle_favorite("beta", cx); // case differs from the page
+        });
+        cx.run_until_parked();
+        // Only the existing page is listed, under its real title.
+        assert!(has(cx, "fav-0") && !has(cx, "fav-1"));
+
+        hover(cx, "fav-0");
+        click_on(cx, "fav-star-0");
+
+        assert_eq!(selected_title(&view, cx), "Alpha");
+        view.update(cx, |app, _| {
+            // The missing page's entry is kept, not cleaned up.
+            assert_eq!(app.state.favorites, vec!["Gone".to_string()]);
+        });
+        assert_eq!(UiState::load(&dir).favorites, vec!["Gone".to_string()]);
+        assert!(!has(cx, "fav-0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn state_reloads_into_a_fresh_window(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "state-reload",
+            &[("Alpha", "- a\n"), ("Beta", "- b\n")],
+            "Alpha",
+        );
+        view.update(cx, |app, cx| {
+            app.toggle_favorite("Alpha", cx);
+            app.open_page("Beta", cx);
+        });
+        let saved = view.update(cx, |app, _| app.state.clone());
+
+        let storage = Storage::open(dir.clone()).unwrap();
+        let (view2, cx2) = cx
+            .cx
+            .add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
+        cx2.run_until_parked();
+        view2.update(cx2, |app, _| {
+            assert_eq!(app.state.favorites, saved.favorites);
+            // Startup opens today's journal, which moves to the front.
+            assert_eq!(app.state.recent, vec![today_title(), "Beta".to_string()]);
+        });
+        assert!(has(cx2, "fav-0") && has(cx2, "recent-1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- settings panel ----------------------------------------------------
+
+    fn settings_open(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> bool {
+        let open = view.update(cx, |app, _| app.settings.is_some());
+        assert_eq!(open, has(cx, "settings-panel"), "state and rendering agree");
+        open
+    }
+
+    fn config_text(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(Config::path(dir)).unwrap()
+    }
+
+    #[gpui::test]
+    fn gear_and_ctrl_comma_open_settings_and_escape_closes_them(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-open", "- hello\n");
+        assert!(!settings_open(&view, cx));
+
+        click_on(cx, "settings-gear");
+        assert!(settings_open(&view, cx));
+        cx.simulate_keystrokes("escape");
+        assert!(!settings_open(&view, cx));
+
+        // Ctrl-, saves the block being edited first, and toggles.
+        click_block(cx, 0);
+        cx.simulate_input(" world");
+        cx.simulate_keystrokes("ctrl-,");
+        assert!(settings_open(&view, cx));
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), "- hello world\n");
+        cx.simulate_keystrokes("ctrl-,");
+        assert!(!settings_open(&view, cx));
+
+        // Starting to edit (Ctrl-N) closes the panel rather than editing under it.
+        cx.simulate_keystrokes("ctrl-, ctrl-n");
+        assert!(!settings_open(&view, cx));
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn palette_command_opens_settings(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-palette", "- hi\n");
+        for query in ["settings", "preferences"] {
+            cx.simulate_keystrokes("ctrl-k");
+            cx.simulate_input(query);
+            view.update(cx, |app, _| {
+                assert_eq!(
+                    app.search_results()[0].target,
+                    Target::Command(Command::OpenSettings),
+                    "{query}"
+                );
+            });
+            cx.simulate_keystrokes("enter");
+            view.update(cx, |app, _| assert!(app.search.is_none()));
+            assert!(settings_open(&view, cx));
+            cx.simulate_keystrokes("escape");
+            assert!(!settings_open(&view, cx));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn backdrop_click_closes_settings_but_panel_clicks_do_not(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-backdrop", "- hi\n");
+        click_on(cx, "settings-gear");
+
+        let panel = cx.debug_bounds("settings-panel").unwrap();
+        cx.simulate_click(panel.origin + point(px(8.), px(8.)), Modifiers::none());
+        assert!(
+            settings_open(&view, cx),
+            "a click inside the panel keeps it open"
+        );
+
+        let backdrop = cx.debug_bounds("settings-backdrop").unwrap();
+        cx.simulate_click(backdrop.origin + point(px(20.), px(20.)), Modifiers::none());
+        assert!(!settings_open(&view, cx));
+        // The click didn't reach the sidebar underneath.
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].title.clone()),
+            "Test"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn theme_buttons_apply_immediately_and_persist(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-theme", "- hi\n");
+        click_on(cx, "settings-gear");
+
+        click_on(cx, "theme-light");
+        view.update(cx, |app, _| {
+            assert_eq!(app.config.theme, ThemeKind::Light);
+            assert_eq!(app.theme.bg, Theme::light().bg);
+        });
+        assert_eq!(saved_config(&dir).theme, ThemeKind::Light);
+        assert!(config_text(&dir).contains("theme = \"light\""));
+        assert!(settings_open(&view, cx), "the panel stays open");
+
+        click_on(cx, "theme-dark");
+        view.update(cx, |app, _| assert_eq!(app.theme.bg, Theme::dark().bg));
+        assert_eq!(saved_config(&dir).theme, ThemeKind::Dark);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn font_size_buttons_change_persist_and_clamp(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-size", "- hi\n");
+        click_on(cx, "settings-gear");
+        let size = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| app.config.font_size)
+        };
+        assert!(has(cx, "font-size-value"));
+
+        click_on(cx, "font-size-inc");
+        click_on(cx, "font-size-inc");
+        assert_eq!(size(&view, cx), 18.0);
+        assert_eq!(saved_config(&dir).font_size, 18.0);
+        click_on(cx, "font-size-dec");
+        assert_eq!(size(&view, cx), 17.0);
+        click_on(cx, "font-size-reset");
+        assert_eq!(size(&view, cx), crate::config::DEFAULT_FONT_SIZE);
+        assert_eq!(
+            saved_config(&dir).font_size,
+            crate::config::DEFAULT_FONT_SIZE
+        );
+
+        for _ in 0..10 {
+            click_on(cx, "font-size-dec");
+        }
+        assert_eq!(size(&view, cx), crate::config::MIN_FONT_SIZE);
+        assert_eq!(saved_config(&dir).font_size, crate::config::MIN_FONT_SIZE);
+        for _ in 0..30 {
+            click_on(cx, "font-size-inc");
+        }
+        assert_eq!(size(&view, cx), crate::config::MAX_FONT_SIZE);
+        assert_eq!(saved_config(&dir).font_size, crate::config::MAX_FONT_SIZE);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn font_family_choice_persists_and_system_default_removes_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-family", "- hi\n");
+        click_on(cx, "settings-gear");
+        // The test platform's text system reports no installed fonts, so the
+        // list only has "System default"...
+        assert!(has(cx, "font-family-default"));
+        assert!(!has(cx, "font-family-0"));
+        // ...so give the open panel a known list, as the real text system would.
+        view.update(cx, |app, cx| {
+            app.settings.as_mut().unwrap().fonts = vec!["Test Sans".into(), "Test Serif".into()];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(has(cx, "font-family-1") && !has(cx, "font-family-2"));
+
+        click_on(cx, "font-family-1");
+        view.update(cx, |app, _| {
+            assert_eq!(app.config.font_family.as_deref(), Some("Test Serif"));
+            // Not really installed here, so rendering keeps the system font.
+            assert_eq!(app.font_family, None);
+        });
+        assert_eq!(
+            saved_config(&dir).font_family.as_deref(),
+            Some("Test Serif")
+        );
+        assert!(config_text(&dir).contains("font_family = \"Test Serif\""));
+
+        click_on(cx, "font-family-default");
+        view.update(cx, |app, _| assert_eq!(app.config.font_family, None));
+        assert_eq!(saved_config(&dir).font_family, None);
+        assert!(
+            !config_text(&dir)
+                .lines()
+                .any(|l| l.starts_with("font_family")),
+            "only the commented-out hint is left"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn settings_from_the_panel_load_in_a_fresh_window(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "settings-reload", "- hi\n");
+        click_on(cx, "settings-gear");
+        click_on(cx, "theme-light");
+        for _ in 0..4 {
+            click_on(cx, "font-size-inc");
+        }
+        view.update(cx, |app, cx| {
+            app.set_font_family(Some("Test Serif".into()), cx)
+        });
+
+        let storage = Storage::open(dir.clone()).unwrap();
+        let config = Config::load(&dir);
+        let (view2, cx2) = cx
+            .cx
+            .add_window_view(|window, cx| NoteSec::new(storage, config, window, cx));
+        view2.update(cx2, |app, _| {
+            assert_eq!(app.config.theme, ThemeKind::Light);
+            assert_eq!(app.theme.bg, Theme::light().bg);
+            assert_eq!(app.config.font_size, 20.0);
+            assert_eq!(app.config.font_family.as_deref(), Some("Test Serif"));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    // --- tabs together with favorites/recent and settings -------------------
+
+    fn recent(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        view.update(cx, |app, _| app.state.recent.clone())
+    }
+
+    fn recent_starts_with(view: &Entity<NoteSec>, cx: &mut VisualTestContext, expected: &[&str]) {
+        let got = recent(view, cx);
+        assert!(
+            got.len() >= expected.len() && got[..expected.len()] == *expected,
+            "RECENT is {got:?}, expected it to start with {expected:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn focusing_page_tabs_records_recent_but_graph_and_empty_do_not(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "tabs-recent", &tab_pages(), "Test");
+        // Opening tabs from the sidebar records each page, most recent first.
+        click_sidebar_page(&view, cx, "Alpha");
+        click_sidebar_page(&view, cx, "Beta");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 2);
+        recent_starts_with(&view, cx, &["Beta", "Alpha"]);
+        // Clicking a tab counts as opening its page.
+        click_on(cx, "tab-0");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 0);
+        recent_starts_with(&view, cx, &["Test", "Beta", "Alpha"]);
+        // So do Ctrl+Tab and Ctrl+Shift+Tab.
+        cx.simulate_keystrokes("ctrl-tab");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 1);
+        recent_starts_with(&view, cx, &["Alpha", "Test", "Beta"]);
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 0);
+        recent_starts_with(&view, cx, &["Test", "Alpha", "Beta"]);
+        // The graph tab is not a page: RECENT doesn't change.
+        let before = recent(&view, cx);
+        cx.simulate_keystrokes("ctrl-g");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta", "Graph"], 3);
+        assert_eq!(recent(&view, cx), before);
+        // Closing it hands focus to its neighbour, which counts.
+        cx.simulate_keystrokes("ctrl-w");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 2);
+        recent_starts_with(&view, cx, &["Beta", "Test", "Alpha"]);
+        cx.simulate_keystrokes("ctrl-w");
+        tabs_are(&view, cx, &["Test", "Alpha"], 1);
+        recent_starts_with(&view, cx, &["Alpha", "Beta", "Test"]);
+        cx.simulate_keystrokes("ctrl-w");
+        tabs_are(&view, cx, &["Test"], 0);
+        recent_starts_with(&view, cx, &["Test", "Alpha", "Beta"]);
+        // The empty state records nothing.
+        let before = recent(&view, cx);
+        cx.simulate_keystrokes("ctrl-w");
+        assert_eq!(tab_state(&view, cx), (vec![], None));
+        assert_eq!(recent(&view, cx), before);
+        // And the list is on disk.
+        assert_eq!(UiState::load(&dir).recent, before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn tab_keys_do_nothing_while_settings_are_open(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "tabs-settings", &tab_pages(), "Test");
+        click_sidebar_page(&view, cx, "Alpha");
+        tabs_are(&view, cx, &["Test", "Alpha"], 1);
+        cx.simulate_keystrokes("ctrl-,");
+        view.update(cx, |app, _| assert!(app.settings.is_some()));
+        cx.simulate_keystrokes("ctrl-tab ctrl-shift-tab ctrl-w");
+        view.update(cx, |app, _| {
+            assert!(app.settings.is_some());
+            assert_eq!(app.tabs.tabs.len(), 2);
+            assert_eq!(app.tabs.active, Some(1));
+        });
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert!(app.settings.is_none()));
+        tabs_are(&view, cx, &["Test", "Alpha"], 1);
+        // With the panel closed the keys work again.
+        cx.simulate_keystrokes("ctrl-tab");
+        tabs_are(&view, cx, &["Test", "Alpha"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn sidebar_click_that_ends_an_edit_opens_the_right_tab(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "tabs-stale-row", &tab_pages(), "Test");
+        // Edit a block so it links to a page that doesn't exist yet. Saving
+        // it (when the sidebar click ends the edit) creates "Aaa", which
+        // sorts before "Beta" and shifts the row indices under the click.
+        click_block(cx, 0);
+        cx.simulate_input(" [[Aaa]]");
+        let before = view.update(cx, |app, _| app.find_page("Beta").unwrap());
+        click_sidebar_page(&view, cx, "Beta");
+        let after = view.update(cx, |app, _| {
+            assert!(
+                app.find_page("Aaa").is_some(),
+                "the link target was created"
+            );
+            app.find_page("Beta").unwrap()
+        });
+        assert_ne!(before, after, "the edit shifted the sidebar rows");
+        tabs_are(&view, cx, &["Test", "Beta"], 1);
+        recent_starts_with(&view, cx, &["Beta"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
