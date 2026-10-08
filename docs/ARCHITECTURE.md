@@ -463,6 +463,24 @@ that mutate, and data races are essentially impossible.
     dimmed and struck through); its mouse-down stops propagation, so it
     never starts editing. The edited block shows the raw keyword. The "/"
     menu doesn't offer TODO: it lists block kinds only.
+17. **Folding is UI-only and keyed by block id** — `NoteSec.collapsed` is a
+    `HashSet<Uuid>` of folded blocks; nothing is written to the file (ids
+    are regenerated on load, so folds reset on restart, as decided for v1).
+    `Page::visible_blocks` hides every block that has a folded ancestor;
+    hidden rows aren't rendered. A block with children gets a `▾`/`▸`
+    arrow left of its bullet (in the indent, so text doesn't move); a press
+    on it stops propagation, so it never starts editing. A folded block
+    shows a badge with the number of **all** hidden descendants
+    (`Page::descendant_count`), not just direct children. Click only; no
+    keyboard folding yet. Interaction rules: the edited block is always
+    made visible (`load_editor` and undo/redo unfold its ancestors, which
+    covers search hits, arrows, Enter and Backspace); folding an ancestor of
+    the edited block leaves edit mode (saving it); Up/Down and the
+    Backspace-delete target skip hidden blocks; Enter on a folded block adds
+    a sibling after its subtree (as Logseq does) instead of a hidden first
+    child; Tab under a folded sibling unfolds it; clicking a backlink
+    unfolds the referencing block on the opened page. Folding is not an
+    undo step.
 
 ---
 

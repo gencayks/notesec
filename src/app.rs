@@ -14,7 +14,7 @@ use crate::model::{
 };
 use crate::search::{search, Command, Hit, Target};
 use crate::storage::{today_title, Storage};
-use crate::ui::{block_row, task_checkbox, Theme};
+use crate::ui::{block_row, fold_arrow, fold_badge, task_checkbox, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
@@ -23,8 +23,10 @@ use gpui::{
     ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
     UnderlineStyle, Window,
 };
+use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
+use uuid::Uuid;
 
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace.
@@ -176,6 +178,9 @@ pub struct NoteSec {
     /// True between a mouse-down in the edited block and the mouse-up: mouse
     /// moves in between extend the selection.
     selecting: bool,
+    /// Ids of folded blocks (their descendants are hidden). UI-only: not
+    /// saved, and block ids are regenerated on load anyway.
+    collapsed: HashSet<Uuid>,
     undo_stack: Vec<HistoryState>,
     redo_stack: Vec<HistoryState>,
     text_history_active: bool,
@@ -269,6 +274,7 @@ impl NoteSec {
             search: None,
             slash: None,
             selecting: false,
+            collapsed: HashSet::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             text_history_active: false,
@@ -426,6 +432,7 @@ impl NoteSec {
             self.editor.clamp();
             self.editor.marked = None;
             self.pages[self.selected].blocks[ix].content = self.editor.text.clone();
+            self.reveal(ix);
         }
         self.save_all_pages();
         window.focus(&self.focus_handle, cx);
@@ -790,6 +797,43 @@ impl NoteSec {
             self.editor.cursor = 0;
         }
         self.editing = Some(ix);
+        // Whatever route led here (search, Enter, Backspace, undo), the
+        // edited block must be visible.
+        self.reveal(ix);
+    }
+
+    /// Unfold every ancestor of block `ix` on the current page.
+    fn reveal(&mut self, ix: usize) {
+        for id in self.pages[self.selected].ancestor_ids(ix) {
+            self.collapsed.remove(&id);
+        }
+    }
+
+    /// The nearest visible block before (`forward == false`) or after block
+    /// `ix`, skipping blocks hidden in folded subtrees.
+    fn visible_neighbor(&self, ix: usize, forward: bool) -> Option<usize> {
+        let visible = self.pages[self.selected].visible_blocks(&self.collapsed);
+        if forward {
+            (ix + 1..visible.len()).find(|&i| visible[i])
+        } else {
+            (0..ix).rev().find(|&i| visible[i])
+        }
+    }
+
+    /// Fold arrow click: fold or unfold block `ix`. Folding a block whose
+    /// descendant is being edited leaves edit mode (saving it). UI-only, so
+    /// not an undo step.
+    fn toggle_fold(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let page = &self.pages[self.selected];
+        let id = page.blocks[ix].id;
+        if !self.collapsed.remove(&id) {
+            self.collapsed.insert(id);
+            let subtree = ix + 1..page.subtree_end(ix);
+            if self.editing.is_some_and(|e| subtree.contains(&e)) {
+                self.stop_edit(cx);
+            }
+        }
+        cx.notify();
     }
 
     fn start_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -837,7 +881,15 @@ impl NoteSec {
         self.record_edit();
         let rest = self.editor.split_off_at_cursor();
         self.sync_content();
-        let new_ix = self.pages[self.selected].insert_after(ix, rest);
+        let page = &mut self.pages[self.selected];
+        // On a folded block the new block goes after its hidden subtree
+        // rather than becoming its (hidden) first child.
+        let folded = self.collapsed.contains(&page.blocks[ix].id) && page.descendant_count(ix) > 0;
+        let new_ix = if folded {
+            page.insert_after_subtree(ix, rest)
+        } else {
+            page.insert_after(ix, rest)
+        };
         self.save_page();
         self.load_editor(new_ix, true);
         cx.notify();
@@ -862,6 +914,8 @@ impl NoteSec {
         if op(&mut self.pages[self.selected], ix) {
             self.record_state(before);
             self.save_page();
+            // Indenting under a folded block unfolds it.
+            self.reveal(ix);
         }
         cx.notify();
     }
@@ -894,12 +948,14 @@ impl NoteSec {
         // block that still has children).
         self.text_history_active = false;
         let before = self.history_state();
+        // The visible block above (not one hidden in a folded subtree).
+        let above = self.visible_neighbor(ix, false).unwrap_or(0);
         let page = &mut self.pages[self.selected];
         if page.blocks.len() > 1 && page.delete_leaf(ix) {
             self.record_state(before);
             self.save_page();
             // Move to the block above (or the new first block if we deleted #0).
-            self.load_editor(ix.saturating_sub(1), false);
+            self.load_editor(above, false);
         }
         cx.notify();
     }
@@ -1035,8 +1091,8 @@ impl NoteSec {
             self.move_slash_selection(-1, cx);
             return;
         }
-        if let Some(ix) = self.editing.filter(|&ix| ix > 0) {
-            self.move_edit(ix - 1, cx);
+        if let Some(prev) = self.editing.and_then(|ix| self.visible_neighbor(ix, false)) {
+            self.move_edit(prev, cx);
         }
     }
 
@@ -1049,10 +1105,8 @@ impl NoteSec {
             self.move_slash_selection(1, cx);
             return;
         }
-        if let Some(ix) = self.editing {
-            if ix + 1 < self.pages[self.selected].blocks.len() {
-                self.move_edit(ix + 1, cx);
-            }
+        if let Some(next) = self.editing.and_then(|ix| self.visible_neighbor(ix, true)) {
+            self.move_edit(next, cx);
         }
     }
 
@@ -1750,10 +1804,13 @@ impl Render for NoteSec {
         let page = &self.pages[self.selected];
         #[cfg(test)]
         let mut reading_layouts = Vec::new();
+        let visible = page.visible_blocks(&self.collapsed);
         let rows: Vec<AnyElement> = page
             .blocks
             .iter()
             .enumerate()
+            // Blocks inside a folded subtree aren't rendered at all.
+            .filter(|&(ix, _)| visible[ix])
             .map(|(ix, block)| {
                 let is_editing = self.editing == Some(ix);
                 let depth = page.depth_of(ix);
@@ -1869,7 +1926,30 @@ impl Render for NoteSec {
                         this.open_page(&link.target, cx);
                     }
                 });
-                let row = block_row(&theme, depth, font_size, kind, content)
+                // Blocks with children get a fold arrow; a folded one also
+                // shows how many blocks it hides. A press on the arrow stops
+                // there, so it never starts editing.
+                let hidden_count = page.descendant_count(ix);
+                let folded = hidden_count > 0 && self.collapsed.contains(&block.id);
+                let fold = (hidden_count > 0).then(|| {
+                    fold_arrow(&theme, folded)
+                        .debug_selector(move || format!("fold-{ix}"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_fold(ix, cx);
+                            }),
+                        )
+                        .into_any_element()
+                });
+                let row = block_row(&theme, depth, font_size, kind, content, fold)
+                    .when(folded, |d| {
+                        d.child(
+                            fold_badge(&theme, font_size, hidden_count)
+                                .debug_selector(move || format!("fold-badge-{ix}-{hidden_count}")),
+                        )
+                    })
                     .id(("block", ix))
                     // Lets tests find this row's on-screen bounds; a no-op in
                     // normal builds.
@@ -1941,9 +2021,13 @@ impl Render for NoteSec {
                         .cursor_pointer()
                         .text_color(theme.text)
                         .hover(|d| d.bg(theme.selected_bg))
-                        .on_click(
-                            cx.listener(move |this, _e, _window, cx| this.open_page(&title, cx)),
-                        )
+                        .on_click(cx.listener(move |this, _e, _window, cx| {
+                            this.open_page(&title, cx);
+                            // Unfold whatever hides the referencing block.
+                            if block_ix < this.pages[this.selected].blocks.len() {
+                                this.reveal(block_ix);
+                            }
+                        }))
                         .child(source.blocks[block_ix].content.clone())
                         .into_any_element(),
                 );
@@ -3923,6 +4007,130 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.pages[app.selected].blocks[0].content, "DONE a");
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn click_on(cx: &mut VisualTestContext, selector: &str) {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        let bounds = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(bounds.center(), Modifiers::none());
+    }
+
+    /// Indices of the rendered block rows, out of the first `n` blocks.
+    fn shown(cx: &mut VisualTestContext, n: usize) -> Vec<usize> {
+        (0..n)
+            .filter(|&ix| has(cx, &format!("block-{ix}")))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn fold_arrow_collapses_and_expands_with_a_count(cx: &mut TestAppContext) {
+        let original = "- a\n  - b\n    - c\n  - d\n- e\n";
+        let (view, cx, dir) = setup(cx, "fold", original);
+        // Only blocks with children have an arrow.
+        assert!(has(cx, "fold-0") && has(cx, "fold-1"));
+        assert!(!has(cx, "fold-2") && !has(cx, "fold-3") && !has(cx, "fold-4"));
+
+        // Folding hides every descendant and counts them all.
+        click_on(cx, "fold-0");
+        assert_eq!(shown(cx, 5), [0, 4]);
+        assert!(has(cx, "fold-badge-0-3"));
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, None, "the arrow never edits")
+        });
+        // Unfolding restores them.
+        click_on(cx, "fold-0");
+        assert_eq!(shown(cx, 5), [0, 1, 2, 3, 4]);
+        assert!(!has(cx, "fold-badge-0-3"));
+
+        // Nested folds: the inner one is remembered across the outer one.
+        click_on(cx, "fold-1");
+        assert_eq!(shown(cx, 5), [0, 1, 3, 4]);
+        assert!(has(cx, "fold-badge-1-1"));
+        click_on(cx, "fold-0");
+        assert_eq!(shown(cx, 5), [0, 4]);
+        click_on(cx, "fold-0");
+        assert_eq!(shown(cx, 5), [0, 1, 3, 4]);
+
+        // UI-only: the file is untouched.
+        assert_eq!(file(&dir), original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn editing_around_folded_blocks(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "fold-edit", "- a\n  - b\n- c\n");
+        // Folding the parent of the edited block leaves edit mode, saving it.
+        click_block(cx, 1);
+        cx.simulate_input("!");
+        click_on(cx, "fold-0");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), "- a\n  - b!\n- c\n");
+
+        // Up/Down skip hidden blocks.
+        click_block(cx, 0);
+        cx.simulate_keystrokes("down");
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(2)));
+        cx.simulate_keystrokes("up");
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+
+        // Enter on a folded block adds a sibling after its subtree.
+        cx.simulate_keystrokes("end enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(2));
+            assert_eq!(app.pages[app.selected].depth_of(2), 0);
+        });
+        assert!(has(cx, "fold-badge-0-1"), "still folded");
+        // Backspace in that empty block goes back to the folded block, not
+        // into its hidden child.
+        cx.simulate_keystrokes("backspace");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.pages[app.selected].blocks.len(), 3);
+        });
+        assert_eq!(shown(cx, 3), [0, 2]);
+
+        // Indenting "c" under the folded "a" unfolds it.
+        click_block(cx, 2);
+        cx.simulate_keystrokes("tab");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(2));
+            assert_eq!(app.pages[app.selected].depth_of(2), 1);
+        });
+        assert_eq!(shown(cx, 3), [0, 1, 2]);
+        assert_eq!(file(&dir), "- a\n  - b!\n  - c\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn search_and_backlinks_unfold_to_a_hidden_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "fold-nav",
+            &[
+                ("Test", "- top\n  - deep zqneedle [[Hub]]\n- after\n"),
+                ("Hub", "- hub\n"),
+            ],
+            "Test",
+        );
+        click_on(cx, "fold-0");
+        assert_eq!(shown(cx, 3), [0, 2]);
+        // A search hit in a folded subtree unfolds it and edits the block.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("zqneedle");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(1)));
+        assert_eq!(shown(cx, 3), [0, 1, 2]);
+
+        // Fold again, go to Hub and follow the backlink back.
+        click_on(cx, "fold-0");
+        view.update(cx, |app, cx| app.open_page("Hub", cx));
+        cx.run_until_parked();
+        click_on(cx, "backlink-0");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Test")
+        });
+        assert_eq!(shown(cx, 3), [0, 1, 2]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

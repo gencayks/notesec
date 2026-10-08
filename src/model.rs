@@ -456,6 +456,44 @@ impl Page {
         end
     }
 
+    /// Number of descendants (children, grandchildren, ...) of block `index`.
+    pub fn descendant_count(&self, index: usize) -> usize {
+        self.subtree_end(index) - index - 1
+    }
+
+    /// Ids of the ancestors of block `index`, nearest first.
+    pub fn ancestor_ids(&self, index: usize) -> Vec<Uuid> {
+        let mut ids = Vec::new();
+        let mut parent = self.blocks[index].parent_id;
+        while let Some(pid) = parent {
+            ids.push(pid);
+            parent = self
+                .blocks
+                .iter()
+                .find(|b| b.id == pid)
+                .and_then(|b| b.parent_id);
+        }
+        ids
+    }
+
+    /// Which blocks are shown when the blocks whose ids are in `collapsed`
+    /// are folded: a block is hidden when any of its ancestors is collapsed.
+    pub fn visible_blocks(&self, collapsed: &std::collections::HashSet<Uuid>) -> Vec<bool> {
+        let mut visible = Vec::with_capacity(self.blocks.len());
+        // Depth of the collapsed block whose subtree we are inside, if any.
+        let mut folded_at: Option<usize> = None;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let depth = self.depth_of(i);
+            if folded_at.is_some_and(|d| depth > d) {
+                visible.push(false);
+                continue;
+            }
+            visible.push(true);
+            folded_at = collapsed.contains(&block.id).then_some(depth);
+        }
+        visible
+    }
+
     /// Recompute every block's `order` from document order. Called after any
     /// structural change so `order` never goes stale.
     pub fn renumber(&mut self) {
@@ -483,6 +521,24 @@ impl Page {
                 id: Uuid::new_v4(),
                 content,
                 parent_id,
+                page_id: self.id.clone(),
+                order: 0,
+            },
+        );
+        self.renumber();
+        at
+    }
+
+    /// Enter on a collapsed block: insert a new sibling with `content` right
+    /// after the block's whole subtree (as Logseq does) and return its index.
+    pub fn insert_after_subtree(&mut self, index: usize, content: String) -> usize {
+        let at = self.subtree_end(index);
+        self.blocks.insert(
+            at,
+            Block {
+                id: Uuid::new_v4(),
+                content,
+                parent_id: self.blocks[index].parent_id,
                 page_id: self.id.clone(),
                 order: 0,
             },
@@ -695,6 +751,52 @@ mod tests {
         }
         assert_eq!(task_split("# NOW a"), (2, Some(TaskState::Now), 6));
         assert_eq!(task_split("# a"), (2, None, 2));
+    }
+
+    #[test]
+    fn collapsing_hides_all_descendants() {
+        let md = "- a\n  - b\n    - c\n  - d\n- e\n  - f\n";
+        let page = Page::from_markdown("t", false, md);
+        let id = |i: usize| page.blocks[i].id;
+        let none = std::collections::HashSet::new();
+        assert!(page.visible_blocks(&none).iter().all(|&v| v));
+        let folded: std::collections::HashSet<_> = [id(0)].into();
+        assert_eq!(
+            page.visible_blocks(&folded),
+            [true, false, false, false, true, true]
+        );
+        assert_eq!(page.descendant_count(0), 3);
+        // A collapsed block inside a collapsed block; and a nested one only.
+        let folded: std::collections::HashSet<_> = [id(1)].into();
+        assert_eq!(
+            page.visible_blocks(&folded),
+            [true, true, false, true, true, true]
+        );
+        assert_eq!(page.descendant_count(1), 1);
+        let folded: std::collections::HashSet<_> = [id(0), id(1), id(4)].into();
+        assert_eq!(
+            page.visible_blocks(&folded),
+            [true, false, false, false, true, false]
+        );
+        // A collapsed leaf hides nothing.
+        let folded: std::collections::HashSet<_> = [id(2), id(5)].into();
+        assert!(page.visible_blocks(&folded).iter().all(|&v| v));
+        assert_eq!(page.ancestor_ids(2), [id(1), id(0)]);
+        assert!(page.ancestor_ids(4).is_empty());
+    }
+
+    #[test]
+    fn insert_after_subtree_adds_a_sibling() {
+        let mut page = Page::from_markdown("t", false, "- a\n  - b\n    - c\n- d\n");
+        let at = page.insert_after_subtree(0, "new".into());
+        assert_eq!(at, 3);
+        assert_eq!(page.to_markdown(), "- a\n  - b\n    - c\n- new\n- d\n");
+        let at = page.insert_after_subtree(1, "x".into());
+        assert_eq!(at, 3);
+        assert_eq!(
+            page.to_markdown(),
+            "- a\n  - b\n    - c\n  - x\n- new\n- d\n"
+        );
     }
 
     #[test]

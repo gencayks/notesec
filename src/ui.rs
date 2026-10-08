@@ -5,7 +5,7 @@
 
 use crate::config::ThemeKind;
 use crate::model::{BlockKind, TaskState};
-use gpui::{div, prelude::*, px, rgb, rgba, Div, FontWeight, Rgba};
+use gpui::{div, prelude::*, px, rgb, rgba, AnyElement, Div, FontWeight, Rgba};
 
 /// Colours used across the UI. Every colour comes from here, so switching
 /// theme is just swapping this struct.
@@ -112,16 +112,52 @@ pub fn task_checkbox(theme: &Theme, font_size: f32, kind: BlockKind, state: Task
     }
 }
 
+/// The fold triangle for a block with children (`▸` collapsed, `▾`
+/// expanded). `block_row` places it just left of the bullet, in the indent,
+/// so it doesn't move the text. `app.rs` adds the click handler.
+pub fn fold_arrow(theme: &Theme, collapsed: bool) -> Div {
+    div()
+        .absolute()
+        .left(px(-17.0))
+        .top(px(-5.0))
+        .size(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .text_size(px(12.0))
+        .text_color(theme.muted)
+        .hover(|d| d.bg(theme.selected_bg))
+        .child(if collapsed { "▸" } else { "▾" })
+}
+
+/// Badge after a collapsed block: how many blocks are hidden under it.
+pub fn fold_badge(theme: &Theme, font_size: f32, count: usize) -> Div {
+    let line_height = font_size * LINE_HEIGHT_RATIO;
+    div()
+        .flex_shrink_0()
+        .mt(px((line_height - font_size) / 2.0 - 1.0))
+        .px_2()
+        .rounded_full()
+        .bg(theme.selected_bg)
+        .text_size(px(font_size * 0.75))
+        .text_color(theme.muted)
+        .child(count.to_string())
+}
+
 /// One block row: indent + bullet + `content`. The content is either static
 /// text (display mode) or the live text-editing element (edit mode).
 /// `font_size` (in px) is the configured size; `kind` scales it for headings
 /// and styles quotes, in both modes, so editing a block doesn't make it jump.
+/// `fold` is the fold arrow of a block with children (see [`fold_arrow`]).
 pub fn block_row(
     theme: &Theme,
     depth: usize,
     font_size: f32,
     kind: BlockKind,
     content: impl IntoElement,
+    fold: Option<AnyElement>,
 ) -> Div {
     let size = font_size * kind_scale(kind);
     let line_height = size * LINE_HEIGHT_RATIO;
@@ -157,11 +193,13 @@ pub fn block_row(
         .child(
             // The bullet dot, vertically centred on the first text line.
             div()
+                .relative()
                 .mt(px((line_height - 6.0) / 2.0))
                 .size(px(6.0))
                 .flex_shrink_0()
                 .rounded_full()
-                .bg(theme.muted),
+                .bg(theme.muted)
+                .children(fold),
         )
         .child(body)
 }
