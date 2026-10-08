@@ -40,6 +40,49 @@ pub fn parse_block_refs(text: &str) -> Vec<(Range<usize>, Uuid)> {
     refs
 }
 
+/// A `{{query #tag}}` (or `{{query #[[multi word]]}}`) macro in `text`:
+/// its byte range and the tag it asks for. Only the first one counts.
+pub fn parse_query(text: &str) -> Option<(Range<usize>, String)> {
+    let start = text.find("{{query")?;
+    let inner_start = start + "{{query".len();
+    let len = text[inner_start..].find("}}")?;
+    let inner = &text[inner_start..inner_start + len];
+    let tag = inner.trim();
+    // The whole inside must be exactly one tag.
+    let refs = parse_references(tag);
+    match refs.as_slice() {
+        [r] if r.is_tag && r.range == (0..tag.len()) => {
+            Some((start..inner_start + len + 2, r.target.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Every block tagged `#tag` (or `#[[tag]]`), in page then document order,
+/// as `(page, block)`. Matching ignores case, like page names. The tag
+/// inside a block's own `{{query ...}}` doesn't count, so a query never
+/// lists itself.
+pub fn tag_query(pages: &[Page], tag: &str) -> Vec<(usize, usize)> {
+    let wanted = tag.to_lowercase();
+    let mut hits = Vec::new();
+    for (page_ix, page) in pages.iter().enumerate() {
+        for (block_ix, block) in page.blocks.iter().enumerate() {
+            let skip = parse_query(&block.content).map(|(range, _)| range);
+            let tagged = parse_references(&block.content).iter().any(|r| {
+                r.is_tag
+                    && r.target.to_lowercase() == wanted
+                    && !skip
+                        .as_ref()
+                        .is_some_and(|s| s.start <= r.range.start && r.range.end <= s.end)
+            });
+            if tagged {
+                hits.push((page_ix, block_ix));
+            }
+        }
+    }
+    hits
+}
+
 /// Where the block with `id` is: `(page index, block index)`.
 pub fn find_block(pages: &[Page], id: Uuid) -> Option<(usize, usize)> {
     pages
@@ -890,6 +933,34 @@ fn parse_bullet(line: &str) -> Option<(usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_macros_take_one_tag() {
+        let (range, tag) = parse_query("see {{query #proj}} here").unwrap();
+        assert_eq!((range, tag.as_str()), (4..19, "proj"));
+        let (_, tag) = parse_query("{{query #[[big plan]]}}").unwrap();
+        assert_eq!(tag, "big plan");
+        assert_eq!(parse_query("{{query  #proj }}").unwrap().1, "proj");
+        assert_eq!(parse_query("{{query proj}}"), None);
+        assert_eq!(parse_query("{{query #a #b}}"), None);
+        assert_eq!(parse_query("{{query #a"), None);
+    }
+
+    #[test]
+    fn tag_query_finds_tagged_blocks_across_pages() {
+        let pages = vec![
+            Page::from_markdown("A", false, "- milk #Proj\n- no tag\n- [[proj]] is a link\n"),
+            Page::from_markdown(
+                "B",
+                false,
+                "- {{query #proj}}\n- plan #[[proj]] and #other\n",
+            ),
+            Page::from_markdown("C", false, "- {{query #[[big plan]]}}\n- x #[[Big Plan]]\n"),
+        ];
+        assert_eq!(tag_query(&pages, "proj"), vec![(0, 0), (1, 1)]);
+        assert_eq!(tag_query(&pages, "big plan"), vec![(2, 1)]);
+        assert_eq!(tag_query(&pages, "nothing"), vec![]);
+    }
 
     #[test]
     fn block_refs_are_found_and_bad_ones_skipped() {

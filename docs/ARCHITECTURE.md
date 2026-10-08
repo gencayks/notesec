@@ -648,6 +648,19 @@ that mutate, and data races are essentially impossible.
     to the start or end of the reference in `content`, so the editor and the
     file only ever hold `((uuid))`. Clicking it opens the source page and
     edits that block. A reference to a missing block shows as written.
+25. **Tag queries are computed while rendering, from the pages in
+    memory**: a block whose text holds `{{query #tag}}` or
+    `{{query #[[multi word]]}}` (`parse_query`: the inside must be exactly
+    one tag) shows, under its text in reading view, a list of every block
+    tagged that way on any page (`tag_query`, case-insensitive like page
+    names; `[[links]]` don't count, and the tag inside a block's own query
+    macro doesn't either, so a query never lists itself). There is no
+    index or cache: the list is rebuilt every frame from `self.pages`,
+    which every save and navigation already keeps current, so results are
+    always live. Each result shows its page and the block's reading text;
+    a press on it stops there (it never starts editing the query block) and
+    a click opens that page. The macro itself stays in the file and in the
+    editor exactly as typed.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

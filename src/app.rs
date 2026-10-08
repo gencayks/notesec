@@ -10,8 +10,8 @@ use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::model::{
-    backlinks, cycle_task, find_block, parse_block_refs, parse_references, tag_counts, BlockKind,
-    Page, TaskState,
+    backlinks, cycle_task, find_block, parse_block_refs, parse_query, parse_references, tag_counts,
+    tag_query, BlockKind, Page, TaskState,
 };
 use crate::search::{search, search_blocks, search_templates, Command, Hit, Target};
 use crate::state::UiState;
@@ -3007,6 +3007,88 @@ impl Render for NoteSec {
                                 .into_any_element(),
                         }
                     }
+                };
+                // A `{{query #tag}}` block lists every block tagged #tag
+                // under its text. Computed each frame from the pages in
+                // memory, so it follows every save and navigation.
+                let query_list = display
+                    .as_ref()
+                    .and_then(|_| parse_query(&block.content))
+                    .map(|(_, tag)| {
+                        let hits = tag_query(&self.pages, &tag);
+                        let header = match hits.len() {
+                            0 => format!("No blocks tagged #{tag}"),
+                            1 => format!("1 block tagged #{tag}"),
+                            n => format!("{n} blocks tagged #{tag}"),
+                        };
+                        let items: Vec<AnyElement> = hits
+                            .iter()
+                            .enumerate()
+                            .map(|(n, &(p, b))| {
+                                let title = self.pages[p].title.clone();
+                                let text = DisplayBlock::new(&self.pages[p].blocks[b].content)
+                                    .text
+                                    .replace('\n', " ");
+                                div()
+                                    .id(("query-hit", n))
+                                    .debug_selector(move || format!("query-{ix}-hit-{n}"))
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_md()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_3()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(theme.selected_bg))
+                                    // A press here never starts editing the
+                                    // query block; the click opens the page.
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.open_page(&title, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(theme.accent)
+                                            .child(self.pages[p].title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_color(theme.text)
+                                            .child(text),
+                                    )
+                                    .into_any_element()
+                            })
+                            .collect();
+                        div()
+                            .id(("query", ix))
+                            .debug_selector(move || format!("query-{ix}"))
+                            .mt_1()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.sidebar_bg)
+                            .flex()
+                            .flex_col()
+                            .text_size(px(font_size * 0.9))
+                            .child(div().px_2().pb_1().text_color(theme.muted).child(header))
+                            .children(items)
+                    });
+                let content = match query_list {
+                    Some(list) => div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(content)
+                        .child(list)
+                        .into_any_element(),
+                    None => content,
                 };
                 // A press on a row that isn't being edited starts editing it
                 // with the cursor under the mouse, and a drag from there
@@ -6756,6 +6838,67 @@ mod tests {
             find_block(&pages, id).map(|(p, b)| pages[p].blocks[b].content.clone())
         });
         assert_eq!(resolved.text, "keep me");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn tag_query_lists_tagged_blocks_from_every_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "tag-query",
+            &[
+                ("Test", "- {{query #proj}}\n- {{query #[[big plan]]}}\n"),
+                ("Alpha", "- buy milk #proj\n- nothing here\n"),
+                ("Beta", "- ship it #[[Proj]]\n- x #[[big plan]]\n"),
+            ],
+            "Test",
+        );
+        assert!(has(cx, "query-0") && has(cx, "query-1"));
+        // Two hits for #proj (one per page), one for the multi-word tag.
+        assert!(has(cx, "query-0-hit-0") && has(cx, "query-0-hit-1"));
+        assert!(!has(cx, "query-0-hit-2"));
+        assert!(has(cx, "query-1-hit-0") && !has(cx, "query-1-hit-1"));
+        // Showing results doesn't touch the file.
+        assert_eq!(file(&dir), "- {{query #proj}}\n- {{query #[[big plan]]}}\n");
+
+        // Clicking a hit goes to that block's page, without editing the query.
+        let at = bounds_of(cx, "query-1-hit-0").center();
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Beta");
+            assert_eq!(app.editing, None);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn tag_query_results_follow_edits_on_other_pages(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "tag-query-live",
+            &[("Test", "- {{query #todo}}\n"), ("Other", "- one\n- two\n")],
+            "Test",
+        );
+        assert!(has(cx, "query-0") && !has(cx, "query-0-hit-0"));
+
+        // Tag a block on another page, then come back.
+        let other = view.update(cx, |app, _| app.find_page("Other").unwrap());
+        view.update(cx, |app, cx| app.show_page(other, cx));
+        cx.run_until_parked();
+        click_block(cx, 1);
+        cx.simulate_input(" #todo");
+        cx.simulate_keystrokes("escape");
+        let test = view.update(cx, |app, _| app.find_page("Test").unwrap());
+        view.update(cx, |app, cx| app.show_page(test, cx));
+        cx.run_until_parked();
+        assert!(has(cx, "query-0-hit-0") && !has(cx, "query-0-hit-1"));
+
+        // Clicking the hit lands on the page that has it.
+        let at = bounds_of(cx, "query-0-hit-0").center();
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Other")
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 }
