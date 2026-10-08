@@ -370,6 +370,11 @@ that mutate, and data races are essentially impossible.
 8. **Hand-rolled fuzzy matcher** — no dependency, tuned scoring, bounded cost.
 9. **Theme as a struct** — theme switch = struct swap, not a rewrite.
 10. **TOML + serde for config** — human-editable, standard, zero hand-parsing.
+11. **Block types are markdown prefixes** — `BlockKind` (Text, Heading 1-3,
+    Quote) is read from a `# ` / `## ` / `### ` / `> ` prefix on `content`
+    rather than stored in a field, so files stay plain Logseq markdown. The
+    editor shows the raw prefix; display mode hides it and styles the row.
+    Typing "/" in an empty block opens a menu to switch the type.
 
 ---
 

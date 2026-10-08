@@ -4,7 +4,8 @@
 //! needs click handlers is built in `app.rs`, where `cx.listener` is available.
 
 use crate::config::ThemeKind;
-use gpui::{div, prelude::*, px, rgb, Div, Rgba};
+use crate::model::BlockKind;
+use gpui::{div, prelude::*, px, rgb, Div, FontWeight, Rgba};
 
 /// Colours used across the UI. Every colour comes from here, so switching
 /// theme is just swapping this struct.
@@ -61,11 +62,50 @@ impl Theme {
 /// derived from the font size with this so it scales when the font does.
 const LINE_HEIGHT_RATIO: f32 = 1.618;
 
+/// Text size of a block of `kind`, relative to the configured font size.
+/// Headings scale up from the user's font size so they follow Ctrl-+/-.
+pub fn kind_scale(kind: BlockKind) -> f32 {
+    match kind {
+        BlockKind::Heading1 => 1.6,
+        BlockKind::Heading2 => 1.35,
+        BlockKind::Heading3 => 1.15,
+        BlockKind::Text | BlockKind::Quote => 1.0,
+    }
+}
+
 /// One block row: indent + bullet + `content`. The content is either static
 /// text (display mode) or the live text-editing element (edit mode).
-/// `font_size` (in px) positions the bullet and sets the minimum row height.
-pub fn block_row(theme: &Theme, depth: usize, font_size: f32, content: impl IntoElement) -> Div {
-    let line_height = font_size * LINE_HEIGHT_RATIO;
+/// `font_size` (in px) is the configured size; `kind` scales it for headings
+/// and styles quotes, in both modes, so editing a block doesn't make it jump.
+pub fn block_row(
+    theme: &Theme,
+    depth: usize,
+    font_size: f32,
+    kind: BlockKind,
+    content: impl IntoElement,
+) -> Div {
+    let size = font_size * kind_scale(kind);
+    let line_height = size * LINE_HEIGHT_RATIO;
+    let body = div()
+        .flex_1()
+        .text_size(px(size))
+        .text_color(theme.text)
+        .when(
+            matches!(
+                kind,
+                BlockKind::Heading1 | BlockKind::Heading2 | BlockKind::Heading3
+            ),
+            |d| d.font_weight(FontWeight::BOLD),
+        )
+        // Quotes: a bar on the left and muted italic text.
+        .when(kind == BlockKind::Quote, |d| {
+            d.border_l_2()
+                .border_color(theme.muted)
+                .pl_2()
+                .text_color(theme.muted)
+                .italic()
+        })
+        .child(content);
     div()
         .flex()
         .flex_row()
@@ -84,5 +124,5 @@ pub fn block_row(theme: &Theme, depth: usize, font_size: f32, content: impl Into
                 .rounded_full()
                 .bg(theme.muted),
         )
-        .child(div().flex_1().text_color(theme.text).child(content))
+        .child(body)
 }

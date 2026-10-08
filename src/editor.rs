@@ -10,6 +10,8 @@
 //!
 //! Blocks are single-line, so newlines are stripped from anything inserted.
 
+use crate::model::BlockKind;
+use crate::search::fuzzy_score;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -146,6 +148,63 @@ impl EditorState {
     }
 }
 
+/// The "/" menu for changing the edited block's type.
+///
+/// It opens when "/" is typed into an empty block (one whose text, after any
+/// type prefix such as `# `, is empty) with the cursor at the end. The text
+/// typed after the "/" stays in the editor and filters the menu; `app.rs`
+/// removes it again when a type is chosen or the menu is dismissed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlashMenu {
+    /// Byte offset of the "/" in the editor text. Everything before it is the
+    /// block's text from before the menu opened.
+    pub slash: usize,
+    /// Highlighted entry, an index into `matches()`.
+    pub selected: usize,
+}
+
+impl SlashMenu {
+    /// If inserting `typed` over `range` in `editor` should open the menu,
+    /// return it (positioned at the "/" about to be inserted). "/" anywhere
+    /// else is ordinary text.
+    pub fn open_for(editor: &EditorState, range: &Range<usize>, typed: &str) -> Option<Self> {
+        let at_end = range.start == editor.text.len() && range.end == editor.text.len();
+        let empty_block = BlockKind::parse(&editor.text).1.is_empty();
+        (typed == "/" && at_end && empty_block && editor.marked.is_none()).then_some(SlashMenu {
+            slash: range.start,
+            selected: 0,
+        })
+    }
+
+    /// The filter text typed after the "/", or `None` if the menu no longer
+    /// applies (the "/" was deleted or the cursor moved before it).
+    pub fn query<'a>(&self, editor: &'a EditorState) -> Option<&'a str> {
+        if editor.text.get(self.slash..self.slash + 1) != Some("/") || editor.cursor <= self.slash {
+            return None;
+        }
+        editor.text.get(self.slash + 1..)
+    }
+
+    /// Block kinds matching `query`, best first. An empty query lists every
+    /// kind in menu order; ties keep menu order too.
+    pub fn matches(query: &str) -> Vec<BlockKind> {
+        let mut scored: Vec<(i32, BlockKind)> = BlockKind::ALL
+            .iter()
+            .filter_map(|&kind| fuzzy_score(query, kind.label()).map(|score| (score, kind)))
+            .collect();
+        // `sort_by` is stable, so equal scores stay in menu order.
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, kind)| kind).collect()
+    }
+
+    /// Move the highlight by `delta`, clamped to the `count` visible entries.
+    pub fn move_selection(&mut self, delta: isize, count: usize) {
+        if count > 0 {
+            self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +241,78 @@ mod tests {
         let e = EditorState::new("a😀b"); // the emoji is 4 bytes, 2 UTF-16 units
         assert_eq!(e.offset_to_utf16(5), 3);
         assert_eq!(e.offset_from_utf16(3), 5);
+    }
+
+    fn type_slash(text: &str) -> Option<SlashMenu> {
+        let e = EditorState::new(text);
+        let end = e.text.len();
+        SlashMenu::open_for(&e, &(end..end), "/")
+    }
+
+    #[test]
+    fn slash_opens_only_in_an_empty_block() {
+        assert_eq!(
+            type_slash(""),
+            Some(SlashMenu {
+                slash: 0,
+                selected: 0
+            })
+        );
+        // An empty heading still counts as empty: the "/" goes after `# `.
+        assert_eq!(type_slash("# ").map(|m| m.slash), Some(2));
+        // Text in the block, or the cursor not at the end: a literal "/".
+        assert_eq!(type_slash("a"), None);
+        assert_eq!(type_slash("# a"), None);
+        let mut e = EditorState::new("# ");
+        e.cursor = 0;
+        assert_eq!(SlashMenu::open_for(&e, &(0..0), "/"), None);
+        // Other characters never open it.
+        let e = EditorState::new("");
+        assert_eq!(SlashMenu::open_for(&e, &(0..0), "x"), None);
+    }
+
+    #[test]
+    fn slash_query_follows_the_editor() {
+        let mut e = EditorState::new("");
+        let menu = SlashMenu::open_for(&e, &(0..0), "/").unwrap();
+        e.insert("/he");
+        assert_eq!(menu.query(&e), Some("he"));
+        e.backspace();
+        e.backspace();
+        assert_eq!(menu.query(&e), Some(""));
+        e.backspace();
+        assert_eq!(menu.query(&e), None, "the / itself was deleted");
+    }
+
+    #[test]
+    fn slash_filter_narrows_and_ranks() {
+        assert_eq!(SlashMenu::matches(""), BlockKind::ALL.to_vec());
+        assert_eq!(
+            SlashMenu::matches("head"),
+            vec![
+                BlockKind::Heading1,
+                BlockKind::Heading2,
+                BlockKind::Heading3
+            ]
+        );
+        assert_eq!(SlashMenu::matches("h2"), vec![BlockKind::Heading2]);
+        assert_eq!(SlashMenu::matches("QUO"), vec![BlockKind::Quote]);
+        assert!(SlashMenu::matches("zzz").is_empty());
+    }
+
+    #[test]
+    fn slash_selection_clamps() {
+        let mut m = SlashMenu {
+            slash: 0,
+            selected: 0,
+        };
+        m.move_selection(-1, 5);
+        assert_eq!(m.selected, 0);
+        m.move_selection(3, 5);
+        m.move_selection(3, 5);
+        assert_eq!(m.selected, 4);
+        m.move_selection(1, 0);
+        assert_eq!(m.selected, 4, "no entries: unchanged");
     }
 
     #[test]

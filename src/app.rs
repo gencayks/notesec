@@ -6,17 +6,18 @@
 //! the block and the page is saved to disk.
 
 use crate::config::Config;
-use crate::editor::EditorState;
+use crate::editor::{EditorState, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
-use crate::model::{backlinks, parse_references, tag_counts, Page};
+use crate::model::{backlinks, parse_references, tag_counts, BlockKind, Page};
 use crate::search::{search, Command, Hit, Target};
 use crate::storage::{today_title, Storage};
 use crate::ui::{block_row, Theme};
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds, ClickEvent,
-    Context, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
-    GlobalElementId, HighlightStyle, Hsla, KeyBinding, LayoutId, PaintQuad, Pixels, ShapedLine,
-    SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
+    actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
+    Bounds, ClickEvent, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, GlobalElementId, HighlightStyle, Hsla, KeyBinding, LayoutId, PaintQuad, Pixels,
+    ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
+    UnderlineStyle, Window,
 };
 use std::ops::Range;
 
@@ -112,6 +113,14 @@ struct SearchState {
 
 const MAX_HISTORY: usize = 100;
 
+/// The "/" block-type menu while it is open (see `editor::SlashMenu`).
+struct SlashState {
+    menu: SlashMenu,
+    /// Undo snapshot from just before the "/" was typed. Esc restores its
+    /// editor exactly; choosing a type records it as the one undo step.
+    before: HistoryState,
+}
+
 #[derive(Clone)]
 struct HistoryState {
     pages: Vec<Page>,
@@ -143,6 +152,8 @@ pub struct NoteSec {
     editor: EditorState,
     /// `Some` while the Ctrl-K search overlay is open.
     search: Option<SearchState>,
+    /// `Some` while the "/" block-type menu is open on the edited block.
+    slash: Option<SlashState>,
     undo_stack: Vec<HistoryState>,
     redo_stack: Vec<HistoryState>,
     text_history_active: bool,
@@ -230,6 +241,7 @@ impl NoteSec {
             editing: None,
             editor: EditorState::default(),
             search: None,
+            slash: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             text_history_active: false,
@@ -379,6 +391,7 @@ impl NoteSec {
             self.selected < self.pages.len() && ix < self.pages[self.selected].blocks.len()
         });
         self.editor = state.editor;
+        self.slash = None;
         self.text_history_active = false;
         if let Some(ix) = self.editing {
             self.editor.cursor = self.editor.cursor.min(self.editor.text.len());
@@ -394,6 +407,7 @@ impl NoteSec {
         if self.search.is_some() {
             return;
         }
+        self.close_slash_keep_text();
         if let Some(state) = self.undo_stack.pop() {
             self.redo_stack.push(self.history_state());
             self.restore_history(state, window, cx);
@@ -404,6 +418,7 @@ impl NoteSec {
         if self.search.is_some() {
             return;
         }
+        self.close_slash_keep_text();
         if let Some(state) = self.redo_stack.pop() {
             self.undo_stack.push(self.history_state());
             self.restore_history(state, window, cx);
@@ -431,6 +446,14 @@ impl NoteSec {
         self.selected = self.find_page(&title).unwrap_or(0);
         self.mode = Mode::Notes;
         self.start_edit(0, window, cx);
+    }
+
+    fn move_slash_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.slash_matches().len();
+        if let Some(state) = &mut self.slash {
+            state.menu.move_selection(delta, count);
+        }
+        cx.notify();
     }
 
     fn move_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -498,6 +521,72 @@ impl NoteSec {
 
     fn on_reset_font(&mut self, _: &ResetFont, _: &mut Window, cx: &mut Context<Self>) {
         self.reset_font_size(cx);
+    }
+
+    // --- "/" block-type menu --------------------------------------------------
+
+    /// Kinds the open menu currently lists (empty when it is closed).
+    fn slash_matches(&self) -> Vec<BlockKind> {
+        self.slash
+            .as_ref()
+            .and_then(|s| s.menu.query(&self.editor))
+            .map(SlashMenu::matches)
+            .unwrap_or_default()
+    }
+
+    /// After the editor changed while the menu is open: close it if the "/"
+    /// is gone or nothing matches any more (what was typed stays as text),
+    /// otherwise go back to the top entry.
+    fn refresh_slash(&mut self) {
+        if self.slash.is_none() {
+            return;
+        }
+        if self.slash_matches().is_empty() {
+            self.close_slash_keep_text();
+        } else if let Some(state) = &mut self.slash {
+            state.menu.selected = 0;
+        }
+    }
+
+    /// Close the menu leaving the "/..." text in the block as ordinary text.
+    /// Typing while the menu was open recorded no history, so record it now
+    /// as one undo step (and let further typing join that step).
+    fn close_slash_keep_text(&mut self) {
+        let Some(state) = self.slash.take() else {
+            return;
+        };
+        if self.editor.text != state.before.editor.text {
+            self.record_state(state.before);
+            self.text_history_active = true;
+        }
+    }
+
+    /// Esc: close the menu and put the block back exactly as it was before
+    /// the "/" was typed.
+    fn dismiss_slash(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.slash.take() {
+            self.editor = state.before.editor;
+        }
+        cx.notify();
+    }
+
+    /// Turn the edited block into `kind`, keeping its text and dropping the
+    /// "/query". One undo step back to before the "/"; saved right away like
+    /// other structural changes.
+    fn apply_slash(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
+        let Some(state) = self.slash.take() else {
+            return;
+        };
+        let text = kind.apply(&state.before.editor.text);
+        self.text_history_active = false;
+        if text != state.before.editor.text {
+            self.record_state(state.before);
+        }
+        self.editor = EditorState::new(&text);
+        if self.sync_content() {
+            self.save_page();
+        }
+        cx.notify();
     }
 
     // --- persistence helpers -------------------------------------------------
@@ -636,6 +725,7 @@ impl NoteSec {
 
     /// Write the editor text back to its block and save if anything changed.
     fn commit(&mut self) {
+        self.close_slash_keep_text();
         if self.sync_content() {
             self.save_page();
         }
@@ -649,6 +739,7 @@ impl NoteSec {
     fn load_editor(&mut self, ix: usize, cursor_at_start: bool) {
         let content = self.pages[self.selected].blocks[ix].content.clone();
         self.editor = EditorState::new(&content);
+        self.slash = None;
         if cursor_at_start {
             self.editor.cursor = 0;
         }
@@ -689,6 +780,12 @@ impl NoteSec {
             self.confirm_search(window, cx);
             return;
         }
+        if let Some(state) = &self.slash {
+            if let Some(&kind) = self.slash_matches().get(state.menu.selected) {
+                self.apply_slash(kind, cx);
+            }
+            return;
+        }
         let Some(ix) = self.editing else { return };
         self.text_history_active = false;
         self.record_edit();
@@ -712,6 +809,7 @@ impl NoteSec {
     /// save. The block keeps its index (document order never changes).
     fn restructure(&mut self, cx: &mut Context<Self>, op: impl FnOnce(&mut Page, usize) -> bool) {
         let Some(ix) = self.editing else { return };
+        self.close_slash_keep_text();
         self.text_history_active = false;
         let before = self.history_state();
         self.sync_content();
@@ -730,6 +828,13 @@ impl NoteSec {
             return;
         }
         let Some(ix) = self.editing else { return };
+        if self.slash.is_some() {
+            // Edits the filter; deleting the "/" itself closes the menu.
+            self.editor.backspace();
+            self.refresh_slash();
+            cx.notify();
+            return;
+        }
         if !self.editor.text.is_empty() {
             self.text_history_active = false;
             let before = self.history_state();
@@ -754,6 +859,12 @@ impl NoteSec {
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.slash.is_some() {
+            self.editor.delete();
+            self.refresh_slash();
+            cx.notify();
+            return;
+        }
         if self.editing.is_some() || self.search.is_some() {
             self.text_history_active = false;
             let before = self.history_state();
@@ -766,21 +877,25 @@ impl NoteSec {
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_slash_keep_text();
         self.active_editor_mut().move_left();
         cx.notify();
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_slash_keep_text();
         self.active_editor_mut().move_right();
         cx.notify();
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_slash_keep_text();
         self.active_editor_mut().move_home();
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_slash_keep_text();
         self.active_editor_mut().move_end();
         cx.notify();
     }
@@ -788,6 +903,10 @@ impl NoteSec {
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
         if self.search.is_some() {
             self.move_search_selection(-1, cx);
+            return;
+        }
+        if self.slash.is_some() {
+            self.move_slash_selection(-1, cx);
             return;
         }
         if let Some(ix) = self.editing.filter(|&ix| ix > 0) {
@@ -800,6 +919,10 @@ impl NoteSec {
             self.move_search_selection(1, cx);
             return;
         }
+        if self.slash.is_some() {
+            self.move_slash_selection(1, cx);
+            return;
+        }
         if let Some(ix) = self.editing {
             if ix + 1 < self.pages[self.selected].blocks.len() {
                 self.move_edit(ix + 1, cx);
@@ -810,6 +933,8 @@ impl NoteSec {
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
         if self.search.is_some() {
             self.close_search(cx);
+        } else if self.slash.is_some() {
+            self.dismiss_slash(cx);
         } else {
             self.stop_edit(cx);
         }
@@ -817,6 +942,7 @@ impl NoteSec {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.close_slash_keep_text();
             if self.search.is_none() && self.editing.is_some() {
                 self.record_edit();
             }
@@ -900,7 +1026,25 @@ impl EntityInputHandler for NoteSec {
             .map(|r| self.active_editor().range_from_utf16(r))
             .or(self.active_editor().marked.clone())
             .unwrap_or(self.active_editor().cursor..self.active_editor().cursor);
-        let before = if self.search.is_none() && self.editing.is_some() {
+        let in_block = self.search.is_none() && self.editing.is_some();
+        // "/" typed into an empty block opens the block-type menu. Its typing
+        // records no history: the menu settles that when it closes.
+        if in_block && self.slash.is_none() {
+            if let Some(menu) = SlashMenu::open_for(&self.editor, &range, new_text) {
+                let before = self.history_state();
+                self.editor.replace_range(range, new_text);
+                self.slash = Some(SlashState { menu, before });
+                cx.notify();
+                return;
+            }
+        }
+        if in_block && self.slash.is_some() {
+            self.editor.replace_range(range, new_text);
+            self.refresh_slash();
+            cx.notify();
+            return;
+        }
+        let before = if in_block {
             if self.text_history_active {
                 None
             } else {
@@ -931,7 +1075,8 @@ impl EntityInputHandler for NoteSec {
             .map(|r| self.active_editor().range_from_utf16(r))
             .or(self.active_editor().marked.clone())
             .unwrap_or(self.active_editor().cursor..self.active_editor().cursor);
-        let before = if self.search.is_none() && self.editing.is_some() {
+        let in_menu = self.slash.is_some();
+        let before = if self.search.is_none() && self.editing.is_some() && !in_menu {
             if self.text_history_active {
                 None
             } else {
@@ -952,6 +1097,9 @@ impl EntityInputHandler for NoteSec {
         }
         if let Some(before) = before {
             self.record_state(before);
+        }
+        if in_menu {
+            self.refresh_slash();
         }
         self.text_changed();
         cx.notify();
@@ -1157,11 +1305,10 @@ impl Element for BlockText {
 // Rendering
 // ---------------------------------------------------------------------------
 impl Render for NoteSec {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let font_size = self.config.font_size;
         // Style for `[[wikilinks]]` in display mode: accent colour + underline.
-        let text_style = window.text_style();
         let link_style = HighlightStyle {
             color: Some(theme.accent.into()),
             underline: Some(UnderlineStyle {
@@ -1304,6 +1451,58 @@ impl Render for NoteSec {
                 .children(tag_rows)
             });
 
+        // --- "/" block-type menu (shown under the edited block) -------------
+        let mut slash_menu = self.slash.as_ref().map(|state| {
+            let selected = state.menu.selected;
+            let items: Vec<AnyElement> = self
+                .slash_matches()
+                .into_iter()
+                .enumerate()
+                .map(|(i, kind)| {
+                    div()
+                        .id(("slash-item", i))
+                        .debug_selector(|| format!("slash-item-{i}"))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .gap_4()
+                        .cursor_pointer()
+                        .text_color(theme.text)
+                        .when(i == selected, |d| d.bg(theme.selected_bg))
+                        .hover(|d| d.bg(theme.selected_bg))
+                        .on_click(cx.listener(move |this, _e, _window, cx| {
+                            this.apply_slash(kind, cx);
+                        }))
+                        .child(kind.label())
+                        .child(
+                            div()
+                                .text_color(theme.muted)
+                                .child(kind.prefix().trim_end().to_string()),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            div()
+                .id("slash-menu")
+                .debug_selector(|| "slash-menu".to_string())
+                // Clicks on the menu must not reach the blocks underneath.
+                .occlude()
+                .w(px(220.0))
+                .flex()
+                .flex_col()
+                .p_1()
+                .rounded_lg()
+                .bg(theme.sidebar_bg)
+                .border_1()
+                .border_color(theme.border)
+                .shadow_lg()
+                .text_size(px(font_size))
+                .children(items)
+        });
+
         // --- Main pane: title + blocks --------------------------------------
         let page = &self.pages[self.selected];
         let rows: Vec<AnyElement> = page
@@ -1313,21 +1512,33 @@ impl Render for NoteSec {
             .map(|(ix, block)| {
                 let is_editing = self.editing == Some(ix);
                 let depth = page.depth_of(ix);
-                let links = parse_references(&block.content);
+                // Display mode hides the type prefix (`# `, `> `) and styles
+                // the row instead; the editor shows the raw markdown.
+                let (kind, body) = if is_editing {
+                    (
+                        BlockKind::parse(&self.editor.text).0,
+                        block.content.as_str(),
+                    )
+                } else {
+                    BlockKind::parse(&block.content)
+                };
+                let links = parse_references(body);
                 // Layout of this row's text, kept so a click can be mapped to
                 // the character (and so the link) under the mouse.
                 let mut text_layout = None;
                 let content: AnyElement = if is_editing {
                     BlockText { app: cx.entity() }.into_any_element()
                 } else if links.is_empty() {
-                    div().child(block.content.clone()).into_any_element()
+                    div().child(body.to_string()).into_any_element()
                 } else {
                     let highlights = links.iter().map(|l| {
                         let style = if l.is_tag { tag_style } else { link_style };
                         (l.range.clone(), style)
                     });
-                    let text = StyledText::new(block.content.clone())
-                        .with_default_highlights(&text_style, highlights);
+                    // `with_highlights` resolves against the inherited text
+                    // style, so heading size/weight and quote styling (and the
+                    // theme's text colour) apply to the unhighlighted parts.
+                    let text = StyledText::new(body.to_string()).with_highlights(highlights);
                     text_layout = Some(text.layout().clone());
                     div().child(text).into_any_element()
                 };
@@ -1345,14 +1556,33 @@ impl Render for NoteSec {
                         None => this.start_edit(ix, window, cx),
                     }
                 });
-                block_row(&theme, depth, font_size, content)
+                let row = block_row(&theme, depth, font_size, kind, content)
                     .id(("block", ix))
                     // Lets tests find this row's on-screen bounds; a no-op in
                     // normal builds.
                     .debug_selector(|| format!("block-{ix}"))
                     .cursor_text()
-                    .when(!is_editing, |d| d.on_click(on_click))
-                    .into_any_element()
+                    .when(!is_editing, |d| d.on_click(on_click));
+                let menu = if is_editing { slash_menu.take() } else { None };
+                match menu {
+                    // The menu hangs off a zero-height strip right under the
+                    // edited row, lined up with its text; `deferred` paints it
+                    // above the rows below.
+                    Some(menu) => div()
+                        .flex()
+                        .flex_col()
+                        .child(row)
+                        .child(
+                            div().h(px(0.)).child(deferred(
+                                anchored()
+                                    .offset(point(px(24.0 * depth as f32 + 14.0), px(2.0)))
+                                    .snap_to_window_with_margin(px(8.))
+                                    .child(menu),
+                            )),
+                        )
+                        .into_any_element(),
+                    None => row.into_any_element(),
+                }
             })
             .collect();
 
@@ -2537,6 +2767,174 @@ mod tests {
         view.update(cx, |app, _| assert!(app.search.is_some()));
         cx.simulate_click(point(px(5.), px(5.)), Modifiers::none());
         view.update(cx, |app, _| assert!(app.search.is_none()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn slash_kinds(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<BlockKind> {
+        view.update(cx, |app, _| app.slash_matches())
+    }
+
+    #[gpui::test]
+    fn slash_menu_opens_on_slash_in_an_empty_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "slash-open", "- one\n- \n");
+
+        // "/" inside text is just a character.
+        click_block(cx, 0);
+        cx.simulate_input("/");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "one/");
+            assert!(app.slash.is_none());
+        });
+        assert!(cx.debug_bounds("slash-menu").is_none());
+
+        // "/" in the empty block opens the menu listing every block kind.
+        click_block(cx, 1);
+        cx.simulate_input("/");
+        view.update(cx, |app, _| {
+            assert!(app.slash.is_some());
+            assert_eq!(app.editor.text, "/");
+            assert_eq!(app.editing, Some(1));
+        });
+        assert_eq!(slash_kinds(&view, cx), BlockKind::ALL.to_vec());
+        assert!(cx.debug_bounds("slash-menu").is_some());
+        assert!(cx.debug_bounds("slash-item-4").is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn slash_filter_narrows_results(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "slash-filter", "- \n");
+        click_block(cx, 0);
+        cx.simulate_input("/hea");
+        assert_eq!(
+            slash_kinds(&view, cx),
+            vec![
+                BlockKind::Heading1,
+                BlockKind::Heading2,
+                BlockKind::Heading3
+            ]
+        );
+        assert!(cx.debug_bounds("slash-item-2").is_some());
+        assert!(cx.debug_bounds("slash-item-3").is_none());
+
+        cx.simulate_input("ding 3");
+        assert_eq!(slash_kinds(&view, cx), vec![BlockKind::Heading3]);
+
+        // Backspace widens the filter again...
+        cx.simulate_keystrokes("backspace backspace backspace backspace backspace backspace");
+        assert_eq!(slash_kinds(&view, cx).len(), 3);
+        // ...and a query nothing matches closes the menu, keeping the text.
+        cx.simulate_input("zz");
+        view.update(cx, |app, _| {
+            assert!(app.slash.is_none());
+            assert_eq!(app.editor.text, "/heazz");
+        });
+        assert!(cx.debug_bounds("slash-menu").is_none());
+        // That literal text is one undo step.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, ""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn slash_enter_converts_block_type(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "slash-enter", "- \n- after\n");
+        click_block(cx, 0);
+
+        // Down/Up move the highlight (clamped); Enter applies it.
+        cx.simulate_input("/head");
+        cx.simulate_keystrokes("up down down down down up enter");
+        view.update(cx, |app, _| {
+            assert!(app.slash.is_none());
+            assert_eq!(app.editing, Some(0), "still editing the same block");
+            assert_eq!(app.editor.text, "## ", "the /query is gone");
+            assert_eq!(
+                app.pages[app.selected].blocks.len(),
+                2,
+                "Enter did not split"
+            );
+        });
+        // A type change is saved straight away, as Logseq markdown.
+        assert_eq!(file(&dir), "- ## \n- after\n");
+
+        cx.simulate_input("Title");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(file(&dir), "- ## Title\n- after\n");
+
+        // An empty heading can be retyped; the new type replaces the prefix,
+        // here by clicking the menu entry.
+        click_block(cx, 1);
+        cx.simulate_keystrokes("backspace backspace backspace backspace backspace");
+        cx.simulate_input("# ");
+        cx.simulate_input("/quo");
+        let item = cx
+            .debug_bounds("slash-item-0")
+            .expect("menu entry rendered");
+        cx.simulate_click(item.center(), Modifiers::none());
+        view.update(cx, |app, _| {
+            assert!(app.slash.is_none());
+            assert_eq!(app.editor.text, "> ");
+        });
+        cx.simulate_input("quoted");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(file(&dir), "- ## Title\n- > quoted\n");
+
+        // Changing the type is one undo step back to before the "/".
+        click_block(cx, 1);
+        cx.simulate_keystrokes("end enter");
+        cx.simulate_input("/h1");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "# "));
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(2));
+            assert_eq!(app.editor.text, "");
+            assert!(app.slash.is_none());
+        });
+        cx.simulate_keystrokes("ctrl-y");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "# "));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn slash_escape_closes_without_changes(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "slash-esc", "- # \n");
+        click_block(cx, 0);
+        let undo_depth = view.update(cx, |app, _| app.undo_stack.len());
+
+        cx.simulate_input("/quo");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "# /quo"));
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| {
+            assert!(app.slash.is_none());
+            assert_eq!(app.editing, Some(0), "Esc only closes the menu");
+            assert_eq!(app.editor.text, "# ");
+            assert_eq!(app.editor.cursor, 2);
+            assert_eq!(app.pages[app.selected].blocks[0].content, "# ");
+            assert_eq!(app.undo_stack.len(), undo_depth, "nothing to undo");
+        });
+        assert!(cx.debug_bounds("slash-menu").is_none());
+
+        // A second Esc leaves editing as usual; the file never changed.
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), "- # \n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn headings_render_bigger_than_text(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(cx, "kinds", "- # Big\n- ### Small\n- plain\n- > quoted\n");
+        let height = |cx: &mut VisualTestContext, ix: usize| {
+            let selector: &'static str = Box::leak(format!("block-{ix}").into_boxed_str());
+            cx.debug_bounds(selector).unwrap().size.height
+        };
+        let (h1, h3, plain, quote) = (height(cx, 0), height(cx, 1), height(cx, 2), height(cx, 3));
+        assert!(h1 > h3, "{h1:?} > {h3:?}");
+        assert!(h3 > plain, "{h3:?} > {plain:?}");
+        assert_eq!(quote, plain);
+        // Rendering never rewrites the stored markdown.
+        assert_eq!(file(&dir), "- # Big\n- ### Small\n- plain\n- > quoted\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 

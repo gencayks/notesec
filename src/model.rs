@@ -214,6 +214,76 @@ pub fn backlinks(pages: &[Page], title: &str) -> Vec<BacklinkGroup> {
     groups
 }
 
+/// The type of a block, expressed the way Logseq stores it: as a markdown
+/// prefix at the start of the block's text (`# Title`, `> quote`). There is
+/// no separate field, so the disk format stays plain Logseq markdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    Text,
+    Heading1,
+    Heading2,
+    Heading3,
+    Quote,
+}
+
+impl BlockKind {
+    /// Every kind, in the order the "/" menu lists them.
+    pub const ALL: [BlockKind; 5] = [
+        BlockKind::Text,
+        BlockKind::Heading1,
+        BlockKind::Heading2,
+        BlockKind::Heading3,
+        BlockKind::Quote,
+    ];
+
+    /// Name shown in the "/" menu (and matched by its filter).
+    pub fn label(self) -> &'static str {
+        match self {
+            BlockKind::Text => "Text",
+            BlockKind::Heading1 => "Heading 1",
+            BlockKind::Heading2 => "Heading 2",
+            BlockKind::Heading3 => "Heading 3",
+            BlockKind::Quote => "Quote",
+        }
+    }
+
+    /// The markdown prefix that marks this kind (empty for plain text).
+    pub fn prefix(self) -> &'static str {
+        match self {
+            BlockKind::Text => "",
+            BlockKind::Heading1 => "# ",
+            BlockKind::Heading2 => "## ",
+            BlockKind::Heading3 => "### ",
+            BlockKind::Quote => "> ",
+        }
+    }
+
+    /// Split block `content` into its kind and the text after the prefix.
+    ///
+    /// Only an exact prefix counts: `#tag` and `####x` are plain text.
+    pub fn parse(content: &str) -> (BlockKind, &str) {
+        // Longest heading prefix first, so `## x` isn't read as `#` + `# x`.
+        for kind in [
+            BlockKind::Heading3,
+            BlockKind::Heading2,
+            BlockKind::Heading1,
+            BlockKind::Quote,
+        ] {
+            if let Some(body) = content.strip_prefix(kind.prefix()) {
+                return (kind, body);
+            }
+        }
+        (BlockKind::Text, content)
+    }
+
+    /// `content` converted to this kind: any existing prefix is replaced and
+    /// the text after it is kept.
+    pub fn apply(self, content: &str) -> String {
+        let (_, body) = BlockKind::parse(content);
+        format!("{}{}", self.prefix(), body)
+    }
+}
+
 /// True for titles shaped like `YYYY-MM-DD` (daily journal pages).
 pub fn is_journal_title(title: &str) -> bool {
     chrono::NaiveDate::parse_from_str(title, "%Y-%m-%d").is_ok()
@@ -712,6 +782,61 @@ mod tests {
         assert!(!page.delete_leaf(0));
         assert!(page.delete_leaf(1));
         assert_eq!(page.to_markdown(), "- a\n- c\n");
+    }
+
+    #[test]
+    fn block_kind_parses_exact_prefixes() {
+        assert_eq!(BlockKind::parse("plain"), (BlockKind::Text, "plain"));
+        assert_eq!(BlockKind::parse("# Title"), (BlockKind::Heading1, "Title"));
+        assert_eq!(BlockKind::parse("## Sub"), (BlockKind::Heading2, "Sub"));
+        assert_eq!(
+            BlockKind::parse("### Small"),
+            (BlockKind::Heading3, "Small")
+        );
+        assert_eq!(BlockKind::parse("> said"), (BlockKind::Quote, "said"));
+        assert_eq!(BlockKind::parse("# "), (BlockKind::Heading1, ""));
+        // Not prefixes: tags, too many hashes, no space, markers mid-text.
+        assert_eq!(BlockKind::parse("#tag x").0, BlockKind::Text);
+        assert_eq!(BlockKind::parse("#### deep").0, BlockKind::Text);
+        assert_eq!(BlockKind::parse(">no space").0, BlockKind::Text);
+        assert_eq!(BlockKind::parse("a # b").0, BlockKind::Text);
+        assert_eq!(BlockKind::parse("").0, BlockKind::Text);
+    }
+
+    #[test]
+    fn block_kind_apply_keeps_text() {
+        assert_eq!(BlockKind::Heading2.apply("hello"), "## hello");
+        assert_eq!(BlockKind::Quote.apply("# hello"), "> hello");
+        assert_eq!(BlockKind::Heading1.apply("### hello"), "# hello");
+        assert_eq!(BlockKind::Text.apply("> hello"), "hello");
+        assert_eq!(BlockKind::Text.apply("hello"), "hello");
+        assert_eq!(BlockKind::Heading3.apply(""), "### ");
+        // Every kind round-trips through parse.
+        for kind in BlockKind::ALL {
+            assert_eq!(BlockKind::parse(&kind.apply("x")), (kind, "x"));
+        }
+    }
+
+    #[test]
+    fn block_kinds_round_trip_as_logseq_markdown() {
+        let md = "- # Title\n  - ## Sub\n  - ### Small\n- > quoted\n- plain\n";
+        let page = Page::from_markdown("t", false, md);
+        let kinds: Vec<BlockKind> = page
+            .blocks
+            .iter()
+            .map(|b| BlockKind::parse(&b.content).0)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::Heading1,
+                BlockKind::Heading2,
+                BlockKind::Heading3,
+                BlockKind::Quote,
+                BlockKind::Text
+            ]
+        );
+        assert_eq!(page.to_markdown(), md);
     }
 
     #[test]
