@@ -1,10 +1,11 @@
 //! UI state that should survive a restart but is not a setting: favorite
-//! pages and recently opened pages, stored as `state.toml` in the graph
-//! folder.
+//! pages, recently opened pages and the sidebar's custom page order, stored
+//! as `state.toml` in the graph folder.
 //!
 //! ```toml
 //! favorites = ["Projects", "Reading list"]
 //! recent = ["2026-10-08", "Projects"]   # most recent first
+//! page_order = ["Projects", "Inbox"]    # absent: alphabetical
 //! ```
 //!
 //! This lives apart from `config.toml` on purpose: `recent` changes on every
@@ -30,6 +31,11 @@ pub struct UiState {
     pub favorites: Vec<String>,
     /// Recently opened page titles, most recent first, at most `MAX_RECENT`.
     pub recent: Vec<String>,
+    /// Custom order of the sidebar's regular (non-journal) pages, set by
+    /// dragging them. Empty means alphabetical. Pages not listed come after
+    /// the listed ones, alphabetically; entries without a page are ignored
+    /// (see `app::sort_pages`).
+    pub page_order: Vec<String>,
 }
 
 impl UiState {
@@ -65,6 +71,7 @@ impl UiState {
     fn sanitized(mut self) -> Self {
         dedupe(&mut self.favorites);
         dedupe(&mut self.recent);
+        dedupe(&mut self.page_order);
         self.recent.truncate(MAX_RECENT);
         self
     }
@@ -73,7 +80,7 @@ impl UiState {
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let body = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let text = format!("# notesec UI state (favorites, recent pages)\n{body}");
+        let text = format!("# notesec UI state (favorites, recent pages, page order)\n{body}");
         write_atomic(&Self::path(root), &text)
     }
 
@@ -94,6 +101,35 @@ impl UiState {
                 true
             }
         }
+    }
+
+    /// A page was renamed: entries for `old` (ignoring case) now say `new`,
+    /// in place (so a renamed page keeps its spot in `page_order`).
+    /// Returns whether anything changed.
+    pub fn rename(&mut self, old: &str, new: &str) -> bool {
+        let mut changed = false;
+        for list in [&mut self.favorites, &mut self.recent, &mut self.page_order] {
+            if let Some(i) = position(list, old) {
+                list[i] = new.to_string();
+                changed = true;
+            }
+            // A stale entry for a deleted page may already have the new name.
+            dedupe(list);
+        }
+        changed
+    }
+
+    /// A page was deleted: drop it from every list. Returns whether anything
+    /// changed.
+    pub fn forget(&mut self, title: &str) -> bool {
+        let mut changed = false;
+        for list in [&mut self.favorites, &mut self.recent, &mut self.page_order] {
+            if let Some(i) = position(list, title) {
+                list.remove(i);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Note that `title` was just opened: move it to the front of `recent`
@@ -152,6 +188,7 @@ mod tests {
         let state = UiState {
             favorites: titles(&["Projects", "Reading list"]),
             recent: titles(&["2026-10-08", "Projects"]),
+            page_order: titles(&["Reading list", "Projects"]),
         };
         state.save(&dir).unwrap();
         assert_eq!(UiState::load(&dir), state);
@@ -167,6 +204,7 @@ mod tests {
         let state = UiState::load(&dir);
         assert_eq!(state.favorites, titles(&["A"]));
         assert!(state.recent.is_empty());
+        assert!(state.page_order.is_empty(), "no page_order: alphabetical");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -187,7 +225,7 @@ mod tests {
         fs::write(
             UiState::path(&dir),
             format!(
-                "favorites = [\"A\", \"\", \"a\", \"  \", \"B\"]\nrecent = [{}]\n",
+                "favorites = [\"A\", \"\", \"a\", \"  \", \"B\"]\nrecent = [{}]\npage_order = [\"X\", \"x\", \"Y\"]\n",
                 recent.join(", ")
             ),
         )
@@ -196,6 +234,7 @@ mod tests {
         assert_eq!(state.favorites, titles(&["A", "B"]));
         assert_eq!(state.recent.len(), MAX_RECENT);
         assert_eq!(state.recent[0], "P0");
+        assert_eq!(state.page_order, titles(&["X", "Y"]));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -217,6 +256,27 @@ mod tests {
         assert_eq!(state.recent.len(), MAX_RECENT);
         assert_eq!(state.recent[0], "P19");
         assert_eq!(state.recent[MAX_RECENT - 1], "P10");
+    }
+
+    #[test]
+    fn rename_and_forget_follow_pages() {
+        let mut state = UiState {
+            favorites: titles(&["Old", "B"]),
+            recent: titles(&["B", "old", "New"]),
+            page_order: titles(&["C", "Old", "B"]),
+        };
+        assert!(state.rename("OLD", "New"));
+        assert_eq!(state.favorites, titles(&["New", "B"]));
+        // The stale "New" entry merges with the renamed one.
+        assert_eq!(state.recent, titles(&["B", "New"]));
+        // Renamed in place: the page keeps its position.
+        assert_eq!(state.page_order, titles(&["C", "New", "B"]));
+        assert!(!state.rename("Missing", "X"));
+        assert!(state.forget("new"));
+        assert_eq!(state.favorites, titles(&["B"]));
+        assert_eq!(state.recent, titles(&["B"]));
+        assert_eq!(state.page_order, titles(&["C", "B"]));
+        assert!(!state.forget("new"));
     }
 
     #[test]

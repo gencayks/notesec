@@ -12,6 +12,8 @@ pub enum TabTarget {
     Page(String),
     /// The page graph.
     Graph,
+    /// The agenda (open tasks by date).
+    Agenda,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -91,6 +93,15 @@ impl Tabs {
             } else {
                 (a + n - 1) % n
             });
+        }
+    }
+
+    /// A page was renamed: tabs showing `old` now show `new`.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        for tab in &mut self.tabs {
+            if matches!(tab, TabTarget::Page(t) if t == old) {
+                *tab = TabTarget::Page(new.to_string());
+            }
         }
     }
 
@@ -176,6 +187,17 @@ mod tests {
         assert_eq!(tabs.active, Some(0));
         tabs.cycle(false);
         assert_eq!(tabs.active, Some(2));
+    }
+
+    #[test]
+    fn rename_keeps_position_and_focus() {
+        let mut tabs = Tabs::new(page("A"));
+        tabs.open(page("B"));
+        tabs.open(TabTarget::Graph);
+        tabs.select(1);
+        tabs.rename("B", "C");
+        assert_eq!(tabs.tabs, [page("A"), page("C"), TabTarget::Graph]);
+        assert_eq!(tabs.active, Some(1));
     }
 
     #[test]

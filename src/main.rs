@@ -1,6 +1,8 @@
+mod agenda;
 mod app;
 mod assets;
 mod code;
+mod commands;
 mod config;
 mod display;
 mod editor;

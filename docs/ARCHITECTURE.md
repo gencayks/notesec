@@ -274,16 +274,17 @@ changes you call `cx.notify()` and GPUI re-renders. **GPUI owns the view**
 ```rust
 actions!(notesec, [Enter, Tab, ShiftTab, Backspace, ...]);
 
-cx.bind_keys([
-    KeyBinding::new("enter", Enter, Some("BlockEditor")),
-    ...
-]);
+// shortcuts(): one line per binding, with its cheatsheet group and text.
+s("enter", Enter, Some("BlockEditor"), Editing, "New block at the cursor"),
+...
+cx.bind_keys(shortcuts().into_iter().map(|s| s.binding));
 ```
 
 Keyboard input goes: **key press -> action -> handler**. The `"BlockEditor"`
 context scopes bindings so Enter only splits blocks *while editing* — the same
 key can mean different things in different contexts. Cleaner than one giant
-`match` on key codes.
+`match` on key codes. The Ctrl-K palette's commands dispatch the same actions
+(decision 33), and the Ctrl+/ dialog lists the same table.
 
 ### Events, not callbacks
 
@@ -329,8 +330,8 @@ too, and "nothing is focused" is a real bug class.
   Missing keys fall back to defaults, so old config files never break.
 
 - **`state.rs` — UI state, not settings.** Favorite and recent page titles
-  in `state.toml`, with the same load/save rules as `config.rs` (see
-  decision 21).
+  and the sidebar's custom page order in `state.toml`, with the same
+  load/save rules as `config.rs` (see decisions 21 and 30).
 
 - **`main.rs` — boring on purpose.** Declare modules, open storage, load config,
   open an 1100x700 window, hand control to GPUI's event loop. If `main` is long,
@@ -717,6 +718,188 @@ that mutate, and data races are essentially impossible.
     `on_drag_move::<ExternalPaths>` remembers the files and whether they're
     over the page, and a window-level mouse-up listener (painted by a
     zero-size `canvas`) takes the drag on release.
+29. **Page context menu: rename, delete, copy title** (23-28 are the blocks
+    track's): right-clicking a page row in PAGES, FAVORITES or RECENT
+    (`on_mouse_down(MouseButton::Right)`) opens a small menu at the click
+    position, placed with `anchored()` like Zed's right-click menus, over a
+    transparent full-window backdrop that closes it on any click (left or
+    right) outside; the menu panel `occlude`s so its own clicks don't reach
+    the backdrop. Esc closes it via a `PageMenu` key context. Opening it
+    saves the block being edited. The page is held by title, never index.
+    *Rename* turns the menu into a text field in place, reusing the
+    palette's `EditorState` + `BlockText` input (`active_editor` returns
+    it), with the old name selected. Enter renames, Esc cancels; a refused
+    name keeps the field open with the reason under it: empty, another
+    page's name (ignoring case, as links do; a case-only rename is fine), a
+    literal `___` (it reads back as `/`), control characters, or a file
+    name over 255 bytes counting `write_atomic`'s `.<name>.md.tmp`
+    (`storage::validate_title`). The file moves with one `fs::rename`
+    (`Storage::rename`, which uses the same title-to-file mapping as saving
+    and refuses to overwrite another file). The title, page id and blocks'
+    `page_id` change (`Page::rename`), pages re-sort, and selection, tabs
+    (`Tabs::rename`) and favorites/recent (`UiState::rename`) follow.
+    `[[links]]` to the old name are not rewritten (v1). Journals can't be
+    renamed: their name is their date and their file
+    `journals/YYYY_MM_DD.md`. *Delete* asks first in a modal (danger-styled
+    Delete, Cancel; Esc or a backdrop click cancels, Enter does nothing),
+    then removes the file (no trash, v1), the page, its tabs (with the same
+    neighbour rule as closing a tab) and its favorites/recent entries.
+    Journals can be deleted (today's comes back on Ctrl-J or at startup),
+    but the last remaining page can't: the app always has a page to show.
+    *Undo:* neither can be undone, and both clear the undo/redo history,
+    because a snapshot holds whole pages under their titles and restoring
+    one saves them all, so it would write the old file back. *Copy page
+    title* writes the title with `cx.write_to_clipboard`.
+30. **Drag to reorder pages; the order lives in `state.toml`.** Only
+    regular pages can be dragged: journals stay above them, newest first,
+    since a date order is the useful one for a diary and mixing the two
+    would make "where is today" depend on dragging. A row is a GPUI drag
+    source (`on_drag` with a `DraggedPage { title }` value and a small
+    preview view that follows the pointer); every page row and a short
+    end-of-list zone (`page-drop-end`) listen with
+    `on_drag_move::<DraggedPage>`. The upper half of a row means "before
+    this page", the lower half "before the next one" (after the last row,
+    or in the end zone: at the very end); each zone also covers half the
+    gap next to it. GPUI calls every zone's drag-move handler on every
+    move, so a zone only clears the drop position it set itself (Zed's
+    project panel does the same). The position shows as an accent line in
+    the gap above the target (`page-drop-indicator`); none is shown where
+    dropping would change nothing. The drop itself is one `on_drop` on the
+    whole sidebar list, which moves the page to the position shown; a drag
+    released anywhere else just ends (GPUI drops it on mouse-up), and
+    `render` forgets a stale position once no drag is active. Clicking
+    still opens a page: GPUI only starts a drag past a 2px move, and a
+    drag never becomes a click. The order is `page_order` (titles) in
+    `state.toml`, as UI state like favorites, not a setting: a drop saves
+    the whole order of regular pages. Absent or empty means alphabetical,
+    so nothing changes until you drag. `sort_pages(pages, order)` is the
+    one place that orders pages (listed pages by position, matched ignoring
+    case, then unlisted ones alphabetically; stale entries are ignored),
+    and `NoteSec::sort_pages` applies it keeping `selected` on the same
+    page. Startup, adding a page, rename, a drop, "Sort pages A-Z" and
+    undo/redo (a snapshot may hold the old order) all go through it; tabs,
+    favorites and recent hold titles, so indices moving doesn't touch them.
+    *New pages* (Ctrl-N, a followed `[[link]]`, the Today journal aside)
+    are appended to `page_order` while a custom order exists, so they show
+    up at the end of the list where you just made them, rather than at an
+    alphabetical spot inside an order you chose by hand. Pages that appear
+    otherwise (a file added outside the app) also come after the listed
+    ones, alphabetically among themselves. Rename keeps the page's place
+    (`UiState::rename` edits the entry in place); delete drops it
+    (`UiState::forget`). *Sort pages A-Z* (a palette command and an item
+    in the page menu, disabled while already alphabetical) clears
+    `page_order`. Reordering isn't an undo step (like favorites).
+31. **Local graph: a filtered `Graph`, same physics and drawing.** The
+    graph view's toolbar has a `Global | Local` switch
+    (`graph-mode-global` / `graph-mode-local`). Local shows the current page
+    and every page one link away, in either direction: pages it links to,
+    pages linking to it, and its tags. A "2 hops" chip (local only,
+    `graph-local-depth`) reaches one ring further, which is the same
+    breadth-first search one step longer, so it costs nothing. Tags became
+    graph edges for this, in both modes: `Graph` now reads references with
+    `parse_references` (`[[links]]` and `#tags`, a tag pointing at the page
+    named like it, which the app creates anyway) instead of wikilinks only,
+    so local and global agree on what a neighbour is. The filtering is pure
+    and in `graph.rs`: `Graph::local_subgraph(center, hops)` keeps the
+    nodes within `hops` edges and only the edges between kept nodes, with
+    positions, pins and backlink counts unchanged (node size still means
+    "linked from many pages" in the whole graph); `Graph::build_local`
+    builds the graph with the journal filter (a journal centre is kept even
+    with journals hidden, but no other journal, so none bridges two hops)
+    and cuts it down. The result is an ordinary `Graph`, so `GraphView`
+    runs the same simulation, camera and painting on it; `rebuild` picks
+    global or local and `Graph::preserve_layout` (split out of the old
+    `build_preserving`) keeps the positions of nodes that stay, so
+    switching doesn't scramble the layout. The *current page* is the one
+    the graph already highlights: the page last shown in a page tab
+    (`selected`), passed in by `refresh` whenever the graph tab is focused.
+    After clicking a node (which opens the page in a page tab, the graph
+    tab stays, decision 20), coming back to the graph shows the local graph
+    of that page. Switching scope or depth, and a new centre in local mode,
+    refit the camera. The mode lives in the `GraphView`, which the app
+    keeps for the session, so it survives leaving and reopening the graph
+    but not a restart (not saved; it is a way of looking, not a setting).
+    The palette's "Toggle local graph" shows the graph and flips the mode.
+32. **Agenda: open tasks by date, as a tab.** `SCHEDULED:` /
+    `DEADLINE:` markers are Logseq's: a line of the block (a continuation
+    line under the task) that starts with either keyword and a date in
+    angle brackets (`SCHEDULED: <2026-10-09 Fri>`, weekday and time
+    optional, Logseq repeaters ignored). Both markers may share a line;
+    the first valid one of each kind wins. The format is documented in
+    `agenda.rs`. Open tasks are `TODO`/`DOING`/`LATER`/`NOW` (`DONE` is
+    finished). A task's date is the earlier of its scheduled and deadline
+    dates; a task on a journal page gets no date from the journal (only a
+    marker counts, as in Logseq). Grouping relative to today is pure
+    (`Agenda::build` in `agenda.rs`): Overdue, Today, Upcoming (one day
+    header each, soonest first) and Unscheduled (open tasks with no
+    marker, last). Within a group (or day), started tasks come first, then
+    by page title. The agenda is a tab (`TabTarget::Agenda`, mode
+    `Mode::Agenda`), like the graph: the sidebar's "Agenda" entry
+    (`sidebar-agenda`) and the palette's "Open agenda" open or focus it;
+    no keyboard shortcut (Ctrl keys are already taken). Built from the
+    pages on every render, so finishing or dating a task shows up when
+    you come back (or when you focus the tab again). Clicking an item
+    opens its page in a new (or existing) page tab — the agenda tab
+    stays, like the graph's — and unfolds the task's block; it is not
+    put in edit mode, because the date lives on a second line and the
+    editor is still single-line on this branch. Reading view leaves the
+    marker lines as plain text for now: stripping them in `DisplayBlock`
+    and drawing a chip would be nicer, but it is not free and the agenda
+    itself already shows the date.
+33. **The palette runs every command; one key table feeds hints and the
+    cheatsheet.** *Commands*: `commands.rs` declares `Command` with one
+    `commands!` row each: `Name => "Label", [keywords], Needs;`. `Name`
+    is both the variant and the GPUI action in `app.rs` it dispatches
+    (`window.dispatch_action`, deferred until the palette has closed),
+    so a command and its key always do the same thing, through the same
+    handler. Adding one is that row plus the action and its handler
+    (needed for a key anyway). *Keys*: `app.rs`'s `shortcuts()` is the
+    whole keymap, one line per binding with its group (Navigation,
+    Editing, View, Tabs, App) and a description; `bind_keys` registers
+    exactly it. *Hints*: a command's hint is read back from GPUI's keymap
+    (`App::key_bindings` -> `Keymap::bindings_for_action`): the first
+    binding without a key context, else the first binding (an editor
+    command's "BlockEditor" key), written as `Ctrl+Shift+T`
+    (`format_keystrokes`). So hints can't drift; the sidebar's Today and
+    Settings hints and the empty state use the same lookup. *Cheatsheet*:
+    "Keyboard shortcuts" or Ctrl+/ (free; Zed's comment key, which we
+    don't need) opens a modal like Settings (dimmed backdrop, `occlude`,
+    own key context "Shortcuts", Esc / backdrop / Ctrl+/ close it) listing
+    `cheatsheet(&shortcuts())`: per group, one row per description with
+    all its keys ("Ctrl+= / Ctrl++"). *Palette*: an empty query lists the
+    pages (as before, up to 12) and then every offered command under a
+    "Commands" header; a query keeps the best 12 hits by the same fuzzy
+    score as before (label, or keyword at a penalty) and shows them as two
+    groups, pages and blocks / commands, the group with the best hit
+    first so Enter still runs the top match. A "Pages" header appears
+    when both groups do. Each command row shows its hint right-aligned
+    and muted; the list scrolls and arrows keep the highlighted row in
+    view (`ScrollHandle::scroll_to_item`). Enter or a click runs the
+    command and closes the palette; Insert template keeps it open as the
+    template picker, and Rename / Delete / Keyboard shortcuts open their
+    own dialog. *Availability*: commands that make no sense are *hidden*,
+    not greyed out (Enter always runs something real): `Needs::Page`
+    commands (Rename, Delete, Copy title, Toggle favorite, Insert
+    template, Collapse all, Expand all) need a page tab on screen (not the
+    graph, the agenda or no tab), Rename also a non-journal and Delete
+    more than one page, as in the page menu; `Needs::Editing` commands
+    (Cycle task, and Coder 1's Move block / image paste at merge) need
+    the palette to have been opened while editing a block — running one
+    resumes that block with its cursor and selection, then dispatches.
+    *New commands*: Collapse all / Expand all fold or unfold every block
+    with children on the current page through the same `collapsed` set
+    as the arrows, so like them they are not undo steps; Fit graph and
+    Toggle journals in graph open the graph tab first, then press its
+    Fit / Journals chips; Rename and Delete open the page menu's rename
+    field (over the page title) or confirm dialog for the current page.
+    *At merge* (both tracks): Move block up / down (Alt+Up / Alt+Down) and
+    Insert image from clipboard (Ctrl+V) joined the `shortcuts()` table
+    and the palette as `Needs::Editing` commands. The rename field shares
+    the `BlockEditor` key context, so the block editor's multi-line keys
+    are guarded by `text_input_open()` (palette or rename field open):
+    Shift+Enter adds no line break, Up / Down don't move between lines,
+    and Ctrl+V pastes text only and never saves an image. The sidebar's
+    reorder line is `page_drop_line`, so it doesn't shadow `ui::drop_line`.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

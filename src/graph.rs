@@ -3,15 +3,19 @@
 //! This module is pure maths: no GPUI types, no I/O. That keeps the physics
 //! easy to unit-test and tune. `graph_view.rs` draws and drives it.
 //!
-//! * **Nodes** are pages. **Edges** are `[[wikilinks]]` between pages (a link in
-//!   either direction gives one undirected edge).
+//! * **Nodes** are pages. **Edges** are `[[wikilinks]]` and `#tags` between
+//!   pages (a tag points at the page named like it; a reference in either
+//!   direction gives one undirected edge).
+//! * A **local graph** (`Graph::build_local`) keeps only one page and the
+//!   pages within a few edges of it; it is an ordinary `Graph`, so the same
+//!   physics and drawing apply.
 //! * **Layout** is a classic force simulation: every pair of nodes repels, every
 //!   edge pulls its ends together like a spring, and a weak pull toward the
 //!   origin keeps disconnected pieces from drifting away. A "temperature"
 //!   (`alpha`) cools each tick so the layout settles, and a hard tick cap
 //!   guarantees it can never run forever.
 
-use crate::model::{parse_wikilinks, Page};
+use crate::model::{parse_references, Page};
 use std::collections::{HashMap, HashSet};
 
 // --- tunable physics constants ------------------------------------------------
@@ -84,10 +88,87 @@ impl Graph {
     /// Links to pages that don't exist and links from a page to itself are
     /// ignored. Link targets match page titles case-insensitively, as elsewhere.
     pub fn build(pages: &[Page], include_journals: bool) -> Graph {
-        let kept: Vec<&Page> = pages
+        Graph::build_from(pages.iter().filter(|p| include_journals || !p.is_journal))
+    }
+
+    /// The local graph around the page called `center` (ignoring case): that
+    /// page plus every page within `hops` edges of it, links and tags in
+    /// either direction, and the edges among them. With journals hidden,
+    /// `center` is kept even if it is a journal, but no other journal is
+    /// (so none bridges to a 2-hop neighbour either). Empty if there is no
+    /// such page.
+    pub fn build_local(pages: &[Page], include_journals: bool, center: &str, hops: usize) -> Graph {
+        let is_center = |p: &Page| p.title.eq_ignore_ascii_case(center);
+        let graph = Graph::build_from(
+            pages
+                .iter()
+                .filter(|p| include_journals || !p.is_journal || is_center(p)),
+        );
+        match graph
+            .nodes
             .iter()
-            .filter(|p| include_journals || !p.is_journal)
+            .position(|n| n.title.eq_ignore_ascii_case(center))
+        {
+            Some(center) => graph.local_subgraph(center, hops),
+            None => Graph::build_from(std::iter::empty()),
+        }
+    }
+
+    /// Node `center` and every node within `hops` edges of it (edges are
+    /// undirected, so incoming and outgoing links both count), keeping
+    /// their positions, pins and backlink counts, with only the edges whose
+    /// ends are both kept. Nodes stay in their original order.
+    pub fn local_subgraph(&self, center: usize, hops: usize) -> Graph {
+        // Breadth-first search, one ring of neighbours per hop.
+        let mut keep = vec![false; self.nodes.len()];
+        keep[center] = true;
+        let mut ring = vec![center];
+        for _ in 0..hops {
+            let mut next = Vec::new();
+            for &i in &ring {
+                for &j in &self.adj[i] {
+                    if !keep[j] {
+                        keep[j] = true;
+                        next.push(j);
+                    }
+                }
+            }
+            ring = next;
+        }
+
+        // Old index -> new index for the kept nodes.
+        let mut new_index = vec![usize::MAX; self.nodes.len()];
+        let mut nodes = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if keep[i] {
+                new_index[i] = nodes.len();
+                nodes.push(node.clone());
+            }
+        }
+        // Old edges are sorted with a < b, and renumbering keeps the order.
+        let edges: Vec<(usize, usize)> = self
+            .edges
+            .iter()
+            .filter(|&&(a, b)| keep[a] && keep[b])
+            .map(|&(a, b)| (new_index[a], new_index[b]))
             .collect();
+        let mut adj = vec![Vec::new(); nodes.len()];
+        for &(a, b) in &edges {
+            adj[a].push(b);
+            adj[b].push(a);
+        }
+        Graph {
+            nodes,
+            edges,
+            adj,
+            alpha: self.alpha,
+            ticks: 0,
+        }
+    }
+
+    /// Build the graph from exactly these pages.
+    fn build_from<'a>(pages: impl Iterator<Item = &'a Page>) -> Graph {
+        let kept: Vec<&Page> = pages.collect();
         let index: HashMap<String, usize> = kept
             .iter()
             .enumerate()
@@ -100,7 +181,8 @@ impl Graph {
         let mut directed: HashSet<(usize, usize)> = HashSet::new();
         for (src, page) in kept.iter().enumerate() {
             for block in &page.blocks {
-                for link in parse_wikilinks(&block.content) {
+                // `[[links]]` and `#tags` alike.
+                for link in parse_references(&block.content) {
                     let Some(&dst) = index.get(&link.target.to_lowercase()) else {
                         continue;
                     };
@@ -154,15 +236,15 @@ impl Graph {
         }
     }
 
-    /// Like `build`, but nodes whose page also existed in `old` keep their
-    /// position and pin state. Used when the graph is rebuilt (journal toggle,
-    /// edits) so it doesn't jump around.
-    pub fn build_preserving(pages: &[Page], include_journals: bool, old: &Graph) -> Graph {
-        let mut graph = Graph::build(pages, include_journals);
+    /// Give nodes that also exist in `old` their old position and pin
+    /// state, and set the temperature for re-settling (gentle if anything
+    /// was kept). Used when the graph is rebuilt (journal toggle, edits,
+    /// global/local switch) so it doesn't jump around.
+    pub fn preserve_layout(&mut self, old: &Graph) {
         let previous: HashMap<&str, &Node> =
             old.nodes.iter().map(|n| (n.title.as_str(), n)).collect();
         let mut kept_any = false;
-        for node in &mut graph.nodes {
+        for node in &mut self.nodes {
             if let Some(old_node) = previous.get(node.title.as_str()) {
                 node.x = old_node.x;
                 node.y = old_node.y;
@@ -171,8 +253,8 @@ impl Graph {
             }
         }
         // Gentle reheat so new nodes find a place, without scrambling the rest.
-        graph.alpha = if kept_any { 0.3 } else { 1.0 };
-        graph
+        self.alpha = if kept_any { 0.3 } else { 1.0 };
+        self.ticks = 0;
     }
 
     pub fn is_settled(&self) -> bool {
@@ -443,6 +525,137 @@ mod tests {
         assert!(g.adj[3].is_empty());
     }
 
+    /// The local-graph fixture: Center links out to Out and tags #topic;
+    /// In and a journal link to it; Far is two hops out (via Out), Island
+    /// three (via Far); Unrelated is not connected at all.
+    fn local_pages() -> Vec<Page> {
+        vec![
+            Page::from_markdown("Center", false, "- see [[Out]] about #topic\n"),
+            Page::from_markdown("Out", false, "- onwards to [[Far]]\n"),
+            Page::from_markdown("In", false, "- mentions [[center]] and [[Out]]\n"),
+            Page::from_markdown("topic", false, "- a tag page\n"),
+            Page::from_markdown("Far", false, "- the end\n"),
+            Page::from_markdown("Island", false, "- only [[Far]]\n"),
+            Page::from_markdown("Unrelated", false, "- nothing\n"),
+            Page::from_markdown("2026-01-01", true, "- worked on [[Center]]\n"),
+        ]
+    }
+
+    /// Edges as sorted title pairs, so tests don't depend on node order.
+    fn edge_titles(g: &Graph) -> Vec<(String, String)> {
+        let mut edges: Vec<(String, String)> = g
+            .edges
+            .iter()
+            .map(|&(a, b)| {
+                let (a, b) = (g.nodes[a].title.clone(), g.nodes[b].title.clone());
+                if a < b {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn tags_are_edges_to_their_page() {
+        let g = Graph::build(&local_pages(), true);
+        assert!(edge_titles(&g).contains(&("Center".into(), "topic".into())));
+        assert_eq!(g.nodes[g.index_of("topic").unwrap()].backlinks, 1);
+        // `#[[x]]` is one reference, not a tag plus a link.
+        let pages = vec![
+            Page::from_markdown("A", false, "- #[[B]] and [[B]]\n"),
+            Page::from_markdown("B", false, "- b\n"),
+        ];
+        let g = Graph::build(&pages, true);
+        assert_eq!(g.edges, vec![(0, 1)]);
+        assert_eq!(g.nodes[1].backlinks, 1);
+    }
+
+    #[test]
+    fn local_graph_is_the_page_and_its_neighbours_both_ways() {
+        let g = Graph::build_local(&local_pages(), true, "center", 1);
+        // Outgoing link, tag, incoming link and the journal's link; in the
+        // original order. Far (2 hops), Island and Unrelated are out.
+        assert_eq!(
+            titles(&g),
+            vec!["Center", "Out", "In", "topic", "2026-01-01"]
+        );
+        // Only edges between kept pages: In-Out stays, Out-Far is gone.
+        assert_eq!(
+            edge_titles(&g),
+            pairs(&[
+                ("2026-01-01", "Center"),
+                ("Center", "In"),
+                ("Center", "Out"),
+                ("Center", "topic"),
+                ("In", "Out"),
+            ])
+        );
+        // Adjacency matches the edges.
+        let center = g.index_of("Center").unwrap();
+        assert_eq!(g.adj[center].len(), 4);
+        assert_eq!(g.adj.iter().map(Vec::len).sum::<usize>(), 2 * g.edges.len());
+        // Node sizes still reflect the whole graph.
+        assert_eq!(g.nodes[center].backlinks, 2);
+    }
+
+    #[test]
+    fn two_hops_reach_one_ring_further() {
+        let g = Graph::build_local(&local_pages(), true, "Center", 2);
+        assert_eq!(
+            titles(&g),
+            vec!["Center", "Out", "In", "topic", "Far", "2026-01-01"]
+        );
+        assert!(edge_titles(&g).contains(&("Far".into(), "Out".into())));
+        assert!(g.index_of("Island").is_none(), "three hops away");
+        // Zero hops: just the page.
+        let g = Graph::build_local(&local_pages(), true, "Center", 0);
+        assert_eq!(titles(&g), vec!["Center"]);
+        assert!(g.edges.is_empty());
+    }
+
+    #[test]
+    fn local_graph_with_journals_hidden_keeps_a_journal_centre() {
+        let g = Graph::build_local(&local_pages(), false, "Center", 1);
+        assert_eq!(titles(&g), vec!["Center", "Out", "In", "topic"]);
+        // Centred on a journal: it stays, other journals don't.
+        let g = Graph::build_local(&local_pages(), false, "2026-01-01", 2);
+        assert_eq!(
+            titles(&g),
+            vec!["Center", "Out", "In", "topic", "2026-01-01"]
+        );
+        // An unknown page gives an empty graph.
+        let g = Graph::build_local(&local_pages(), true, "Nope", 1);
+        assert!(g.nodes.is_empty() && g.edges.is_empty());
+    }
+
+    #[test]
+    fn local_subgraph_keeps_positions_and_pins() {
+        let mut full = Graph::build(&local_pages(), true);
+        settle(&mut full);
+        let out = full.index_of("Out").unwrap();
+        full.nodes[out].pinned = true;
+        let local = full.local_subgraph(full.index_of("Center").unwrap(), 1);
+        for n in &local.nodes {
+            let o = &full.nodes[full.index_of(&n.title).unwrap()];
+            assert_eq!((n.x, n.y, n.pinned), (o.x, o.y, o.pinned));
+        }
+        // The subgraph runs the same physics.
+        let mut local = local;
+        local.reheat(1.0);
+        local.tick();
+        assert!(local.nodes.iter().all(|n| n.x.is_finite()));
+    }
+
     #[test]
     fn backlinks_count_distinct_source_pages() {
         let g = Graph::build(&pages(), true);
@@ -623,7 +836,8 @@ mod tests {
         let mut old = Graph::build(&pages(), true);
         settle(&mut old);
         old.nodes[1].pinned = true;
-        let new = Graph::build_preserving(&pages(), false, &old);
+        let mut new = Graph::build(&pages(), false);
+        new.preserve_layout(&old);
         // Journal gone; the others kept their place.
         assert_eq!(new.nodes.len(), 4);
         for n in &new.nodes {

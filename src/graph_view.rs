@@ -46,6 +46,15 @@ pub enum GraphEvent {
 
 impl EventEmitter<GraphEvent> for GraphView {}
 
+/// Which part of the graph is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Every page.
+    Global,
+    /// The current page and its neighbours (see `Graph::build_local`).
+    Local,
+}
+
 /// What the mouse is currently doing.
 enum Drag {
     /// Pressed on a node. Becomes a real drag once the mouse moves past the
@@ -67,7 +76,14 @@ pub struct GraphView {
     pages: Vec<Page>,
     graph: Graph,
     include_journals: bool,
-    /// Title of the page open in the editor; its node is drawn in the accent colour.
+    /// Global or local. Kept for as long as the view lives (the app keeps
+    /// one for the whole session), not saved.
+    scope: Scope,
+    /// How many links away from the current page the local graph reaches
+    /// (1 or 2).
+    hops: usize,
+    /// Title of the page open in the editor; its node is drawn in the accent
+    /// colour, and the local graph is centred on it.
     current: String,
     theme: Theme,
     font_size: f32,
@@ -102,6 +118,8 @@ impl GraphView {
             pages,
             graph,
             include_journals: true,
+            scope: Scope::Global,
+            hops: 1,
             current,
             theme,
             font_size,
@@ -118,8 +136,36 @@ impl GraphView {
     /// Re-read the pages (they may have been edited since the view was last
     /// open) while keeping node positions and pins.
     pub fn refresh(&mut self, pages: Vec<Page>, current: String, cx: &mut Context<Self>) {
+        // A local graph around another page is a different picture: fit it.
+        if self.scope == Scope::Local && !current.eq_ignore_ascii_case(&self.current) {
+            self.auto_fit = true;
+        }
         self.pages = pages;
         self.current = current;
+        self.rebuild(cx);
+    }
+
+    /// Switch between the whole graph and the current page's neighbourhood.
+    pub fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        if self.scope != scope {
+            self.scope = scope;
+            self.auto_fit = true;
+            self.rebuild(cx);
+        }
+    }
+
+    pub fn toggle_scope(&mut self, cx: &mut Context<Self>) {
+        let scope = match self.scope {
+            Scope::Global => Scope::Local,
+            Scope::Local => Scope::Global,
+        };
+        self.set_scope(scope, cx);
+    }
+
+    /// The local graph's "2 hops" chip: reach 1 or 2 links out.
+    fn toggle_hops(&mut self, cx: &mut Context<Self>) {
+        self.hops = if self.hops == 1 { 2 } else { 1 };
+        self.auto_fit = true;
         self.rebuild(cx);
     }
 
@@ -129,8 +175,18 @@ impl GraphView {
         cx.notify();
     }
 
+    /// Rebuild the graph for the current scope. Nodes that were already
+    /// shown keep their place, so switching scope or page doesn't scramble
+    /// the layout; the same physics then settles the new set.
     fn rebuild(&mut self, cx: &mut Context<Self>) {
-        self.graph = Graph::build_preserving(&self.pages, self.include_journals, &self.graph);
+        let mut graph = match self.scope {
+            Scope::Global => Graph::build(&self.pages, self.include_journals),
+            Scope::Local => {
+                Graph::build_local(&self.pages, self.include_journals, &self.current, self.hops)
+            }
+        };
+        graph.preserve_layout(&self.graph);
+        self.graph = graph;
         if self.reduce_motion {
             self.graph.warm_up(crate::graph::MAX_TICKS);
         }
@@ -139,13 +195,13 @@ impl GraphView {
         cx.notify();
     }
 
-    fn toggle_journals(&mut self, cx: &mut Context<Self>) {
+    pub fn toggle_journals(&mut self, cx: &mut Context<Self>) {
         self.include_journals = !self.include_journals;
         self.auto_fit = true;
         self.rebuild(cx);
     }
 
-    fn fit(&mut self, cx: &mut Context<Self>) {
+    pub fn fit(&mut self, cx: &mut Context<Self>) {
         self.auto_fit = true;
         cx.notify();
     }
@@ -157,6 +213,22 @@ impl GraphView {
     pub(crate) fn node_screen_pos(&self, title: &str) -> Option<(f32, f32)> {
         let n = &self.graph.nodes[self.graph.index_of(title)?];
         Some(self.camera.to_screen(n.x, n.y, self.pane.0, self.pane.1))
+    }
+
+    /// Titles of the nodes shown, in graph order.
+    #[cfg(test)]
+    pub(crate) fn node_titles(&self) -> Vec<String> {
+        self.graph.nodes.iter().map(|n| n.title.clone()).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn includes_journals(&self) -> bool {
+        self.include_journals
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope(&self) -> Scope {
+        self.scope
     }
 
     #[cfg(test)]
@@ -709,6 +781,36 @@ impl Render for GraphView {
                 .child(label)
         };
 
+        // Global | Local: two halves of one bordered control.
+        let local = self.scope == Scope::Local;
+        let segment = |id: &'static str, label: &'static str, active: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .px_3()
+                .py_1()
+                .border_1()
+                .border_color(if active { theme.accent } else { theme.border })
+                .text_color(if active { theme.accent } else { theme.muted })
+                .when(active, |d| d.bg(theme.selected_bg))
+                .cursor_pointer()
+                .hover(|d| d.bg(theme.selected_bg))
+                .child(label)
+        };
+        let scope_control = div()
+            .flex()
+            .flex_row()
+            .child(
+                segment("graph-mode-global", "Global", !local)
+                    .rounded_l_md()
+                    .on_click(cx.listener(|this, _e, _w, cx| this.set_scope(Scope::Global, cx))),
+            )
+            .child(
+                segment("graph-mode-local", "Local", local)
+                    .rounded_r_md()
+                    .on_click(cx.listener(|this, _e, _w, cx| this.set_scope(Scope::Local, cx))),
+            );
+
         let link_count = self.graph.edges.len();
         let toolbar = div()
             .flex()
@@ -731,6 +833,13 @@ impl Render for GraphView {
                     .text_color(theme.muted)
                     .child("scroll to zoom \u{b7} drag to pan \u{b7} click a node to open"),
             )
+            .child(scope_control)
+            .when(local, |d| {
+                d.child(
+                    chip("graph-local-depth", "2 hops", self.hops == 2)
+                        .on_click(cx.listener(|this, _e, _w, cx| this.toggle_hops(cx))),
+                )
+            })
             .child(
                 chip("graph-journals", "Journals", self.include_journals)
                     .on_click(cx.listener(|this, _e, _w, cx| this.toggle_journals(cx))),
@@ -1010,6 +1119,41 @@ mod tests {
             v.toggle_journals(cx);
             assert_eq!(v.graph.nodes.len(), 6);
             assert!(v.auto_fit, "toggling refits the camera");
+        });
+    }
+
+    fn sorted(mut titles: Vec<String>) -> Vec<String> {
+        titles.sort();
+        titles
+    }
+
+    #[gpui::test]
+    fn local_scope_shows_the_neighbourhood_and_follows_the_current_page(cx: &mut TestAppContext) {
+        let view = cx.new(|_| new_view("A"));
+        view.update(cx, |v, cx| {
+            v.auto_fit = false;
+            v.set_scope(Scope::Local, cx);
+            assert!(v.auto_fit, "switching scope refits");
+            assert_eq!(sorted(v.node_titles()), vec!["A", "Hub"]);
+            assert_eq!(v.graph.edges.len(), 1);
+
+            v.toggle_hops(cx);
+            assert_eq!(
+                sorted(v.node_titles()),
+                vec!["2026-01-01", "A", "B", "C", "Hub"]
+            );
+            v.toggle_hops(cx);
+
+            // Another current page: re-centred and refitted.
+            v.auto_fit = false;
+            let pages = v.pages.clone();
+            v.refresh(pages, "Island".into(), cx);
+            assert_eq!(v.node_titles(), vec!["Island"]);
+            assert!(v.auto_fit);
+
+            v.toggle_scope(cx);
+            assert_eq!(v.scope, Scope::Global);
+            assert_eq!(v.node_titles().len(), 6);
         });
     }
 

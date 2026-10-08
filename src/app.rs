@@ -5,8 +5,10 @@
 //! stops (Escape, click elsewhere, switching pages) the text is written back to
 //! the block and the page is saved to disk.
 
+use crate::agenda::{day_label, Agenda, AgendaItem};
 use crate::assets::{image_markdown, is_image_path, parse_images, resolve, save_image, ImageRef};
 use crate::code::{split_code, CodeBlock, Part};
+use crate::commands::{binding_hint, format_keystrokes, Command, Needs};
 use crate::config::{Config, ThemeKind};
 use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
@@ -15,9 +17,9 @@ use crate::model::{
     backlinks, cycle_task, find_block, parse_block_refs, parse_query, parse_references, tag_counts,
     tag_query, BlockKind, Page, TaskState,
 };
-use crate::search::{search, search_blocks, search_templates, Command, Hit, Target};
+use crate::search::{search, search_blocks, search_templates, Hit, Target};
 use crate::state::UiState;
-use crate::storage::{today_title, Storage, Template};
+use crate::storage::{today_title, validate_title, Storage, Template};
 use crate::table::{parse_table, Align};
 use crate::tabs::{TabTarget, Tabs};
 use crate::ui::{
@@ -26,19 +28,20 @@ use crate::ui::{
 };
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
-    Bounds, ClickEvent, Context, DragMoveEvent, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, ExternalPaths, FocusHandle, FontStyle, FontWeight, GlobalElementId,
+    Bounds, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontStyle, FontWeight, GlobalElementId,
     HighlightStyle, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, ShapedLine, SharedString, Style, StyledText, Subscription,
-    Task, TextRun, UTF16Selection, UnderlineStyle, Window,
+    MouseUpEvent, PaintQuad, Pixels, ScrollHandle, ShapedLine, SharedString, Style, StyledText,
+    Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use uuid::Uuid;
 
 // Actions are named, typed commands that key bindings map onto. The macro
-// declares one unit struct per name inside the `notesec` namespace.
+// declares one unit struct per name inside the `notesec` namespace. Palette
+// commands (`commands.rs`) dispatch these too.
 actions!(
     notesec,
     [
@@ -80,63 +83,192 @@ actions!(
         ResetFont,
         OpenSettings,
         Quit,
+        // Palette commands without a key of their own (except
+        // ShowShortcuts, Ctrl+/).
+        OpenAgenda,
+        RenamePage,
+        DeletePage,
+        CopyPageTitle,
+        ToggleFavorite,
+        SortPagesAz,
+        InsertTemplate,
+        CollapseAll,
+        ExpandAll,
+        ToggleLocalGraph,
+        FitGraph,
+        ToggleGraphJournals,
+        ShowShortcuts,
     ]
 );
 
-/// Register keyboard shortcuts. The `"BlockEditor"` context is only active
-/// while a block is being edited (see `render`), so these keys do nothing
-/// otherwise.
+/// The headings of the keyboard shortcuts dialog, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyGroup {
+    Navigation,
+    Editing,
+    View,
+    Tabs,
+    App,
+}
+
+impl KeyGroup {
+    pub const ALL: [KeyGroup; 5] = [
+        KeyGroup::Navigation,
+        KeyGroup::Editing,
+        KeyGroup::View,
+        KeyGroup::Tabs,
+        KeyGroup::App,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyGroup::Navigation => "Navigation",
+            KeyGroup::Editing => "Editing",
+            KeyGroup::View => "View",
+            KeyGroup::Tabs => "Tabs",
+            KeyGroup::App => "App",
+        }
+    }
+}
+
+/// One key binding and how the shortcuts dialog describes it. `bind_keys`
+/// registers exactly these and the dialog lists exactly these, so the two
+/// can't drift; the palette reads its hints back from the keymap.
+pub struct Shortcut {
+    pub binding: KeyBinding,
+    pub group: KeyGroup,
+    /// Rows with the same group and description are merged in the dialog
+    /// ("Ctrl+= / Ctrl++").
+    pub description: &'static str,
+}
+
+/// The whole keymap. One line per binding; an action's main binding comes
+/// first (it is the one shown next to its palette command).
+#[rustfmt::skip]
+pub fn shortcuts() -> Vec<Shortcut> {
+    use KeyGroup::*;
+    fn s<A: gpui::Action>(
+        keys: &str,
+        action: A,
+        context: Option<&str>,
+        group: KeyGroup,
+        description: &'static str,
+    ) -> Shortcut {
+        Shortcut {
+            binding: KeyBinding::new(keys, action, context),
+            group,
+            description,
+        }
+    }
+    // The "BlockEditor" context only exists while a block (or the palette's
+    // query box, or the rename field) is being edited, so these keys do
+    // nothing otherwise.
+    let ed = Some("BlockEditor");
+    vec![
+        // Global (no context): work whether or not a block is being edited.
+        s("ctrl-k",         ToggleSearch,  None, Navigation, "Search pages, blocks and commands"),
+        s("ctrl-j",         OpenToday,     None, Navigation, "Open today's journal"),
+        s("ctrl-n",         NewPage,       None, Navigation, "New page"),
+        s("up",             Up,            ed,   Navigation, "Block above / below (or palette result)"),
+        s("down",           Down,          ed,   Navigation, "Block above / below (or palette result)"),
+        s("enter",          Enter,         ed,   Editing,    "New block at the cursor (palette: open the result)"),
+        s("tab",            Tab,           ed,   Editing,    "Indent the block"),
+        s("shift-tab",      ShiftTab,      ed,   Editing,    "Outdent the block"),
+        s("backspace",      Backspace,     ed,   Editing,    "Delete back; on an empty block, remove it"),
+        s("delete",         Delete,        ed,   Editing,    "Delete forward"),
+        s("left",           Left,          ed,   Editing,    "Move the cursor"),
+        s("right",          Right,         ed,   Editing,    "Move the cursor"),
+        s("home",           Home,          ed,   Editing,    "Start / end of the block"),
+        s("end",            End,           ed,   Editing,    "Start / end of the block"),
+        s("shift-left",     SelectLeft,    ed,   Editing,    "Extend the selection"),
+        s("shift-right",    SelectRight,   ed,   Editing,    "Extend the selection"),
+        s("shift-home",     SelectHome,    ed,   Editing,    "Extend the selection"),
+        s("shift-end",      SelectEnd,     ed,   Editing,    "Extend the selection"),
+        s("shift-enter",    NewLine,       ed,   Editing,    "Line break inside the block"),
+        s("alt-up",         MoveBlockUp,   ed,   Editing,    "Move the block up / down"),
+        s("alt-down",       MoveBlockDown, ed,   Editing,    "Move the block up / down"),
+        s("ctrl-v",         Paste,         ed,   Editing,    "Paste (an image is saved to assets/)"),
+        s("ctrl-b",         Bold,          ed,   Editing,    "Bold"),
+        s("ctrl-i",         Italic,        ed,   Editing,    "Italic"),
+        s("ctrl-enter",     CycleTask,     ed,   Editing,    "Cycle task: TODO, DOING, DONE, none"),
+        s("escape",         Escape,        ed,   Editing,    "Stop editing (or close the palette)"),
+        s("ctrl-z",         Undo,          None, Editing,    "Undo"),
+        s("ctrl-shift-z",   Redo,          None, Editing,    "Redo"),
+        s("ctrl-y",         Redo,          None, Editing,    "Redo"),
+        s("ctrl-g",         ToggleGraph,   None, View,       "Toggle graph view"),
+        s("ctrl-shift-t",   ToggleTheme,   None, View,       "Switch theme"),
+        // `=` and `+` share a key on US layouts; bind both so Ctrl-+ works
+        // with or without Shift.
+        s("ctrl-=",         IncreaseFont,  None, View,       "Increase font size"),
+        s("ctrl-+",         IncreaseFont,  None, View,       "Increase font size"),
+        s("ctrl--",         DecreaseFont,  None, View,       "Decrease font size"),
+        s("ctrl-0",         ResetFont,     None, View,       "Reset font size"),
+        s("ctrl-w",         CloseTab,      None, Tabs,       "Close tab"),
+        s("ctrl-tab",       NextTab,       None, Tabs,       "Next tab"),
+        s("ctrl-shift-tab", PrevTab,       None, Tabs,       "Previous tab"),
+        s("ctrl-,",         OpenSettings,  None, App,        "Open / close settings"),
+        s("ctrl-/",         ShowShortcuts, None, App,        "Keyboard shortcuts (this list)"),
+        s("ctrl-q",         Quit,          None, App,        "Quit"),
+        // While the settings panel, a page menu (or its delete
+        // confirmation) or this list is open, the root's key context is
+        // that instead, so Esc closes it. (Renaming uses "BlockEditor":
+        // it types.)
+        s("escape",         Escape,        Some("Settings"),  App, "Close a dialog or menu"),
+        s("escape",         Escape,        Some("PageMenu"),  App, "Close a dialog or menu"),
+        s("escape",         Escape,        Some("Shortcuts"), App, "Close a dialog or menu"),
+    ]
+}
+
+/// The shortcuts dialog's content: for each group (in order, empty ones
+/// left out), one row per description with every key bound to it.
+pub fn cheatsheet(shortcuts: &[Shortcut]) -> Vec<(KeyGroup, Vec<(String, &'static str)>)> {
+    KeyGroup::ALL
+        .iter()
+        .map(|&group| {
+            let mut rows: Vec<(Vec<String>, &'static str)> = Vec::new();
+            for s in shortcuts.iter().filter(|s| s.group == group) {
+                let keys = format_keystrokes(s.binding.keystrokes());
+                match rows.iter_mut().find(|(_, d)| *d == s.description) {
+                    Some((list, _)) => {
+                        if !list.contains(&keys) {
+                            list.push(keys);
+                        }
+                    }
+                    None => rows.push((vec![keys], s.description)),
+                }
+            }
+            let rows = rows
+                .into_iter()
+                .map(|(keys, description)| (keys.join(" / "), description))
+                .collect();
+            (group, rows)
+        })
+        .filter(|(_, rows): &(KeyGroup, Vec<_>)| !rows.is_empty())
+        .collect()
+}
+
+/// Register keyboard shortcuts (the `shortcuts` table).
 pub fn bind_keys(cx: &mut App) {
-    let ctx = Some("BlockEditor");
-    cx.bind_keys([
-        KeyBinding::new("enter", Enter, ctx),
-        KeyBinding::new("tab", Tab, ctx),
-        KeyBinding::new("shift-tab", ShiftTab, ctx),
-        KeyBinding::new("backspace", Backspace, ctx),
-        KeyBinding::new("delete", Delete, ctx),
-        KeyBinding::new("left", Left, ctx),
-        KeyBinding::new("right", Right, ctx),
-        KeyBinding::new("up", Up, ctx),
-        KeyBinding::new("down", Down, ctx),
-        KeyBinding::new("shift-enter", NewLine, ctx),
-        KeyBinding::new("home", Home, ctx),
-        KeyBinding::new("end", End, ctx),
-        KeyBinding::new("escape", Escape, ctx),
-        KeyBinding::new("shift-left", SelectLeft, ctx),
-        KeyBinding::new("shift-right", SelectRight, ctx),
-        KeyBinding::new("shift-home", SelectHome, ctx),
-        KeyBinding::new("shift-end", SelectEnd, ctx),
-        KeyBinding::new("ctrl-v", Paste, ctx),
-        KeyBinding::new("ctrl-b", Bold, ctx),
-        KeyBinding::new("ctrl-i", Italic, ctx),
-        KeyBinding::new("ctrl-enter", CycleTask, ctx),
-        KeyBinding::new("alt-up", MoveBlockUp, ctx),
-        KeyBinding::new("alt-down", MoveBlockDown, ctx),
-        // While the settings panel is open the root's key context is
-        // "Settings" instead, so Esc closes the panel.
-        KeyBinding::new("escape", Escape, Some("Settings")),
-        // Global (no context): works whether or not a block is being edited.
-        KeyBinding::new("ctrl-k", ToggleSearch, None),
-        KeyBinding::new("ctrl-n", NewPage, None),
-        KeyBinding::new("ctrl-j", OpenToday, None),
-        KeyBinding::new("ctrl-z", Undo, None),
-        KeyBinding::new("ctrl-shift-z", Redo, None),
-        KeyBinding::new("ctrl-y", Redo, None),
-        KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
-        KeyBinding::new("ctrl-g", ToggleGraph, None),
-        // `=` and `+` share a key on US layouts; bind both so Ctrl-+ works with
-        // or without Shift.
-        KeyBinding::new("ctrl-=", IncreaseFont, None),
-        KeyBinding::new("ctrl-+", IncreaseFont, None),
-        KeyBinding::new("ctrl--", DecreaseFont, None),
-        KeyBinding::new("ctrl-0", ResetFont, None),
-        KeyBinding::new("ctrl-w", CloseTab, None),
-        KeyBinding::new("ctrl-tab", NextTab, None),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-        KeyBinding::new("ctrl-,", OpenSettings, None),
-        KeyBinding::new("ctrl-q", Quit, None),
-    ]);
+    cx.bind_keys(shortcuts().into_iter().map(|s| s.binding));
     cx.on_action(|_: &Quit, cx| cx.quit());
+}
+
+/// The palette puts a header over each group of results (see
+/// `search::search`): "Commands" over the commands, and "Pages" over the
+/// pages and blocks when commands are listed too. The header shown just
+/// above row `i`, if any.
+fn palette_header(hits: &[Hit], i: usize) -> Option<&'static str> {
+    let is_command = hits[i].target.is_command();
+    if i > 0 && hits[i - 1].target.is_command() == is_command {
+        return None;
+    }
+    if is_command {
+        Some("Commands")
+    } else if hits.iter().any(|h| h.target.is_command()) {
+        Some("Pages")
+    } else {
+        None
+    }
 }
 
 /// The value carried by a block drag (see `BlockDragPreview` for what is
@@ -163,6 +295,8 @@ enum Mode {
     Notes,
     /// The page graph.
     Graph,
+    /// The agenda: open tasks by date.
+    Agenda,
     /// No tab is open: an empty state with hints.
     Empty,
 }
@@ -177,8 +311,12 @@ enum Nav {
     Tab,
 }
 
-/// How many results the search overlay shows.
+/// How many page and block results the search overlay shows (commands
+/// come on top of these with an empty query).
 const MAX_RESULTS: usize = 12;
+
+/// Height of the palette's scrolling result list.
+const PALETTE_LIST_HEIGHT: f32 = 440.0;
 
 /// State of the Ctrl-K overlay while it is open.
 struct SearchState {
@@ -191,9 +329,15 @@ struct SearchState {
     /// template" puts the template's blocks after it (see
     /// `Page::insert_blocks_from`); `None` means append to the page.
     insert_after: Option<usize>,
+    /// That block's editor (text, cursor, selection) when the palette
+    /// opened: an editor command (`Needs::Editing`) resumes it.
+    resume: Option<EditorState>,
     /// `Some` once "Insert template" was chosen: the palette then lists these
     /// templates instead of pages, blocks and commands.
     templates: Option<Vec<Template>>,
+    /// The result list scrolls (an empty query lists every command); arrow
+    /// keys keep the highlighted row in view through this.
+    scroll: ScrollHandle,
 }
 
 const MAX_HISTORY: usize = 100;
@@ -207,6 +351,78 @@ struct SettingsState {
     /// dedupes), read once when the panel opens rather than on every frame.
     fonts: Vec<String>,
 }
+
+/// A sidebar page's right-click menu, and the rename / delete steps it
+/// leads to. The page is held by title: indices shift when pages re-sort.
+struct PageMenu {
+    title: String,
+    /// Where the right-click happened, in window coordinates.
+    position: gpui::Point<Pixels>,
+    step: MenuStep,
+}
+
+enum MenuStep {
+    /// The menu: Rename, Delete, Copy page title.
+    Menu,
+    /// Typing the new name: the menu turns into a text field in place. It
+    /// reuses `EditorState` like the palette's query box.
+    Rename {
+        editor: EditorState,
+        /// Why the last Enter was refused, shown under the field.
+        error: Option<String>,
+    },
+    /// The confirm dialog before deleting.
+    ConfirmDelete { error: Option<String> },
+}
+
+/// What a sidebar page row carries while it is dragged (`on_drag`): the
+/// page, by title.
+struct DraggedPage {
+    title: String,
+}
+
+/// The floating copy of a page row that follows the pointer during a drag.
+struct PageDragPreview {
+    title: SharedString,
+    theme: Theme,
+    font_size: f32,
+    font_family: Option<SharedString>,
+}
+
+impl Render for PageDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .when_some(self.font_family.clone(), |d, family| d.font_family(family))
+            .text_size(px(self.font_size))
+            .w(px(220.0))
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(theme.sidebar_bg)
+            .border_1()
+            .border_color(theme.accent)
+            .text_color(theme.text)
+            .shadow_md()
+            .opacity(0.9)
+            .child(self.title.clone())
+    }
+}
+
+/// Where a dragged page would land if dropped now.
+#[derive(Clone, Debug, PartialEq)]
+struct PageDrop {
+    /// The drop zone that set this: a page row (by title) or `None` for the
+    /// end-of-list zone. Only that zone clears it when the pointer leaves
+    /// (every zone hears every drag move; Zed's project panel idiom).
+    zone: Option<String>,
+    /// Insert before this page; `None` means at the end of the list.
+    before: Option<String>,
+}
+
+/// Half the gap between sidebar rows (`gap_1`): each row's drop zone
+/// reaches this far past its edges, so the gaps are covered too.
+const ROW_GAP_HALF: f32 = 2.0;
 
 /// The "/" block-type menu while it is open (see `editor::SlashMenu`).
 struct SlashState {
@@ -226,7 +442,8 @@ struct HistoryState {
 
 pub struct NoteSec {
     storage: Storage,
-    /// All pages, kept sorted for the sidebar (journals first, newest first).
+    /// All pages in sidebar order (see `sort_pages`): journals first,
+    /// newest first, then the rest in the custom or alphabetical order.
     pages: Vec<Page>,
     /// Index into `pages` of the page shown in the main pane.
     selected: usize,
@@ -260,6 +477,14 @@ pub struct NoteSec {
     ref_selected: (Range<usize>, usize),
     /// Esc closed the picker for the `((` at this offset.
     ref_dismissed: Option<usize>,
+    /// `Some` while a page's context menu (or its rename / delete step) is
+    /// open.
+    page_menu: Option<PageMenu>,
+    /// True while the keyboard shortcuts dialog is open.
+    shortcuts_open: bool,
+    /// Where the page being dragged in the sidebar would land. Only
+    /// meaningful while a drag is active; `render` clears it otherwise.
+    page_drop: Option<PageDrop>,
     /// True between a mouse-down in the edited block and the mouse-up: mouse
     /// moves in between extend the selection.
     selecting: bool,
@@ -338,7 +563,8 @@ impl NoteSec {
             pages.push(welcome);
         }
 
-        sort_pages(&mut pages);
+        let state = UiState::load(storage.root());
+        sort_pages(&mut pages, &state.page_order);
         // Open on today's journal.
         let selected = pages
             .iter()
@@ -356,7 +582,6 @@ impl NoteSec {
             .as_deref()
             .and_then(|family| installed_font(family, cx));
 
-        let state = UiState::load(storage.root());
         let mono_font = mono_font(cx);
 
         let mut app = NoteSec {
@@ -373,6 +598,9 @@ impl NoteSec {
             search: None,
             slash: None,
             settings: None,
+            page_menu: None,
+            shortcuts_open: false,
+            page_drop: None,
             selecting: false,
             collapsed: HashSet::new(),
             block_drop: None,
@@ -403,19 +631,51 @@ impl NoteSec {
     // --- which editor is active ----------------------------------------------
 
     /// The text editor currently receiving input: the search box while the
-    /// overlay is open, otherwise the block editor.
+    /// overlay is open, the rename field while renaming a page, otherwise
+    /// the block editor.
     fn active_editor(&self) -> &EditorState {
-        match &self.search {
-            Some(s) => &s.query,
-            None => &self.editor,
+        match (&self.search, &self.page_menu) {
+            (Some(s), _) => &s.query,
+            (
+                None,
+                Some(PageMenu {
+                    step: MenuStep::Rename { editor, .. },
+                    ..
+                }),
+            ) => editor,
+            _ => &self.editor,
         }
     }
 
     fn active_editor_mut(&mut self) -> &mut EditorState {
-        match &mut self.search {
-            Some(s) => &mut s.query,
-            None => &mut self.editor,
+        match (&mut self.search, &mut self.page_menu) {
+            (Some(s), _) => &mut s.query,
+            (
+                None,
+                Some(PageMenu {
+                    step: MenuStep::Rename { editor, .. },
+                    ..
+                }),
+            ) => editor,
+            _ => &mut self.editor,
         }
+    }
+
+    /// True while the rename field of the page menu takes the typing.
+    fn renaming(&self) -> bool {
+        matches!(
+            self.page_menu,
+            Some(PageMenu {
+                step: MenuStep::Rename { .. },
+                ..
+            })
+        )
+    }
+
+    /// The palette's query box or the rename field has the keyboard (not a
+    /// block): typing there records no undo history.
+    fn text_input_open(&self) -> bool {
+        self.search.is_some() || self.renaming()
     }
 
     // --- settings --------------------------------------------------------------
@@ -487,6 +747,8 @@ impl NoteSec {
         // Save the edited block and close the palette: the panel covers both.
         self.stop_edit(cx);
         self.close_search(cx);
+        self.page_menu = None;
+        self.shortcuts_open = false;
         let fonts = cx.text_system().all_font_names();
         self.settings = Some(SettingsState { fonts });
         cx.notify();
@@ -520,18 +782,6 @@ impl NoteSec {
         cx.notify();
     }
 
-    fn run_command(&mut self, command: Command, cx: &mut Context<Self>) {
-        match command {
-            Command::ToggleTheme => self.toggle_theme(cx),
-            Command::IncreaseFontSize => self.change_font_size(1.0, cx),
-            Command::DecreaseFontSize => self.change_font_size(-1.0, cx),
-            Command::ResetFontSize => self.reset_font_size(cx),
-            Command::ToggleGraph => self.toggle_graph(cx),
-            Command::InsertTemplate => self.open_template_picker(None, cx),
-            Command::OpenSettings => self.open_settings(cx),
-        }
-    }
-
     // --- templates -------------------------------------------------------------
 
     /// Show the palette as a template picker. `insert_after` is the block the
@@ -542,7 +792,9 @@ impl NoteSec {
             query: EditorState::default(),
             selected: 0,
             insert_after,
+            resume: None,
             templates: Some(self.storage.load_templates()),
+            scroll: ScrollHandle::new(),
         });
         cx.notify();
     }
@@ -585,7 +837,12 @@ impl NoteSec {
                 let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
                 search_templates(&names, &query.text, MAX_RESULTS)
             }
-            Some(s) => search(&self.pages, &s.query.text, MAX_RESULTS),
+            Some(s) => search(
+                &self.pages,
+                &self.available_commands(),
+                &s.query.text,
+                MAX_RESULTS,
+            ),
             None => Vec::new(),
         }
     }
@@ -595,6 +852,14 @@ impl NoteSec {
     fn text_changed(&mut self) {
         if let Some(s) = &mut self.search {
             s.selected = 0;
+        }
+        // A refused name's message goes away once the name is edited.
+        if let Some(PageMenu {
+            step: MenuStep::Rename { error, .. },
+            ..
+        }) = &mut self.page_menu
+        {
+            *error = None;
         }
     }
 
@@ -606,13 +871,18 @@ impl NoteSec {
         // Remember where the cursor was (for "Insert template"), then save
         // whatever block is being edited before covering it.
         let insert_after = self.editing;
+        let resume = insert_after.map(|_| self.editor.clone());
         self.stop_edit(cx);
         self.settings = None;
+        self.page_menu = None;
+        self.shortcuts_open = false;
         self.search = Some(SearchState {
             query: EditorState::default(),
             selected: 0,
             insert_after,
+            resume,
             templates: None,
+            scroll: ScrollHandle::new(),
         });
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -662,6 +932,8 @@ impl NoteSec {
     ) {
         self.pages = state.pages;
         self.selected = state.selected.min(self.pages.len().saturating_sub(1));
+        // The snapshot may predate a drag or "Sort pages A-Z".
+        self.sort_pages();
         self.editing = state.editing.filter(|&ix| {
             self.selected < self.pages.len() && ix < self.pages[self.selected].blocks.len()
         });
@@ -681,7 +953,7 @@ impl NoteSec {
         let pages = &self.pages;
         self.tabs.retain(|t| match t {
             TabTarget::Page(title) => pages.iter().any(|p| p.title == *title),
-            TabTarget::Graph => true,
+            TabTarget::Graph | TabTarget::Agenda => true,
         });
         if self.editing.is_some() || matches!(self.tabs.active_target(), Some(TabTarget::Page(_))) {
             // Not `show_page`: undo/redo isn't the user opening a page, so
@@ -697,7 +969,7 @@ impl NoteSec {
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() {
+        if self.search.is_some() || self.page_menu.is_some() {
             return;
         }
         self.close_slash_as_typing();
@@ -708,7 +980,7 @@ impl NoteSec {
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() {
+        if self.search.is_some() || self.page_menu.is_some() {
             return;
         }
         self.close_slash_as_typing();
@@ -734,8 +1006,7 @@ impl NoteSec {
         if let Err(err) = self.storage.save(&page) {
             eprintln!("notesec: failed to create page {title}: {err}");
         }
-        self.pages.push(page);
-        sort_pages(&mut self.pages);
+        self.add_page(page);
         let ix = self.find_page(&title).unwrap_or(0);
         self.show_page(ix, cx);
         self.start_edit(0, window, cx);
@@ -750,10 +1021,16 @@ impl NoteSec {
     }
 
     fn move_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let count = self.search_results().len();
+        let hits = self.search_results();
         if let Some(s) = &mut self.search {
-            if count > 0 {
-                s.selected = (s.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+            if !hits.is_empty() {
+                s.selected =
+                    (s.selected as isize + delta).clamp(0, hits.len() as isize - 1) as usize;
+                // Children of the list are headers and rows; find the row's.
+                let headers = (0..=s.selected)
+                    .filter(|&i| palette_header(&hits, i).is_some())
+                    .count();
+                s.scroll.scroll_to_item(s.selected + headers);
             }
         }
         cx.notify();
@@ -771,9 +1048,9 @@ impl NoteSec {
     /// Act on a search result: open its page (and for a block hit, start
     /// editing that block) or run the command.
     fn open_hit(&mut self, hit: &Hit, window: &mut Window, cx: &mut Context<Self>) {
-        let (insert_after, templates) = match self.search.take() {
-            Some(s) => (s.insert_after, s.templates),
-            None => (None, None),
+        let (insert_after, resume, templates) = match self.search.take() {
+            Some(s) => (s.insert_after, s.resume, s.templates),
+            None => (None, None, None),
         };
         self.close_search(cx);
         match hit.target {
@@ -788,9 +1065,28 @@ impl NoteSec {
                     self.start_edit(block, window, cx);
                 }
             }
-            // Keeps the palette open, now listing templates.
+            // Keeps the palette open, now listing templates (after the
+            // block that was being edited when it opened).
             Target::Command(Command::InsertTemplate) => self.open_template_picker(insert_after, cx),
-            Target::Command(command) => self.run_command(command, cx),
+            // The same action the command's key binding dispatches. It
+            // runs once this handler returns (GPUI defers it), so the
+            // palette is already closed.
+            Target::Command(command) => {
+                // An editor command acts on the block the palette was
+                // opened from: edit it again, exactly as it was.
+                if command.needs() == Needs::Editing {
+                    let (Some(ix), Some(editor)) = (insert_after, resume) else {
+                        return;
+                    };
+                    if ix >= self.pages[self.selected].blocks.len() {
+                        return;
+                    }
+                    self.start_edit(ix, window, cx);
+                    self.editor = editor;
+                    self.editor.clamp();
+                }
+                window.dispatch_action(command.action(), cx)
+            }
             Target::Template(ix) => {
                 if let Some(template) = templates.as_ref().and_then(|t| t.get(ix)) {
                     self.insert_template(template, insert_after, cx);
@@ -829,6 +1125,191 @@ impl NoteSec {
 
     fn on_reset_font(&mut self, _: &ResetFont, _: &mut Window, cx: &mut Context<Self>) {
         self.reset_font_size(cx);
+    }
+
+    // --- palette commands ------------------------------------------------------
+
+    /// The page the palette's page commands act on: the one on screen, if a
+    /// page tab is showing (not the graph, the agenda or no tab at all).
+    fn current_page(&self) -> Option<String> {
+        (self.mode == Mode::Notes).then(|| self.pages[self.selected].title.clone())
+    }
+
+    /// Commands the palette offers right now, in table order. Page commands
+    /// are left out without a current page, editor commands unless the
+    /// palette was opened while editing a block, and Rename / Delete when
+    /// the page menu would refuse them (a journal; the last page).
+    fn available_commands(&self) -> Vec<Command> {
+        let page = self.current_page();
+        let editing = page.is_some()
+            && self
+                .search
+                .as_ref()
+                .is_some_and(|s| s.insert_after.is_some() && s.resume.is_some());
+        Command::ALL
+            .iter()
+            .copied()
+            .filter(|c| match c.needs() {
+                Needs::Nothing => true,
+                Needs::Page => page.is_some(),
+                Needs::Editing => editing,
+            })
+            .filter(|c| match c {
+                Command::RenamePage => page.as_deref().is_some_and(|t| self.can_rename(t)),
+                Command::DeletePage => self.can_delete(),
+                _ => true,
+            })
+            .collect()
+    }
+
+    fn on_open_agenda(&mut self, _: &OpenAgenda, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_agenda(cx);
+    }
+
+    fn on_sort_pages_az(&mut self, _: &SortPagesAz, _: &mut Window, cx: &mut Context<Self>) {
+        self.sort_pages_az(cx);
+    }
+
+    fn on_toggle_local_graph(
+        &mut self,
+        _: &ToggleLocalGraph,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_local_graph(cx);
+    }
+
+    /// "Fit graph": show the graph (opening it if needed) and fit it.
+    fn on_fit_graph(&mut self, _: &FitGraph, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_graph(cx);
+        if let Some(graph) = self.graph.clone() {
+            graph.update(cx, |g, cx| g.fit(cx));
+        }
+    }
+
+    /// "Toggle journals in graph": show the graph and flip its Journals chip.
+    fn on_toggle_graph_journals(
+        &mut self,
+        _: &ToggleGraphJournals,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_graph(cx);
+        if let Some(graph) = self.graph.clone() {
+            graph.update(cx, |g, cx| g.toggle_journals(cx));
+        }
+    }
+
+    fn on_insert_template(&mut self, _: &InsertTemplate, _: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page().is_some() {
+            self.open_template_picker(self.editing, cx);
+        }
+    }
+
+    /// Where the page menu opens when a command (not a right-click) opens
+    /// it: over the page title, at the top left of the main pane.
+    fn command_menu_position() -> gpui::Point<Pixels> {
+        point(px(272.0), px(80.0))
+    }
+
+    /// "Rename current page": the page menu's rename field, for the page
+    /// on screen.
+    fn on_rename_page(&mut self, _: &RenamePage, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.current_page().filter(|t| self.can_rename(t)) else {
+            return;
+        };
+        self.open_page_menu(title, Self::command_menu_position(), cx);
+        self.start_rename(cx);
+    }
+
+    /// "Delete current page": the page menu's confirm dialog.
+    fn on_delete_page(&mut self, _: &DeletePage, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.current_page() else {
+            return;
+        };
+        self.open_page_menu(title, Self::command_menu_position(), cx);
+        self.ask_delete(cx);
+        // `ask_delete` refuses for the last page; don't leave the menu up.
+        if matches!(
+            self.page_menu,
+            Some(PageMenu {
+                step: MenuStep::Menu,
+                ..
+            })
+        ) {
+            self.close_page_menu(cx);
+        }
+    }
+
+    fn on_copy_page_title(&mut self, _: &CopyPageTitle, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(title) = self.current_page() {
+            cx.write_to_clipboard(ClipboardItem::new_string(title));
+        }
+    }
+
+    fn on_toggle_favorite(&mut self, _: &ToggleFavorite, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(title) = self.current_page() {
+            self.toggle_favorite(&title, cx);
+        }
+    }
+
+    /// "Collapse all": fold every block of the current page that has
+    /// children. Folding is UI-only (not an undo step), like the arrows.
+    fn on_collapse_all(&mut self, _: &CollapseAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page().is_none() {
+            return;
+        }
+        let page = &self.pages[self.selected];
+        self.collapsed.extend(
+            (0..page.blocks.len())
+                .filter(|&ix| page.descendant_count(ix) > 0)
+                .map(|ix| page.blocks[ix].id),
+        );
+        // A block being edited inside a folded subtree stops being edited.
+        let visible = page.visible_blocks(&self.collapsed);
+        if self.editing.is_some_and(|ix| !visible[ix]) {
+            self.stop_edit(cx);
+        }
+        cx.notify();
+    }
+
+    /// "Expand all": unfold every block of the current page.
+    fn on_expand_all(&mut self, _: &ExpandAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page().is_none() {
+            return;
+        }
+        for block in &self.pages[self.selected].blocks {
+            self.collapsed.remove(&block.id);
+        }
+        cx.notify();
+    }
+
+    // --- keyboard shortcuts dialog --------------------------------------------
+
+    /// Ctrl+/ or "Keyboard shortcuts": open the list, or close it if open.
+    fn on_show_shortcuts(
+        &mut self,
+        _: &ShowShortcuts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shortcuts_open {
+            self.close_shortcuts(cx);
+            return;
+        }
+        // A modal like the settings panel: save the edit, close the rest.
+        self.stop_edit(cx);
+        self.close_search(cx);
+        self.settings = None;
+        self.page_menu = None;
+        self.shortcuts_open = true;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn close_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.shortcuts_open = false;
+        cx.notify();
     }
 
     // --- "/" block-type menu --------------------------------------------------
@@ -1056,12 +1537,34 @@ impl NoteSec {
     }
 
     /// Add a page, keeping the sidebar sorted and `selected` pointing at the
-    /// same page as before (sorting can shift indices).
+    /// same page as before (sorting can shift indices). With a custom order
+    /// the new page goes at the end of it.
     fn add_page(&mut self, page: Page) {
-        let current = self.pages[self.selected].title.clone();
+        if !page.is_journal && !self.state.page_order.is_empty() {
+            self.state.page_order.push(page.title.clone());
+            self.save_state();
+        }
         self.pages.push(page);
-        sort_pages(&mut self.pages);
-        self.selected = self.find_page(&current).unwrap_or(0);
+        self.sort_pages();
+    }
+
+    /// Put `pages` in sidebar order (`sort_pages`, with the custom order
+    /// from `state.toml`), keeping `selected` on the same page. Every
+    /// re-sort goes through here: startup aside, that is adding, renaming,
+    /// dropping a dragged page, "Sort pages A-Z" and undo/redo.
+    fn sort_pages(&mut self) {
+        let current = self
+            .pages
+            .get(self.selected)
+            .map(|p| (p.title.clone(), p.is_journal));
+        sort_pages(&mut self.pages, &self.state.page_order);
+        if let Some((title, is_journal)) = current {
+            self.selected = self
+                .pages
+                .iter()
+                .position(|p| p.title == title && p.is_journal == is_journal)
+                .unwrap_or(0);
+        }
     }
 
     /// Create (and save) a page for every `[[link]]` on the selected page that
@@ -1163,6 +1666,11 @@ impl NoteSec {
                 self.mode = Mode::Graph;
                 cx.notify();
             }
+            // Built from the pages on every render, so it is never stale.
+            Some(TabTarget::Agenda) => {
+                self.mode = Mode::Agenda;
+                cx.notify();
+            }
             None => {
                 self.mode = Mode::Empty;
                 cx.notify();
@@ -1186,10 +1694,13 @@ impl NoteSec {
         self.apply_tab(cx);
     }
 
-    /// The Ctrl-K palette or the settings panel covers the page. Both are
-    /// modal, so the tab keys do nothing while one is open.
+    /// The Ctrl-K palette, the settings panel or a page menu covers the
+    /// page. All are modal, so the tab keys do nothing while one is open.
     fn overlay_open(&self) -> bool {
-        self.search.is_some() || self.settings.is_some()
+        self.search.is_some()
+            || self.settings.is_some()
+            || self.page_menu.is_some()
+            || self.shortcuts_open
     }
 
     /// Ctrl+W. Ignored while an overlay is open.
@@ -1243,6 +1754,341 @@ impl NoteSec {
         self.show_page(ix, cx);
     }
 
+    // --- page context menu: rename, delete, copy title ----------------------
+
+    /// Right-click on a sidebar page: open its menu at `position`.
+    fn open_page_menu(
+        &mut self,
+        title: String,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        // Save the edited block first: Rename and Delete act on the file.
+        self.stop_edit(cx);
+        self.page_menu = Some(PageMenu {
+            title,
+            position,
+            step: MenuStep::Menu,
+        });
+        cx.notify();
+    }
+
+    fn close_page_menu(&mut self, cx: &mut Context<Self>) {
+        if self.page_menu.take().is_some() {
+            // The rename field's layout is stale now.
+            self.last_layout = None;
+            self.last_bounds = None;
+        }
+        cx.notify();
+    }
+
+    /// Journals are named by their date (`journals/YYYY_MM_DD.md`), so only
+    /// regular pages can be renamed.
+    fn can_rename(&self, title: &str) -> bool {
+        self.find_page(title)
+            .is_some_and(|ix| !self.pages[ix].is_journal)
+    }
+
+    /// The last page can't be deleted: there is always a page to show.
+    fn can_delete(&self) -> bool {
+        self.pages.len() > 1
+    }
+
+    /// "Rename": turn the menu into a text field holding the title, all
+    /// selected so typing replaces it.
+    fn start_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(title) = self.page_menu.as_ref().map(|m| m.title.clone()) else {
+            return;
+        };
+        if !self.can_rename(&title) {
+            return;
+        }
+        let mut editor = EditorState::new(&title);
+        editor.select_home();
+        if let Some(menu) = &mut self.page_menu {
+            menu.step = MenuStep::Rename {
+                editor,
+                error: None,
+            };
+        }
+        cx.notify();
+    }
+
+    /// Enter in the rename field: rename, or show why not and stay open.
+    fn confirm_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(PageMenu {
+            title,
+            step: MenuStep::Rename { editor, .. },
+            ..
+        }) = &self.page_menu
+        else {
+            return;
+        };
+        let (old, new) = (title.clone(), editor.text.clone());
+        match self.rename_page(&old, &new, cx) {
+            Ok(()) => self.close_page_menu(cx),
+            Err(message) => {
+                if let Some(PageMenu {
+                    step: MenuStep::Rename { error, .. },
+                    ..
+                }) = &mut self.page_menu
+                {
+                    *error = Some(message);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Rename the page called `old` to `new`: its file, its title, and
+    /// everything that refers to it by title (selection, tabs, favorites,
+    /// recent). `[[links]]` to the old name are left as they are (v1).
+    /// Returns a message for the user if the name can't be used.
+    fn rename_page(&mut self, old: &str, new: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let new = validate_title(new)?;
+        let ix = self
+            .find_page(old)
+            .ok_or_else(|| "This page no longer exists".to_string())?;
+        if self.pages[ix].is_journal {
+            return Err("Journal pages are named by their date".into());
+        }
+        let old = self.pages[ix].title.clone();
+        if new == old {
+            return Ok(());
+        }
+        // Another page with that name, ignoring case like links do (a
+        // case-only rename of this page is fine).
+        if self.find_page(&new).is_some_and(|other| other != ix) {
+            return Err(format!("A page named \u{201c}{new}\u{201d} already exists"));
+        }
+        self.stop_edit(cx);
+        self.storage
+            .rename(&self.pages[ix], &new)
+            .map_err(|err| format!("Could not rename the file: {err}"))?;
+
+        self.pages[ix].rename(&new);
+        // Favorites, recent and the custom order follow (in place) before
+        // re-sorting, so the page keeps its spot in a custom order.
+        if self.state.rename(&old, &new) {
+            self.save_state();
+        }
+        self.sort_pages();
+        self.tabs.rename(&old, &new);
+        self.forget_history();
+        if self.mode == Mode::Graph {
+            self.refresh_graph(cx);
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    /// "Delete" -> the confirm dialog.
+    fn ask_delete(&mut self, cx: &mut Context<Self>) {
+        if !self.can_delete() {
+            return;
+        }
+        if let Some(menu) = &mut self.page_menu {
+            menu.step = MenuStep::ConfirmDelete { error: None };
+        }
+        cx.notify();
+    }
+
+    /// The confirm dialog's Delete button.
+    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(title) = self.page_menu.as_ref().map(|m| m.title.clone()) else {
+            return;
+        };
+        match self.delete_page(&title, cx) {
+            Ok(()) => self.close_page_menu(cx),
+            Err(message) => {
+                if let Some(PageMenu {
+                    step: MenuStep::ConfirmDelete { error },
+                    ..
+                }) = &mut self.page_menu
+                {
+                    *error = Some(message);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Delete the page called `title`: its file (no trash in v1), the page,
+    /// its tabs (the neighbour tab takes focus, as when closing a tab) and
+    /// its favorites/recent entries.
+    fn delete_page(&mut self, title: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let ix = self
+            .find_page(title)
+            .ok_or_else(|| "This page no longer exists".to_string())?;
+        if !self.can_delete() {
+            return Err("The only page can't be deleted".into());
+        }
+        self.stop_edit(cx);
+        self.storage
+            .delete(&self.pages[ix])
+            .map_err(|err| format!("Could not delete the file: {err}"))?;
+
+        let current = &self.pages[self.selected];
+        let current = (current.title.clone(), current.is_journal);
+        let removed = self.pages.remove(ix);
+        // Keep `selected` valid; if it was the deleted page, `apply_tab`
+        // below moves it to whatever the focused tab shows.
+        self.selected = self
+            .pages
+            .iter()
+            .position(|p| p.title == current.0 && p.is_journal == current.1)
+            .unwrap_or(ix.min(self.pages.len() - 1));
+        self.tabs
+            .retain(|t| !matches!(t, TabTarget::Page(p) if *p == removed.title));
+        if self.state.forget(&removed.title) {
+            self.save_state();
+        }
+        self.forget_history();
+        self.apply_tab(cx);
+        Ok(())
+    }
+
+    /// Undo snapshots hold whole pages under their titles, and restoring
+    /// one saves every page in it, so replaying a snapshot from before a
+    /// rename or delete would write the old file back. Those two actions
+    /// can't be undone (v1), and edits from before them can't either.
+    fn forget_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.text_history_active = false;
+    }
+
+    /// "Copy page title": put the title on the clipboard.
+    fn copy_page_title(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = &self.page_menu {
+            cx.write_to_clipboard(ClipboardItem::new_string(menu.title.clone()));
+        }
+        self.close_page_menu(cx);
+    }
+
+    // --- custom page order: drag to reorder, "Sort pages A-Z" -----------------
+
+    /// Titles of the regular (non-journal) pages, in sidebar order.
+    fn regular_titles(&self) -> Vec<String> {
+        self.pages
+            .iter()
+            .filter(|p| !p.is_journal)
+            .map(|p| p.title.clone())
+            .collect()
+    }
+
+    /// The order of the regular pages after moving `dragged` to just before
+    /// `before` (`None`: to the end), or `None` if that changes nothing or
+    /// either page is unknown (journals aren't in this list).
+    fn reordered(&self, dragged: &str, before: Option<&str>) -> Option<Vec<String>> {
+        let mut order = self.regular_titles();
+        let from = order.iter().position(|t| t == dragged)?;
+        let to = match before {
+            Some(before) => order.iter().position(|t| t == before)?,
+            None => order.len(),
+        };
+        // Removing the page first shifts the places after it up by one.
+        let to = if to > from { to - 1 } else { to };
+        if to == from {
+            return None;
+        }
+        let title = order.remove(from);
+        order.insert(to, title);
+        Some(order)
+    }
+
+    /// A page is dragged over the drop zone `zone` (a page row by title, or
+    /// `None` for the end-of-list zone). In the zone's upper half the page
+    /// would go before `upper`, in its lower half before `lower` (`None`:
+    /// at the end). Every zone hears every move, so a zone only clears the
+    /// drop position it set itself.
+    fn drag_over_zone(
+        &mut self,
+        event: &DragMoveEvent<DraggedPage>,
+        zone: Option<String>,
+        upper: Option<String>,
+        lower: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let position = event.event.position;
+        if !event.bounds.dilate(px(ROW_GAP_HALF)).contains(&position) {
+            if self.page_drop.as_ref().is_some_and(|d| d.zone == zone) {
+                self.page_drop = None;
+                cx.notify();
+            }
+            return;
+        }
+        let before = if position.y < event.bounds.center().y {
+            upper
+        } else {
+            lower
+        };
+        let dragged = event.drag(cx).title.clone();
+        // No indicator where dropping would leave the order as it is.
+        let drop = self
+            .reordered(&dragged, before.as_deref())
+            .map(|_| PageDrop { zone, before });
+        if self.page_drop != drop {
+            self.page_drop = drop;
+            cx.notify();
+        }
+    }
+
+    /// A dragged page was released over the sidebar: move it to the drop
+    /// position shown, and save that as the custom order.
+    fn drop_page(&mut self, dragged: &str, cx: &mut Context<Self>) {
+        if let Some(drop) = self.page_drop.take() {
+            if let Some(order) = self.reordered(dragged, drop.before.as_deref()) {
+                self.state.page_order = order;
+                self.save_state();
+                self.sort_pages();
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Sort pages A-Z" (palette or page menu): forget the custom order.
+    fn sort_pages_az(&mut self, cx: &mut Context<Self>) {
+        self.close_page_menu(cx);
+        if !self.state.page_order.is_empty() {
+            self.state.page_order.clear();
+            self.save_state();
+            self.sort_pages();
+        }
+        cx.notify();
+    }
+
+    // --- agenda ----------------------------------------------------------------
+
+    /// "Open agenda" (palette, sidebar): open or focus the agenda tab.
+    fn show_agenda(&mut self, cx: &mut Context<Self>) {
+        // Save the block being edited so the agenda sees it.
+        self.stop_edit(cx);
+        self.tabs.open(TabTarget::Agenda);
+        self.apply_tab(cx);
+    }
+
+    /// The agenda as of now.
+    fn agenda(&self) -> Agenda {
+        Agenda::build(&self.pages, chrono::Local::now().date_naive())
+    }
+
+    /// Clicking an agenda item: open its page in a tab (the agenda tab
+    /// stays, like the graph's) and unfold the task's block. It is not put
+    /// in edit mode: the block holds the date marker on a second line, and
+    /// the editor is single-line on this branch.
+    fn open_agenda_item(&mut self, page: &str, block: uuid::Uuid, cx: &mut Context<Self>) {
+        self.navigate(page, Nav::Tab, cx);
+        if let Some(ix) = self.pages[self.selected]
+            .blocks
+            .iter()
+            .position(|b| b.id == block)
+        {
+            self.reveal(ix);
+        }
+        cx.notify();
+    }
+
     // --- graph view ------------------------------------------------------------
 
     /// Open (or focus) the graph tab, creating the graph on first use.
@@ -1251,6 +2097,15 @@ impl NoteSec {
         self.stop_edit(cx);
         self.tabs.open(TabTarget::Graph);
         self.apply_tab(cx);
+    }
+
+    /// "Toggle local graph" (palette): show the graph tab and switch it
+    /// between the whole graph and the current page's neighbourhood.
+    fn toggle_local_graph(&mut self, cx: &mut Context<Self>) {
+        self.show_graph(cx);
+        if let Some(graph) = self.graph.clone() {
+            graph.update(cx, |g, cx| g.toggle_scope(cx));
+        }
     }
 
     /// Create the graph view, or give it the current pages.
@@ -1378,8 +2233,11 @@ impl NoteSec {
     }
 
     fn start_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        // Never edit under the settings panel (e.g. Ctrl-N while it is open).
+        // Never edit under the settings panel, a page menu or the shortcuts
+        // list (e.g. Ctrl-N while one is open).
         self.settings = None;
+        self.page_menu = None;
+        self.shortcuts_open = false;
         self.commit();
         self.text_history_active = false;
         self.load_editor(ix, false);
@@ -1409,6 +2267,10 @@ impl NoteSec {
 
     /// Enter: split the block at the cursor; the right half becomes a new block.
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming() {
+            self.confirm_rename(cx);
+            return;
+        }
         if self.search.is_some() {
             self.confirm_search(window, cx);
             return;
@@ -1555,7 +2417,7 @@ impl NoteSec {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() {
+        if self.text_input_open() {
             self.active_editor_mut().backspace();
             self.text_changed();
             cx.notify();
@@ -1597,10 +2459,10 @@ impl NoteSec {
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
         // With the menu open, the "/query" becomes text before deleting.
         self.close_slash_as_typing();
-        if self.editing.is_some() || self.search.is_some() {
+        if self.editing.is_some() || self.text_input_open() {
             self.text_history_active = false;
             let before = self.history_state();
-            if self.active_editor_mut().delete() && self.search.is_none() {
+            if self.active_editor_mut().delete() && !self.text_input_open() {
                 self.record_state(before);
             }
             self.text_changed();
@@ -1903,7 +2765,7 @@ impl NoteSec {
     /// (`-1`) or below (`1`), keeping its horizontal position. False when
     /// there is no such line, so Up and Down move to the next block instead.
     fn move_cursor_line(&mut self, direction: isize, cx: &mut Context<Self>) -> bool {
-        if self.editing.is_none() {
+        if self.editing.is_none() || self.text_input_open() {
             return false;
         }
         let Some(lines) = self.last_layout.as_ref() else {
@@ -1929,8 +2791,10 @@ impl NoteSec {
     /// Shift+Enter: a line break inside the block (Enter starts a new
     /// block). Pipe tables are written this way, one row per line.
     fn new_line(&mut self, _: &NewLine, _: &mut Window, cx: &mut Context<Self>) {
+        // The palette and the rename field are single-line (a page name
+        // can't hold a line break).
         if self.editing.is_none()
-            || self.search.is_some()
+            || self.text_input_open()
             || self.slash.is_some()
             || self.ref_menu_open()
         {
@@ -1945,7 +2809,12 @@ impl NoteSec {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.page_menu.is_some() {
+            // Closes the menu, cancels a rename or a delete.
+            self.close_page_menu(cx);
+        } else if self.shortcuts_open {
+            self.close_shortcuts(cx);
+        } else if self.settings.is_some() {
             self.close_settings(cx);
         } else if self.search.is_some() {
             self.close_search(cx);
@@ -1973,7 +2842,7 @@ impl NoteSec {
             gpui::ClipboardEntry::Image(image) => Some(image.bytes.clone()),
             _ => None,
         });
-        if let (Some(bytes), true) = (image, self.search.is_none() && self.editing.is_some()) {
+        if let (Some(bytes), true) = (image, !self.text_input_open() && self.editing.is_some()) {
             self.add_images(vec![bytes], cx);
             return;
         }
@@ -2032,6 +2901,11 @@ impl NoteSec {
     /// at the cursor of the edited block, or else in a new block at the end
     /// of the page, one per image. One undo step either way (the files stay).
     fn add_images(&mut self, images: Vec<Vec<u8>>, cx: &mut Context<Self>) {
+        // The palette or the rename field has the keyboard: no block to
+        // put them in, so don't save anything either.
+        if self.text_input_open() {
+            return;
+        }
         let refs: Vec<String> = images
             .iter()
             .filter_map(|bytes| {
@@ -2046,9 +2920,6 @@ impl NoteSec {
             })
             .collect();
         if refs.is_empty() {
-            return;
-        }
-        if self.search.is_some() {
             return;
         }
         self.close_slash_as_typing();
@@ -2284,14 +3155,29 @@ fn create_journal(storage: &Storage, title: &str) -> Page {
     page
 }
 
-/// Journals first (newest first, since `YYYY-MM-DD` sorts lexically), then
-/// regular pages alphabetically.
-fn sort_pages(pages: &mut [Page]) {
+/// Sidebar order. Journals first, newest first (`YYYY-MM-DD` sorts
+/// lexically); they always keep date order. Then regular pages: those named
+/// in `order` (the custom order from `state.toml`, matched ignoring case)
+/// in that order, then any others alphabetically. An empty `order` is
+/// plain alphabetical; entries without a page are ignored.
+fn sort_pages(pages: &mut [Page], order: &[String]) {
+    let mut rank = HashMap::new();
+    for (i, title) in order.iter().enumerate() {
+        rank.entry(title.to_lowercase()).or_insert(i);
+    }
+    // Listed pages by their position, then the rest alphabetically.
+    let key = |p: &Page| {
+        let title = p.title.to_lowercase();
+        match rank.get(&title) {
+            Some(&r) => (0, r, String::new()),
+            None => (1, 0, title),
+        }
+    };
     pages.sort_by(|a, b| match (a.is_journal, b.is_journal) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         (true, true) => b.title.cmp(&a.title),
-        (false, false) => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+        (false, false) => key(a).cmp(&key(b)),
     });
 }
 
@@ -2985,10 +3871,479 @@ impl NoteSec {
     }
 }
 
+impl NoteSec {
+    /// The page menu overlay: the right-click menu (or the rename field it
+    /// turns into) at the click position, or the delete confirmation. A
+    /// full-window backdrop closes it on any click outside (left or right);
+    /// `occlude` keeps clicks inside the panel from reaching the backdrop.
+    fn render_page_menu(&self, menu: &PageMenu, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let panel = || {
+            div()
+                .occlude()
+                .flex()
+                .flex_col()
+                .p_1()
+                .rounded_lg()
+                .bg(theme.sidebar_bg)
+                .border_1()
+                .border_color(theme.border)
+                .shadow_lg()
+        };
+
+        if let MenuStep::ConfirmDelete { error } = &menu.step {
+            // A modal like the settings panel: dimmed backdrop, centred box.
+            let title = menu.title.clone();
+            return div()
+                .id("confirm-delete-backdrop")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(gpui::black().opacity(0.45))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(160.0))
+                .on_click(cx.listener(|this, _e, _window, cx| this.close_page_menu(cx)))
+                .child(
+                    panel()
+                        .id("confirm-delete")
+                        .debug_selector(|| "confirm-delete".to_string())
+                        .w(px(420.0))
+                        .gap_2()
+                        .p_4()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::BOLD)
+                                .child(format!("Delete \u{201c}{title}\u{201d}?")),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.muted)
+                                .child("Its file is deleted from the graph. This can't be undone."),
+                        )
+                        .when_some(error.clone(), |d, error| {
+                            d.child(div().text_color(theme.danger).child(error))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("confirm-delete-cancel")
+                                        .debug_selector(|| "confirm-delete-cancel".to_string())
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(theme.selected_bg))
+                                        .on_click(cx.listener(|this, _e, _window, cx| {
+                                            this.close_page_menu(cx)
+                                        }))
+                                        .child("Cancel"),
+                                )
+                                .child(
+                                    div()
+                                        .id("confirm-delete-ok")
+                                        .debug_selector(|| "confirm-delete-ok".to_string())
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(theme.danger)
+                                        .text_color(theme.bg)
+                                        .font_weight(FontWeight::BOLD)
+                                        .cursor_pointer()
+                                        .hover(|d| d.opacity(0.85))
+                                        .on_click(cx.listener(|this, _e, _window, cx| {
+                                            this.confirm_delete(cx)
+                                        }))
+                                        .child("Delete"),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
+
+        let content = match &menu.step {
+            MenuStep::Rename { error, .. } => panel()
+                .w(px(300.0))
+                .gap_1()
+                .p_2()
+                .child(div().px_1().text_color(theme.muted).child("Rename page"))
+                .child(
+                    div()
+                        .debug_selector(|| "rename-input".to_string())
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.accent)
+                        .bg(theme.bg)
+                        .child(BlockText { app: cx.entity() }),
+                )
+                .when_some(error.clone(), |d, error| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "rename-error".to_string())
+                            .px_1()
+                            .text_color(theme.danger)
+                            .child(error),
+                    )
+                })
+                .child(
+                    div()
+                        .px_1()
+                        .text_color(theme.muted)
+                        .child("Enter to rename, Esc to cancel"),
+                )
+                .into_any_element(),
+            _ => {
+                // One menu row; a disabled one is muted and has no handler.
+                let item = |id: &'static str, label: &'static str, enabled: bool| {
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.to_string())
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .text_color(if enabled { theme.text } else { theme.muted })
+                        .when(enabled, |d| {
+                            d.cursor_pointer().hover(|d| d.bg(theme.selected_bg))
+                        })
+                        .child(label)
+                };
+                let can_rename = self.can_rename(&menu.title);
+                let can_delete = self.can_delete();
+                let custom_order = !self.state.page_order.is_empty();
+                panel()
+                    .id("page-menu")
+                    .debug_selector(|| "page-menu".to_string())
+                    .w(px(200.0))
+                    .child(
+                        item("page-menu-rename", "Rename", can_rename).when(can_rename, |d| {
+                            d.on_click(cx.listener(|this, _e, _window, cx| this.start_rename(cx)))
+                        }),
+                    )
+                    .child(item("page-menu-delete", "Delete\u{2026}", can_delete).when(
+                        can_delete,
+                        |d| {
+                            d.text_color(theme.danger)
+                                .on_click(cx.listener(|this, _e, _window, cx| this.ask_delete(cx)))
+                        },
+                    ))
+                    .child(
+                        item("page-menu-copy", "Copy page title", true).on_click(
+                            cx.listener(|this, _e, _window, cx| this.copy_page_title(cx)),
+                        ),
+                    )
+                    // Only useful once pages were dragged out of A-Z order.
+                    .child(div().my_1().h(px(1.0)).bg(theme.border))
+                    .child(
+                        item("page-menu-sort", "Sort pages A-Z", custom_order).when(
+                            custom_order,
+                            |d| {
+                                d.on_click(
+                                    cx.listener(|this, _e, _window, cx| this.sort_pages_az(cx)),
+                                )
+                            },
+                        ),
+                    )
+                    .into_any_element()
+            }
+        };
+
+        div()
+            .id("page-menu-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, _window, cx| this.close_page_menu(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _e, _window, cx| this.close_page_menu(cx)),
+            )
+            // Window coordinates of the click; `anchored` flips or shifts the
+            // panel so it stays inside the window.
+            .child(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(content),
+            )
+            .into_any_element()
+    }
+}
+
+impl NoteSec {
+    /// The keyboard shortcuts dialog (Ctrl+/ or "Keyboard shortcuts"): the
+    /// `shortcuts` table, grouped, in a modal like the settings panel.
+    fn render_shortcuts(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let mut children: Vec<AnyElement> = Vec::new();
+        let mut n: usize = 0;
+        for (group, rows) in cheatsheet(&shortcuts()) {
+            children.push(
+                div()
+                    .mt_2()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.accent)
+                    .child(group.label())
+                    .into_any_element(),
+            );
+            for (keys, description) in rows {
+                let i = n;
+                n += 1;
+                children.push(
+                    div()
+                        .debug_selector(move || format!("shortcut-row-{i}"))
+                        .flex()
+                        .flex_row()
+                        .gap_3()
+                        .py(px(2.0))
+                        .child(
+                            div()
+                                .w(px(200.0))
+                                .flex_shrink_0()
+                                .text_color(theme.text)
+                                .child(keys),
+                        )
+                        .child(div().text_color(theme.muted).child(description))
+                        .into_any_element(),
+                );
+            }
+        }
+        div()
+            .id("shortcuts-backdrop")
+            .debug_selector(|| "shortcuts-backdrop".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(gpui::black().opacity(0.45))
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(60.0))
+            .on_click(cx.listener(|this, _e, _window, cx| this.close_shortcuts(cx)))
+            .child(
+                div()
+                    .id("shortcuts-dialog")
+                    .debug_selector(|| "shortcuts-dialog".to_string())
+                    .occlude()
+                    .w(px(600.0))
+                    .max_h(px(620.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Keyboard shortcuts"),
+                            )
+                            .child(div().text_color(theme.muted).child("Esc to close")),
+                    )
+                    .children(children),
+            )
+            .into_any_element()
+    }
+
+    /// The agenda tab: open tasks in Overdue, Today, Upcoming (one header
+    /// per day) and Unscheduled sections. Rows are numbered top to bottom
+    /// (`agenda-item-{i}`).
+    fn render_agenda(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let agenda = self.agenda();
+        let today = chrono::Local::now().date_naive();
+        let mut children: Vec<AnyElement> = Vec::new();
+        let mut next: usize = 0;
+
+        let header = |id: &'static str, label: String, color: gpui::Rgba| {
+            div()
+                .debug_selector(move || id.to_string())
+                .mt_4()
+                .px_3()
+                .py_1()
+                .text_color(color)
+                .child(label)
+                .into_any_element()
+        };
+        let mut row =
+            |item: &AgendaItem| {
+                let i = next;
+                next += 1;
+                let (page, block) = (item.page.clone(), item.block);
+                let started = item.state.is_started();
+                let date = |kind: &str, d: Option<crate::agenda::AgendaDate>, late: bool| {
+                    d.map(|d| {
+                        div()
+                            .flex_shrink_0()
+                            .text_color(if late { theme.danger } else { theme.muted })
+                            .child(format!("{kind} {}", d.label()))
+                    })
+                };
+                div()
+                    .id(("agenda-item", i))
+                    .debug_selector(move || format!("agenda-item-{i}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.selected_bg))
+                    .on_click(cx.listener(move |this, _e, _window, cx| {
+                        this.open_agenda_item(&page, block, cx)
+                    }))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if started { theme.accent } else { theme.border })
+                            .text_color(if started { theme.accent } else { theme.muted })
+                            .child(item.state.keyword()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.text)
+                            .child(item.text.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .max_w(px(180.0))
+                            .truncate()
+                            .text_color(theme.muted)
+                            .child(item.page.clone()),
+                    )
+                    .children(date(
+                        "Scheduled",
+                        item.dates.scheduled,
+                        item.dates.scheduled.is_some_and(|d| d.date < today),
+                    ))
+                    .children(date(
+                        "Deadline",
+                        item.dates.deadline,
+                        item.dates.deadline.is_some_and(|d| d.date < today),
+                    ))
+                    .into_any_element()
+            };
+
+        if !agenda.overdue.is_empty() {
+            children.push(header(
+                "agenda-group-overdue",
+                format!("OVERDUE \u{b7} {}", agenda.overdue.len()),
+                theme.danger,
+            ));
+            children.extend(agenda.overdue.iter().map(&mut row));
+        }
+        if !agenda.today.is_empty() {
+            children.push(header(
+                "agenda-group-today",
+                format!("TODAY \u{b7} {}", day_label(today)),
+                theme.accent,
+            ));
+            children.extend(agenda.today.iter().map(&mut row));
+        }
+        if !agenda.upcoming.is_empty() {
+            children.push(header(
+                "agenda-group-upcoming",
+                "UPCOMING".to_string(),
+                theme.muted,
+            ));
+            for (day, items) in &agenda.upcoming {
+                children.push(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .text_color(theme.text)
+                        .child(day_label(*day))
+                        .into_any_element(),
+                );
+                children.extend(items.iter().map(&mut row));
+            }
+        }
+        if !agenda.unscheduled.is_empty() {
+            children.push(header(
+                "agenda-group-unscheduled",
+                format!("UNSCHEDULED \u{b7} {}", agenda.unscheduled.len()),
+                theme.muted,
+            ));
+            children.extend(agenda.unscheduled.iter().map(&mut row));
+        }
+        if agenda.is_empty() {
+            children.push(
+                div()
+                    .mt_4()
+                    .px_3()
+                    .text_color(theme.muted)
+                    .child(
+                        "No open tasks. Start a block with TODO; date it with a line \
+                         SCHEDULED: <2026-10-09> or DEADLINE: <2026-10-09> under it.",
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .id("agenda")
+            .debug_selector(|| "agenda".to_string())
+            .flex_1()
+            .h_full()
+            .overflow_y_scroll()
+            .p_8()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(px(self.config.font_size * 1.9))
+                    .text_color(theme.text)
+                    .child("Agenda"),
+            )
+            .children(children)
+            .into_any_element()
+    }
+}
+
 impl Render for NoteSec {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A drag released outside the sidebar just ends (GPUI drops it), so
+        // forget where it would have landed.
+        if !cx.has_active_drag() {
+            self.page_drop = None;
+        }
         let theme = self.theme;
         let font_size = self.config.font_size;
+        // Shortcut hints are read from the keymap (`bind_keys`), so they
+        // always show the real binding.
+        let keymap = cx.key_bindings();
+        let hint = move |action: &dyn gpui::Action| -> String {
+            binding_hint(&keymap.borrow(), action).unwrap_or_default()
+        };
         // Style for `[[wikilinks]]` in display mode: accent colour + underline.
         let link_style = HighlightStyle {
             color: Some(theme.accent.into()),
@@ -3021,11 +4376,35 @@ impl Render for NoteSec {
         };
 
         // --- Sidebar: one clickable row per page ---------------------------
+        // The accent line showing where a dragged page would land: above the
+        // row it is drawn in, in the gap between rows.
+        let page_drop_line = move || {
+            div()
+                .debug_selector(|| "page-drop-indicator".to_string())
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(-3.0))
+                .h(px(2.0))
+                .rounded_sm()
+                .bg(theme.accent)
+        };
+        let drop_before = self.page_drop.as_ref().map(|d| d.before.clone());
+        let preview_font = self.font_family.clone();
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = self.mode == Mode::Notes && ix == self.selected;
             let is_favorite = self.state.is_favorite(&page.title);
             let title = page.title.clone();
             let star_title = page.title.clone();
+            let menu_title = page.title.clone();
+            let drop_here = drop_before == Some(Some(page.title.clone()));
+            // Regular pages can be dragged to reorder them; journals keep
+            // their date order. Journals come first, so whatever follows a
+            // regular page is regular too.
+            let drag = (!page.is_journal).then(|| {
+                let next = self.pages.get(ix + 1).map(|p| p.title.clone());
+                (page.title.clone(), next, preview_font.clone())
+            });
             div()
                 // Interactive elements need a stable id; (name, index) is the idiom.
                 .id(("page", ix))
@@ -3061,6 +4440,35 @@ impl Render for NoteSec {
                     };
                     this.show_page(ix, cx);
                 }))
+                // Right-click: Rename / Delete / Copy page title.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        this.open_page_menu(menu_title.clone(), event.position, cx)
+                    }),
+                )
+                .when_some(drag, |d, (zone, next, font_family)| {
+                    let dragged = DraggedPage {
+                        title: zone.clone(),
+                    };
+                    d.on_drag(dragged, move |page: &DraggedPage, _offset, _window, cx| {
+                        let font_family = font_family.clone();
+                        cx.new(|_| PageDragPreview {
+                            title: page.title.clone().into(),
+                            theme,
+                            font_size,
+                            font_family,
+                        })
+                    })
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<DraggedPage>, _window, cx| {
+                            let zone = Some(zone.clone());
+                            this.drag_over_zone(event, zone.clone(), zone, next.clone(), cx)
+                        },
+                    ))
+                })
+                .relative()
+                .when(drop_here, |d| d.child(page_drop_line()))
                 .child(div().flex_1().overflow_hidden().child(page.title.clone()))
                 .child(
                     favorite_star(&theme, is_favorite)
@@ -3090,6 +4498,7 @@ impl Render for NoteSec {
         let shortcut_row = |id: ElementId, selector: String, title: &str| {
             let is_current = current_title.as_deref() == Some(title.to_lowercase().as_str());
             let target = title.to_string();
+            let menu_title = title.to_string();
             div()
                 .id(id)
                 .debug_selector(move || selector)
@@ -3109,6 +4518,12 @@ impl Render for NoteSec {
                 .on_click(cx.listener(move |this, _e, _window, cx| {
                     this.open_page(&target, cx);
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        this.open_page_menu(menu_title.clone(), event.position, cx)
+                    }),
+                )
                 .child(div().flex_1().overflow_hidden().child(title.to_string()))
         };
         let existing = |titles: &[String]| -> Vec<(usize, String)> {
@@ -3210,7 +4625,7 @@ impl Render for NoteSec {
             .hover(|d| d.bg(theme.selected_bg))
             .on_click(cx.listener(|this, _e, _window, cx| this.open_today(cx)))
             .child("Today")
-            .child(div().text_color(theme.muted).child("Ctrl-J"));
+            .child(div().text_color(theme.muted).child(hint(&OpenToday)));
 
         // "Graph view" entry above the page list; highlighted while open.
         let in_graph = self.mode == Mode::Graph;
@@ -3226,6 +4641,21 @@ impl Render for NoteSec {
             .hover(|d| d.bg(theme.selected_bg))
             .on_click(cx.listener(|this, _e, _window, cx| this.toggle_graph(cx)))
             .child("Graph view");
+
+        // "Agenda" entry: open tasks by date; highlighted while open.
+        let in_agenda = self.mode == Mode::Agenda;
+        let agenda_item = div()
+            .id("sidebar-agenda")
+            .debug_selector(|| "sidebar-agenda".to_string())
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(if in_agenda { theme.accent } else { theme.text })
+            .when(in_agenda, |d| d.bg(theme.selected_bg))
+            .hover(|d| d.bg(theme.selected_bg))
+            .on_click(cx.listener(|this, _e, _window, cx| this.show_agenda(cx)))
+            .child("Agenda");
 
         let pages_header = div()
             .px_3()
@@ -3268,11 +4698,29 @@ impl Render for NoteSec {
             .hover(|d| d.bg(theme.selected_bg))
             .on_click(cx.listener(|this, _e, _window, cx| this.open_settings(cx)))
             .child("Settings")
-            .child(div().text_color(theme.muted).child("Ctrl-,"));
+            .child(div().text_color(theme.muted).child(hint(&OpenSettings)));
+
+        // Below the last page: dropping here moves a page to the very end.
+        let drop_end = div()
+            .id("page-drop-end")
+            .debug_selector(|| "page-drop-end".to_string())
+            .relative()
+            .h(px(12.0))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedPage>, _window, cx| {
+                    this.drag_over_zone(event, None, None, None, cx)
+                }),
+            )
+            .when(drop_before == Some(None), |d| d.child(page_drop_line()));
 
         let sidebar_list = div()
             .id("sidebar")
             .debug_selector(|| "sidebar".to_string())
+            // A page dragged anywhere in the list lands where the indicator
+            // is (nowhere if none is shown).
+            .on_drop(cx.listener(|this, dragged: &DraggedPage, _window, cx| {
+                this.drop_page(&dragged.title, cx)
+            }))
             .flex_1()
             .min_h_0()
             .flex()
@@ -3282,6 +4730,7 @@ impl Render for NoteSec {
             .overflow_y_scroll()
             .child(today_item)
             .child(graph_item)
+            .child(agenda_item)
             .when(!favorite_rows.is_empty(), |d| {
                 d.child(section_header("FAVORITES")).children(favorite_rows)
             })
@@ -3290,6 +4739,7 @@ impl Render for NoteSec {
             })
             .child(pages_header)
             .children(sidebar_items)
+            .child(drop_end)
             .when(has_tags, |d| {
                 d.child(
                     div()
@@ -4050,10 +5500,12 @@ impl Render for NoteSec {
             let hits = self.search_results();
             let selected = state.selected;
             let templates = state.templates.as_deref();
+            let headers: Vec<Option<&'static str>> =
+                (0..hits.len()).map(|i| palette_header(&hits, i)).collect();
             let rows: Vec<AnyElement> =
                 hits.into_iter()
                     .enumerate()
-                    .map(|(i, hit)| {
+                    .flat_map(|(i, hit)| {
                         // Page hit: just the title. Block hit: the text, then the
                         // page it lives on. Command: its label and a muted tag.
                         // (Muted text is the secondary column in each case.)
@@ -4077,10 +5529,20 @@ impl Render for NoteSec {
                                     .child(self.pages[p].blocks[b].content.clone()),
                                 self.pages[p].title.clone(),
                             ),
-                            Target::Command(c) => row(
-                                div().text_color(theme.text).child(c.label()),
-                                "command".into(),
-                            ),
+                            // The shortcut hint, right-aligned and muted.
+                            Target::Command(c) => div()
+                                .debug_selector(move || format!("command-{}", c.name()))
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .gap_2()
+                                .child(div().text_color(theme.text).child(c.label()))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(theme.muted)
+                                        .child(hint(c.action().as_ref())),
+                                ),
                             Target::Template(t) => row(
                                 div().text_color(theme.accent).child(
                                     templates.map_or(String::new(), |ts| ts[t].name.clone()),
@@ -4088,9 +5550,21 @@ impl Render for NoteSec {
                                 "template".into(),
                             ),
                         };
-                        div()
+                        let header = headers[i].map(|title| {
+                            div()
+                                .debug_selector(move || {
+                                    format!("palette-{}-header", title.to_lowercase())
+                                })
+                                .px_3()
+                                .pt_2()
+                                .text_color(theme.muted)
+                                .child(title)
+                                .into_any_element()
+                        });
+                        let row = div()
                             .id(("search-result", i))
                             .debug_selector(|| format!("search-result-{i}"))
+                            .flex_shrink_0()
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -4101,7 +5575,8 @@ impl Render for NoteSec {
                                 this.open_hit(&hit, window, cx);
                             }))
                             .child(label)
-                            .into_any_element()
+                            .into_any_element();
+                        header.into_iter().chain(std::iter::once(row))
                     })
                     .collect();
             let no_results = rows.is_empty();
@@ -4162,7 +5637,18 @@ impl Render for NoteSec {
                                 .bg(theme.bg)
                                 .child(BlockText { app: cx.entity() }),
                         )
-                        .children(rows)
+                        // Scrolls: an empty query lists every command.
+                        .child(
+                            div()
+                                .id("search-results")
+                                .max_h(px(PALETTE_LIST_HEIGHT))
+                                .overflow_y_scroll()
+                                .track_scroll(&state.scroll)
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .children(rows),
+                        )
                         .when(no_results, |d| {
                             d.child(
                                 div()
@@ -4186,6 +5672,7 @@ impl Render for NoteSec {
                 let label = match tab {
                     TabTarget::Page(title) => title.clone(),
                     TabTarget::Graph => "Graph".to_string(),
+                    TabTarget::Agenda => "Agenda".to_string(),
                 };
                 div()
                     .id(("tab", i))
@@ -4241,7 +5728,7 @@ impl Render for NoteSec {
 
         // No tabs: say so and offer the usual ways to open one.
         let empty_state = || {
-            let hint = |keys: &'static str, what: &'static str| {
+            let hint_row = |keys: String, what: &'static str| {
                 div()
                     .flex()
                     .flex_row()
@@ -4283,11 +5770,15 @@ impl Render for NoteSec {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(hint("Ctrl-J", "today's journal"))
-                        .child(hint("Ctrl-K", "search pages and blocks"))
-                        .child(hint("Ctrl-N", "new page"))
-                        .child(hint("Ctrl-G", "graph view"))
-                        .child(hint("", "or pick a page in the sidebar")),
+                        .child(hint_row(hint(&OpenToday), "today's journal"))
+                        .child(hint_row(
+                            hint(&ToggleSearch),
+                            "search pages, blocks and commands",
+                        ))
+                        .child(hint_row(hint(&NewPage), "new page"))
+                        .child(hint_row(hint(&ToggleGraph), "graph view"))
+                        .child(hint_row(hint(&ShowShortcuts), "keyboard shortcuts"))
+                        .child(hint_row(String::new(), "or pick a page in the sidebar")),
                 )
         };
 
@@ -4295,6 +5786,7 @@ impl Render for NoteSec {
         // state.
         let view: AnyElement = match (&self.mode, &self.graph) {
             (Mode::Graph, Some(graph)) => graph.clone().into_any_element(),
+            (Mode::Agenda, _) => self.render_agenda(cx),
             (Mode::Empty, _) => empty_state().into_any_element(),
             _ => main.into_any_element(),
         };
@@ -4312,8 +5804,17 @@ impl Render for NoteSec {
             .as_ref()
             .map(|state| self.render_settings(state, cx));
 
-        let is_editing = self.editing.is_some() || self.search.is_some();
-        let settings_open = self.settings.is_some();
+        let page_menu_overlay = self
+            .page_menu
+            .as_ref()
+            .map(|menu| self.render_page_menu(menu, cx));
+
+        let shortcuts_overlay = self.shortcuts_open.then(|| self.render_shortcuts(cx));
+
+        let is_editing = self.editing.is_some() || self.text_input_open();
+        let shortcuts_open = self.shortcuts_open;
+        let settings_open = self.settings.is_some() && !shortcuts_open;
+        let page_menu_open = self.page_menu.is_some() && !is_editing && !shortcuts_open;
         div()
             .size_full()
             .relative()
@@ -4328,9 +5829,13 @@ impl Render for NoteSec {
             // The key context only exists while editing, which is what makes
             // the "BlockEditor" key bindings conditional. The settings panel
             // takes over the keyboard context while it is open.
+            .when(shortcuts_open, |d| d.key_context("Shortcuts"))
             .when(settings_open, |d| d.key_context("Settings"))
-            .when(!settings_open && is_editing, |d| {
+            .when(!shortcuts_open && !settings_open && is_editing, |d| {
                 d.key_context("BlockEditor")
+            })
+            .when(!settings_open && page_menu_open, |d| {
+                d.key_context("PageMenu")
             })
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::tab))
@@ -4373,10 +5878,25 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_decrease_font))
             .on_action(cx.listener(Self::on_reset_font))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_open_agenda))
+            .on_action(cx.listener(Self::on_rename_page))
+            .on_action(cx.listener(Self::on_delete_page))
+            .on_action(cx.listener(Self::on_copy_page_title))
+            .on_action(cx.listener(Self::on_toggle_favorite))
+            .on_action(cx.listener(Self::on_sort_pages_az))
+            .on_action(cx.listener(Self::on_insert_template))
+            .on_action(cx.listener(Self::on_collapse_all))
+            .on_action(cx.listener(Self::on_expand_all))
+            .on_action(cx.listener(Self::on_toggle_local_graph))
+            .on_action(cx.listener(Self::on_fit_graph))
+            .on_action(cx.listener(Self::on_toggle_graph_journals))
+            .on_action(cx.listener(Self::on_show_shortcuts))
             .child(sidebar)
             .child(content)
             .children(overlay)
             .children(settings_overlay)
+            .children(page_menu_overlay)
+            .children(shortcuts_overlay)
     }
 }
 
@@ -4384,6 +5904,7 @@ impl Render for NoteSec {
 mod tests {
     use super::*;
     use crate::config::ThemeKind;
+    use crate::graph_view::Scope;
     use crate::state::MAX_RECENT;
     use gpui::{
         Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
@@ -5369,7 +6890,7 @@ mod tests {
 
         // The palette command toggles the view too.
         cx.simulate_keystrokes("ctrl-k");
-        cx.simulate_input("graph");
+        cx.simulate_input("toggle graph view");
         cx.simulate_keystrokes("enter");
         view.update(cx, |app, _| assert_eq!(app.mode, Mode::Notes));
         let _ = std::fs::remove_dir_all(dir);
@@ -5402,6 +6923,79 @@ mod tests {
             graph.update(cx, |g, _| g.is_pinned("Zed")),
             "dragged node is still pinned"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn graph_titles(graph: &Entity<GraphView>, cx: &mut VisualTestContext) -> Vec<String> {
+        let mut titles = graph.update(cx, |g, _| g.node_titles());
+        titles.sort();
+        titles
+    }
+
+    #[gpui::test]
+    fn local_graph_toggle_shows_neighbours_and_nodes_still_open_pages(cx: &mut TestAppContext) {
+        let pages = [
+            ("Test", "- links to [[Alpha]] about #topic\n"),
+            ("Alpha", "- back to [[Test]] and [[Zed]]\n"),
+            ("Zed", "- leaf\n"),
+            ("topic", "- tag page\n"),
+            ("Island", "- alone\n"),
+        ];
+        let (view, cx, dir) = setup_pages(cx, "graph-local", &pages, "Test");
+        let today = today_title();
+        let mut all = vec!["Alpha", "Island", "Test", "Zed", "topic", today.as_str()]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        all.sort();
+        let (graph, _) = open_graph(&view, cx);
+        assert_eq!(graph_titles(&graph, cx), all, "global by default");
+
+        // Local: the open page, the page it links to and its tag.
+        click_on(cx, "graph-mode-local");
+        assert_eq!(graph.update(cx, |g, _| g.scope()), Scope::Local);
+        assert_eq!(graph_titles(&graph, cx), vec!["Alpha", "Test", "topic"]);
+        // Two hops reach Zed (via Alpha); one hop again drops it.
+        click_on(cx, "graph-local-depth");
+        assert_eq!(
+            graph_titles(&graph, cx),
+            vec!["Alpha", "Test", "Zed", "topic"]
+        );
+        click_on(cx, "graph-local-depth");
+        assert_eq!(graph_titles(&graph, cx), vec!["Alpha", "Test", "topic"]);
+
+        // Clicking a node still opens its page (in a page tab).
+        let canvas = cx.debug_bounds("graph-canvas").expect("canvas drawn");
+        let alpha = node_pos(&graph, canvas, "Alpha", cx);
+        cx.simulate_click(alpha, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Notes);
+            assert_eq!(app.pages[app.selected].title, "Alpha");
+        });
+
+        // Back in the graph: still local, now around Alpha (incoming link
+        // from Test, outgoing to Zed).
+        let (graph, _) = open_graph_again(&view, cx);
+        assert_eq!(graph.update(cx, |g, _| g.scope()), Scope::Local);
+        assert_eq!(graph_titles(&graph, cx), vec!["Alpha", "Test", "Zed"]);
+
+        click_on(cx, "graph-mode-global");
+        assert_eq!(graph_titles(&graph, cx), all, "Global shows everything");
+
+        // The palette command shows the graph and switches it to local.
+        cx.simulate_keystrokes("ctrl-g");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Notes));
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("local graph");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.search_results()[0].target,
+                Target::Command(Command::ToggleLocalGraph)
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+        assert_eq!(graph.update(cx, |g, _| g.scope()), Scope::Local);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5486,7 +7080,10 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.search.as_ref().unwrap().selected, 2)
         });
-        cx.simulate_keystrokes("down down down down down down down down down down down down");
+        // (An empty query lists the pages, then every command.)
+        for _ in 0..Command::ALL.len() + 12 {
+            cx.simulate_keystrokes("down");
+        }
         view.update(cx, |app, _| {
             let last = app.search_results().len() - 1;
             assert_eq!(app.search.as_ref().unwrap().selected, last);
@@ -6504,6 +8101,7 @@ mod tests {
                 .map(|t| match t {
                     TabTarget::Page(title) => title.clone(),
                     TabTarget::Graph => "Graph".to_string(),
+                    TabTarget::Agenda => "Agenda".to_string(),
                 })
                 .collect();
             (labels, app.tabs.active)
@@ -6528,6 +8126,7 @@ mod tests {
         assert!(!has(cx, &format!("tab-{}", labels.len())));
         view.update(cx, |app, _| match labels[active] {
             "Graph" => assert_eq!(app.mode, Mode::Graph),
+            "Agenda" => assert_eq!(app.mode, Mode::Agenda),
             title => {
                 assert_eq!(app.mode, Mode::Notes);
                 assert_eq!(app.pages[app.selected].title, title);
@@ -8082,6 +9681,1067 @@ mod tests {
         drop_files(cx, sidebar, vec![pic]);
         assert!(!dir.join("assets").exists());
         assert_eq!(file(&dir), md);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- page context menu -------------------------------------------------
+
+    /// Right-click (press and release) the middle of `selector`'s element.
+    fn right_click(cx: &mut VisualTestContext, selector: &str) -> Point<Pixels> {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        let at = cx.debug_bounds(selector).expect(selector).center();
+        cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::none());
+        cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+        at
+    }
+
+    fn right_click_page(view: &Entity<NoteSec>, cx: &mut VisualTestContext, title: &str) {
+        let row = page_row(view, cx, "page", title);
+        right_click(cx, &row);
+    }
+
+    fn menu_title(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Option<String> {
+        view.update(cx, |app, _| app.page_menu.as_ref().map(|m| m.title.clone()))
+    }
+
+    fn non_journal_titles(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        view.update(cx, |app, _| {
+            app.pages
+                .iter()
+                .filter(|p| !p.is_journal)
+                .map(|p| p.title.clone())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn right_click_opens_the_page_menu_and_esc_or_outside_click_closes_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-open", &tab_pages(), "Test");
+        assert!(!has(cx, "page-menu"));
+
+        let row = page_row(&view, cx, "page", "Alpha");
+        let at = right_click(cx, &row);
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Alpha"));
+        for item in [
+            "page-menu",
+            "page-menu-rename",
+            "page-menu-delete",
+            "page-menu-copy",
+        ] {
+            assert!(has(cx, item), "{item}");
+        }
+        // It opens where the click was, and the click didn't open the page.
+        let menu = cx.debug_bounds("page-menu").unwrap();
+        assert!((menu.origin.x - at.x).abs() < px(2.) && (menu.origin.y - at.y).abs() < px(2.));
+        assert_eq!(selected_title(&view, cx), "Test");
+
+        cx.simulate_keystrokes("escape");
+        assert!(menu_title(&view, cx).is_none() && !has(cx, "page-menu"));
+
+        // A click outside closes it without reaching what is underneath.
+        right_click_page(&view, cx, "Alpha");
+        let beta = page_row(&view, cx, "page", "Beta");
+        click_on(cx, &beta);
+        assert!(menu_title(&view, cx).is_none());
+        assert_eq!(selected_title(&view, cx), "Test");
+        // So does a right-click outside.
+        right_click_page(&view, cx, "Alpha");
+        cx.simulate_mouse_down(
+            point(px(900.), px(600.)),
+            MouseButton::Right,
+            Modifiers::none(),
+        );
+        assert!(menu_title(&view, cx).is_none());
+
+        // FAVORITES rows have the same menu.
+        view.update(cx, |app, cx| app.toggle_favorite("Beta", cx));
+        cx.run_until_parked();
+        right_click(cx, "fav-0");
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Beta"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn rename_moves_the_file_and_selection_tabs_and_lists_follow(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-rename", &tab_pages(), "Test");
+        click_sidebar_page(&view, cx, "Alpha");
+        view.update(cx, |app, cx| app.toggle_favorite("Alpha", cx));
+        // An unsaved edit on the page is saved before the file moves.
+        click_block(cx, 0);
+        cx.simulate_input(" edited");
+
+        right_click_page(&view, cx, "Alpha");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        click_on(cx, "page-menu-rename");
+        assert!(has(cx, "rename-input") && !has(cx, "page-menu"));
+        // The old name is selected, so typing replaces it.
+        cx.simulate_input("Gamma");
+        cx.simulate_keystrokes("enter");
+
+        assert!(menu_title(&view, cx).is_none() && !has(cx, "rename-input"));
+        assert!(!page_file(&dir, "Alpha").exists());
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Gamma")).unwrap(),
+            "- alpha edited\n"
+        );
+        // Still sorted, and the selection and the open tab follow.
+        assert_eq!(non_journal_titles(&view, cx), ["Beta", "Gamma", "Test"]);
+        let gamma = page_row(&view, cx, "page", "Gamma");
+        assert!(has(cx, &gamma));
+        assert_eq!(selected_title(&view, cx), "Gamma");
+        tabs_are(&view, cx, &["Test", "Gamma"], 1);
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.favorites, vec!["Gamma".to_string()]);
+            assert_eq!(app.state.recent[0], "Gamma");
+            assert!(!app.state.recent.iter().any(|t| t == "Alpha"));
+            assert_eq!(UiState::load(&dir), app.state);
+        });
+        // Rename isn't undoable, and undo can't bring the old file back.
+        cx.simulate_keystrokes("ctrl-z");
+        assert!(!page_file(&dir, "Alpha").exists());
+        assert_eq!(selected_title(&view, cx), "Gamma");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn rename_refuses_taken_empty_and_unmappable_names(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-rename-bad", &tab_pages(), "Test");
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-rename");
+
+        let error = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| match &app.page_menu {
+                Some(PageMenu {
+                    step: MenuStep::Rename { error, .. },
+                    ..
+                }) => error.clone(),
+                _ => panic!("rename field closed"),
+            })
+        };
+        // Another page's name, in any case.
+        cx.simulate_input("beta");
+        cx.simulate_keystrokes("enter");
+        assert!(error(&view, cx).unwrap().contains("already exists"));
+        assert!(has(cx, "rename-error"));
+        // Editing the name clears the message.
+        cx.simulate_keystrokes("shift-home backspace");
+        assert_eq!(error(&view, cx), None);
+        cx.simulate_input("   ");
+        cx.simulate_keystrokes("enter");
+        assert!(error(&view, cx).unwrap().contains("empty"));
+        cx.simulate_keystrokes("shift-home backspace");
+        cx.simulate_input("a___b");
+        cx.simulate_keystrokes("enter");
+        assert!(error(&view, cx).unwrap().contains("___"));
+
+        cx.simulate_keystrokes("escape");
+        assert!(menu_title(&view, cx).is_none());
+        assert_eq!(non_journal_titles(&view, cx), ["Alpha", "Beta", "Test"]);
+        assert!(page_file(&dir, "Alpha").exists() && page_file(&dir, "Beta").exists());
+
+        // Journals are named by their date: Rename is disabled for them.
+        let today = view.update(cx, |app, _| app.find_journal(&today_title()).unwrap());
+        right_click(cx, &format!("page-{today}"));
+        click_on(cx, "page-menu-rename");
+        assert!(has(cx, "page-menu") && !has(cx, "rename-input"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn delete_after_confirm_removes_file_page_and_tab(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-delete", &tab_pages(), "Test");
+        click_sidebar_page(&view, cx, "Alpha");
+        click_sidebar_page(&view, cx, "Beta");
+        click_on(cx, "tab-1");
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 1);
+        view.update(cx, |app, cx| app.toggle_favorite("Alpha", cx));
+
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-delete");
+        assert!(has(cx, "confirm-delete") && !has(cx, "page-menu"));
+        // Enter doesn't confirm a destructive action.
+        cx.simulate_keystrokes("enter");
+        assert!(has(cx, "confirm-delete") && page_file(&dir, "Alpha").exists());
+
+        click_on(cx, "confirm-delete-ok");
+        assert!(menu_title(&view, cx).is_none() && !has(cx, "confirm-delete"));
+        assert!(!page_file(&dir, "Alpha").exists());
+        assert_eq!(non_journal_titles(&view, cx), ["Beta", "Test"]);
+        // Its tab closed and the neighbour that took its place has focus.
+        tabs_are(&view, cx, &["Test", "Beta"], 1);
+        view.update(cx, |app, _| {
+            assert!(!app.state.favorites.iter().any(|t| t == "Alpha"));
+            assert!(!app.state.recent.iter().any(|t| t == "Alpha"));
+            assert_eq!(UiState::load(&dir), app.state);
+        });
+        // Deleting a page with no tab leaves the tabs alone.
+        right_click_page(&view, cx, "Test");
+        click_on(cx, "page-menu-delete");
+        click_on(cx, "confirm-delete-ok");
+        tabs_are(&view, cx, &["Beta"], 0);
+        assert!(!page_file(&dir, "Test").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn cancelling_a_delete_keeps_the_file(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-delete-cancel", &tab_pages(), "Test");
+        let ask = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            right_click_page(view, cx, "Beta");
+            click_on(cx, "page-menu-delete");
+            assert!(has(cx, "confirm-delete"));
+        };
+        ask(&view, cx);
+        click_on(cx, "confirm-delete-cancel");
+        assert!(!has(cx, "confirm-delete"));
+        ask(&view, cx);
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "confirm-delete"));
+        ask(&view, cx);
+        let dialog = cx.debug_bounds("confirm-delete").unwrap();
+        cx.simulate_click(dialog.origin - point(px(20.), px(20.)), Modifiers::none());
+        assert!(menu_title(&view, cx).is_none());
+
+        assert!(page_file(&dir, "Beta").exists());
+        assert_eq!(non_journal_titles(&view, cx), ["Alpha", "Beta", "Test"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn todays_journal_can_be_deleted_but_not_the_last_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "menu-delete-journal", "- hi\n");
+        let today = view.update(cx, |app, _| app.find_journal(&today_title()).unwrap());
+        right_click(cx, &format!("page-{today}"));
+        click_on(cx, "page-menu-delete");
+        click_on(cx, "confirm-delete-ok");
+        assert!(!todays_journal_file(&dir).exists());
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages.len(), 1);
+            assert_eq!(app.pages[app.selected].title, "Test");
+        });
+
+        // The last page: Delete is disabled.
+        right_click_page(&view, cx, "Test");
+        click_on(cx, "page-menu-delete");
+        assert!(has(cx, "page-menu") && !has(cx, "confirm-delete"));
+        cx.simulate_keystrokes("escape");
+        assert!(file(&dir).contains("hi"));
+
+        // Ctrl-J brings today's journal back.
+        cx.simulate_keystrokes("ctrl-j");
+        assert!(todays_journal_file(&dir).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn copy_page_title_puts_it_on_the_clipboard(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "menu-copy", &tab_pages(), "Test");
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-copy");
+        assert!(menu_title(&view, cx).is_none());
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("Alpha")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- drag to reorder pages ---------------------------------------------
+
+    fn reorder_pages() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("Alpha", "- a\n"),
+            ("Beta", "- b\n"),
+            ("Gamma", "- g\n"),
+            ("Delta", "- d\n"),
+        ]
+    }
+
+    /// Press on `from`'s element and drag (left button held) to `to`
+    /// without releasing. The first move, past GPUI's 2px threshold, starts
+    /// the drag; the drop zones hear the moves after it.
+    fn start_drag(cx: &mut VisualTestContext, from: &str, to: Point<Pixels>) {
+        let start = bounds_of(cx, from).center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            start + point(px(0.), px(5.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn release(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// Just inside the top (`upper`) or bottom edge of `selector`'s element.
+    fn edge_of(cx: &mut VisualTestContext, selector: &str, upper: bool) -> Point<Pixels> {
+        let b = bounds_of(cx, selector);
+        if upper {
+            point(b.center().x, b.top() + px(3.))
+        } else {
+            point(b.center().x, b.bottom() - px(3.))
+        }
+    }
+
+    fn drag_page_to(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        title: &str,
+        to: Point<Pixels>,
+    ) {
+        let row = page_row(view, cx, "page", title);
+        start_drag(cx, &row, to);
+        release(cx, to);
+    }
+
+    fn titles(list: &[&str]) -> Vec<String> {
+        list.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn sort_pages_puts_journals_first_then_the_custom_order_then_the_rest() {
+        let mut pages: Vec<Page> = [
+            ("beta", false),
+            ("2026-10-07", true),
+            ("Mid", false),
+            ("Alpha", false),
+            ("2026-10-08", true),
+            ("Zed", false),
+        ]
+        .into_iter()
+        .map(|(title, journal)| Page::new(title, journal))
+        .collect();
+        let order_of =
+            |pages: &[Page]| -> Vec<String> { pages.iter().map(|p| p.title.clone()).collect() };
+
+        // No custom order: alphabetical, ignoring case.
+        sort_pages(&mut pages, &[]);
+        assert_eq!(
+            order_of(&pages),
+            titles(&["2026-10-08", "2026-10-07", "Alpha", "beta", "Mid", "Zed"])
+        );
+
+        // Listed pages first, matched ignoring case (the first entry wins);
+        // a stale entry is skipped; unlisted pages follow alphabetically.
+        let order = titles(&["zed", "Gone", "alpha", "ZED"]);
+        sort_pages(&mut pages, &order);
+        assert_eq!(
+            order_of(&pages),
+            titles(&["2026-10-08", "2026-10-07", "Zed", "Alpha", "beta", "Mid"])
+        );
+
+        // Journals never take part, even if listed.
+        sort_pages(&mut pages, &titles(&["2026-10-07", "Mid"]));
+        assert_eq!(
+            order_of(&pages),
+            titles(&["2026-10-08", "2026-10-07", "Mid", "Alpha", "beta", "Zed"])
+        );
+    }
+
+    #[gpui::test]
+    fn dragging_a_page_reorders_it_and_the_order_survives_a_restart(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-reorder", &reorder_pages(), "Beta");
+        assert_eq!(
+            non_journal_titles(&view, cx),
+            titles(&["Alpha", "Beta", "Delta", "Gamma"])
+        );
+
+        // Drag Gamma over the upper half of Alpha: the indicator shows in
+        // the gap above Alpha.
+        let gamma = page_row(&view, cx, "page", "Gamma");
+        let alpha = page_row(&view, cx, "page", "Alpha");
+        let to = edge_of(cx, &alpha, true);
+        start_drag(cx, &gamma, to);
+        let line = bounds_of(cx, "page-drop-indicator");
+        let alpha_top = bounds_of(cx, &alpha).top();
+        assert!(line.bottom() <= alpha_top && line.top() >= alpha_top - px(4.));
+        release(cx, to);
+
+        assert!(!has(cx, "page-drop-indicator"), "gone after the drop");
+        let order = titles(&["Gamma", "Alpha", "Beta", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.page_order, order);
+            assert_eq!(UiState::load(&dir).page_order, order);
+            // The selection and the tab still show Beta (indices moved);
+            // the drag did not click Gamma open.
+            assert_eq!(app.pages[app.selected].title, "Beta");
+            assert_eq!(app.tabs.tabs, vec![TabTarget::Page("Beta".into())]);
+            // Journals stay first.
+            assert!(app.pages[0].is_journal);
+        });
+        // The row now rendered first among the pages is Gamma.
+        let first = page_row(&view, cx, "page", "Gamma");
+        let second = page_row(&view, cx, "page", "Alpha");
+        assert!(bounds_of(cx, &first).top() < bounds_of(cx, &second).top());
+
+        let storage = Storage::open(dir.clone()).unwrap();
+        let (view2, cx2) = cx
+            .cx
+            .add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
+        cx2.run_until_parked();
+        assert_eq!(non_journal_titles(&view2, cx2), order);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn pages_drop_below_a_row_at_the_very_end_but_not_onto_journals(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-end", &reorder_pages(), "Beta");
+
+        // Lower half of Beta: after it.
+        let beta = page_row(&view, cx, "page", "Beta");
+        let to = edge_of(cx, &beta, false);
+        drag_page_to(&view, cx, "Alpha", to);
+        assert_eq!(
+            non_journal_titles(&view, cx),
+            titles(&["Beta", "Alpha", "Delta", "Gamma"])
+        );
+
+        // The end zone below the last page: to the very end, with the
+        // indicator drawn there.
+        let beta = page_row(&view, cx, "page", "Beta");
+        let end = bounds_of(cx, "page-drop-end").center();
+        start_drag(cx, &beta, end);
+        let line = bounds_of(cx, "page-drop-indicator");
+        assert!(line.bottom() <= bounds_of(cx, "page-drop-end").top());
+        release(cx, end);
+        assert_eq!(
+            non_journal_titles(&view, cx),
+            titles(&["Alpha", "Delta", "Gamma", "Beta"])
+        );
+
+        // Lower half of the last row (Beta): also the end.
+        let beta = page_row(&view, cx, "page", "Beta");
+        let to = edge_of(cx, &beta, false);
+        drag_page_to(&view, cx, "Alpha", to);
+        let order = titles(&["Delta", "Gamma", "Beta", "Alpha"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // Dropping a page where it already is shows no indicator and
+        // changes nothing.
+        let delta = page_row(&view, cx, "page", "Delta");
+        let to = edge_of(cx, &delta, false);
+        start_drag(cx, &delta, to);
+        assert!(!has(cx, "page-drop-indicator"));
+        release(cx, to);
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // Journals can't be dragged, and aren't drop targets.
+        let journal = page_row(&view, cx, "page", &today_title());
+        let gamma = page_row(&view, cx, "page", "Gamma");
+        let to = edge_of(cx, &gamma, true);
+        start_drag(cx, &journal, to);
+        assert!(!has(cx, "page-drop-indicator"));
+        release(cx, to);
+        let to = edge_of(cx, &journal, false);
+        drag_page_to(&view, cx, "Alpha", to);
+        assert_eq!(non_journal_titles(&view, cx), order);
+        view.update(cx, |app, _| {
+            assert!(app.pages[0].is_journal);
+            assert_eq!(UiState::load(&dir).page_order, order);
+        });
+
+        // Released outside the sidebar (no move there first, as when the
+        // pointer leaves the window): the drag just ends.
+        let main = bounds_of(cx, "block-0").center();
+        let row = page_row(&view, cx, "page", "Beta");
+        let delta = page_row(&view, cx, "page", "Delta");
+        let to = edge_of(cx, &delta, true);
+        start_drag(cx, &row, to);
+        assert!(has(cx, "page-drop-indicator"));
+        release(cx, main);
+        assert!(!has(cx, "page-drop-indicator"));
+        assert_eq!(non_journal_titles(&view, cx), order);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn new_pages_go_at_the_end_of_a_custom_order(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-new", &reorder_pages(), "Beta");
+        // Without a custom order a new page is placed alphabetically.
+        view.update(cx, |app, cx| app.open_page("Aardvark", cx));
+        assert_eq!(
+            non_journal_titles(&view, cx),
+            titles(&["Aardvark", "Alpha", "Beta", "Delta", "Gamma"])
+        );
+        view.update(cx, |app, _| assert!(app.state.page_order.is_empty()));
+
+        let alpha = page_row(&view, cx, "page", "Alpha");
+        let to = edge_of(cx, &alpha, true);
+        drag_page_to(&view, cx, "Gamma", to);
+        let order = titles(&["Aardvark", "Gamma", "Alpha", "Beta", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // Ctrl-N, then a page created by following a link: each at the end.
+        cx.simulate_keystrokes("ctrl-n");
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, cx| app.open_page("Apple", cx));
+        let mut expected = order.clone();
+        expected.extend(titles(&["Untitled", "Apple"]));
+        assert_eq!(non_journal_titles(&view, cx), expected);
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Apple");
+            assert_eq!(app.state.page_order, expected);
+            assert_eq!(UiState::load(&dir).page_order, expected);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn sort_a_z_from_the_palette_or_page_menu_restores_alphabetical_order(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-sort", &reorder_pages(), "Beta");
+        let alphabetical = titles(&["Alpha", "Beta", "Delta", "Gamma"]);
+        let reorder = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            let alpha = page_row(view, cx, "page", "Alpha");
+            let to = edge_of(cx, &alpha, true);
+            drag_page_to(view, cx, "Delta", to);
+            assert_eq!(
+                non_journal_titles(view, cx),
+                titles(&["Delta", "Alpha", "Beta", "Gamma"])
+            );
+        };
+
+        reorder(&view, cx);
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("sort pages");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.search_results()[0].target,
+                Target::Command(Command::SortPagesAz)
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(non_journal_titles(&view, cx), alphabetical);
+        view.update(cx, |app, _| {
+            assert!(app.state.page_order.is_empty());
+            assert!(UiState::load(&dir).page_order.is_empty());
+            assert_eq!(app.pages[app.selected].title, "Beta");
+        });
+
+        // From the page menu; it is disabled while already alphabetical.
+        right_click_page(&view, cx, "Gamma");
+        click_on(cx, "page-menu-sort");
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Gamma"), "disabled");
+        cx.simulate_keystrokes("escape");
+        reorder(&view, cx);
+        right_click_page(&view, cx, "Gamma");
+        click_on(cx, "page-menu-sort");
+        assert_eq!(menu_title(&view, cx), None);
+        assert_eq!(non_journal_titles(&view, cx), alphabetical);
+        assert!(UiState::load(&dir).page_order.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn rename_delete_and_undo_keep_the_custom_order(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "drag-rename", &reorder_pages(), "Beta");
+        // An edit before the reorder leaves an undo snapshot in A-Z order.
+        click_block(cx, 0);
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("escape");
+        let alpha = page_row(&view, cx, "page", "Alpha");
+        let to = edge_of(cx, &alpha, true);
+        drag_page_to(&view, cx, "Gamma", to);
+        let order = titles(&["Gamma", "Alpha", "Beta", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // Undo restores the text but not the old order.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Beta");
+            assert_eq!(app.pages[app.selected].blocks[0].content, "b");
+        });
+        assert_eq!(non_journal_titles(&view, cx), order);
+
+        // A renamed page keeps its place (no longer alphabetical).
+        view.update(cx, |app, cx| app.rename_page("Alpha", "Zulu", cx))
+            .unwrap();
+        let order = titles(&["Gamma", "Zulu", "Beta", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+        view.update(cx, |app, cx| app.delete_page("Beta", cx))
+            .unwrap();
+        let order = titles(&["Gamma", "Zulu", "Delta"]);
+        assert_eq!(non_journal_titles(&view, cx), order);
+        view.update(cx, |app, _| {
+            assert_eq!(app.state.page_order, order);
+            assert_eq!(UiState::load(&dir).page_order, order);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- agenda --------------------------------------------------------------
+
+    #[gpui::test]
+    fn agenda_groups_dated_tasks_and_clicking_one_opens_its_page(cx: &mut TestAppContext) {
+        let today = chrono::Local::now().date_naive();
+        let fmt = |d: chrono::NaiveDate| d.format("%Y-%m-%d").to_string();
+        let (yesterday, tomorrow) = (
+            fmt(today - chrono::Days::new(1)),
+            fmt(today + chrono::Days::new(1)),
+        );
+        let today = fmt(today);
+        let work = format!(
+            "- TODO late report\n  DEADLINE: <{yesterday}>\n\
+             - TODO due today\n  SCHEDULED: <{today}>\n\
+             - DONE finished\n  SCHEDULED: <{today}>\n\
+             - TODO next up\n  SCHEDULED: <{tomorrow} 09:00>\n"
+        );
+        let home =
+            format!("- DOING someday\n- parent\n  - TODO nested today\n    SCHEDULED: <{today}>\n");
+        let pages = [
+            ("Test", "- hello\n"),
+            ("Work", work.as_str()),
+            ("Home", home.as_str()),
+        ];
+        let (view, cx, dir) = setup_pages(cx, "agenda", &pages, "Test");
+        assert!(!has(cx, "agenda"));
+
+        click_on(cx, "sidebar-agenda");
+        tabs_are(&view, cx, &["Test", "Agenda"], 1);
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Agenda));
+
+        // Top to bottom: each group header, then its items. Within Today the
+        // pages sort by title (Home before Work); DONE is left out.
+        let top = |cx: &mut VisualTestContext, s: &str| bounds_of(cx, s).top();
+        let order = [
+            "agenda-group-overdue",
+            "agenda-item-0",
+            "agenda-group-today",
+            "agenda-item-1",
+            "agenda-item-2",
+            "agenda-group-upcoming",
+            "agenda-item-3",
+            "agenda-group-unscheduled",
+            "agenda-item-4",
+        ];
+        for pair in order.windows(2) {
+            assert!(top(cx, pair[0]) < top(cx, pair[1]), "{pair:?}");
+        }
+        assert!(!has(cx, "agenda-item-5"), "the DONE task is not listed");
+        view.update(cx, |app, _| {
+            let agenda = app.agenda();
+            assert_eq!(agenda.overdue[0].text, "late report");
+            let today_items: Vec<&str> = agenda.today.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(today_items, vec!["nested today", "due today"]);
+            assert_eq!(agenda.upcoming[0].1[0].text, "next up");
+            assert_eq!(agenda.unscheduled[0].text, "someday");
+        });
+
+        // Clicking an item opens its page in a new tab (the agenda tab
+        // stays) and unfolds the task's block.
+        view.update(cx, |app, _| {
+            let home = app.find_page("Home").unwrap();
+            let parent = app.pages[home].blocks[1].id;
+            app.collapsed.insert(parent);
+        });
+        click_on(cx, "agenda-item-1");
+        tabs_are(&view, cx, &["Test", "Agenda", "Home"], 2);
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Notes);
+            assert_eq!(app.pages[app.selected].title, "Home");
+            assert!(app.collapsed.is_empty(), "the task's parent is unfolded");
+            assert_eq!(app.editing, None);
+        });
+        // The page with its two-line task renders in the reading view.
+        assert!(has(cx, "block-2"));
+
+        // The palette command focuses the agenda again; it is rebuilt from
+        // the pages, so a task finished meanwhile is gone.
+        view.update(cx, |app, _| {
+            let work = app.find_page("Work").unwrap();
+            let block = &mut app.pages[work].blocks[0];
+            block.content = block.content.replacen("TODO", "DONE", 1);
+        });
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("open agenda");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.search_results()[0].target,
+                Target::Command(Command::OpenAgenda)
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        tabs_are(&view, cx, &["Test", "Agenda", "Home"], 1);
+        assert!(!has(cx, "agenda-group-overdue"));
+        assert!(has(cx, "agenda-group-today"));
+
+        click_on(cx, "agenda-item-1");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Work")
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn empty_agenda_shows_no_groups(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "agenda-empty", "- hello\n");
+        view.update(cx, |app, cx| app.show_agenda(cx));
+        assert!(has(cx, "agenda"));
+        assert!(!has(cx, "agenda-item-0"));
+        for group in ["overdue", "today", "upcoming", "unscheduled"] {
+            assert!(!has(cx, &format!("agenda-group-{group}")));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- command palette for everything, shortcuts dialog -----------------------
+
+    /// Open the palette, type `query` and run the top result with Enter.
+    fn run_in_palette(cx: &mut VisualTestContext, query: &str) {
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input(query);
+        cx.simulate_keystrokes("enter");
+    }
+
+    fn top_hit(view: &Entity<NoteSec>, cx: &mut VisualTestContext, query: &str) -> Target {
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input(query);
+        let top = view.update(cx, |app, _| app.search_results()[0].target);
+        cx.simulate_keystrokes("escape");
+        top
+    }
+
+    fn command_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- a\n  - b\n- c\n  - d\n    - e\n"),
+            ("Beta", "- other\n"),
+            ("Alpha", "- more\n"),
+        ]
+    }
+
+    #[gpui::test]
+    fn every_command_is_listed_with_an_empty_query(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "cmd-all", &command_pages(), "Test");
+        // Opened while editing a block, so editor commands are offered too.
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-k");
+        assert!(has(cx, "palette-commands-header"));
+        assert!(has(cx, "palette-pages-header"));
+        let commands: Vec<Command> = view.update(cx, |app, _| {
+            app.search_results()
+                .iter()
+                .filter_map(|h| match h.target {
+                    Target::Command(c) => Some(c),
+                    _ => None,
+                })
+                .collect()
+        });
+        assert_eq!(commands, Command::ALL);
+        // Every row is rendered (the list scrolls; arrows reach the last).
+        for c in Command::ALL {
+            assert!(has(cx, &format!("command-{}", c.name())), "{c:?}");
+        }
+        for _ in 0..Command::ALL.len() + 12 {
+            cx.simulate_keystrokes("down");
+        }
+        let last = view.update(cx, |app, _| {
+            let s = app.search.as_ref().unwrap();
+            app.search_results()[s.selected].target
+        });
+        assert_eq!(last, Target::Command(*Command::ALL.last().unwrap()));
+        cx.simulate_keystrokes("escape");
+
+        // Not editing: no editor commands. From the graph tab: no page
+        // commands either.
+        cx.simulate_keystrokes("escape ctrl-k");
+        let offered = view.update(cx, |app, _| app.available_commands());
+        assert!(!offered.contains(&Command::CycleTask));
+        assert!(offered.contains(&Command::CollapseAll));
+        cx.simulate_keystrokes("escape ctrl-g ctrl-k");
+        let offered = view.update(cx, |app, _| app.available_commands());
+        for c in Command::ALL {
+            assert_eq!(
+                offered.contains(c),
+                c.needs() == Needs::Nothing,
+                "{c:?} on the graph tab"
+            );
+        }
+        assert!(!has(cx, "command-CollapseAll"));
+        assert!(has(cx, "command-FitGraph"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn fuzzy_queries_find_commands(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "cmd-fuzzy", &command_pages(), "Test");
+        for (query, command) in [
+            ("shrt", Command::ShowShortcuts),
+            ("agnd", Command::OpenAgenda),
+            ("col all", Command::CollapseAll),
+            ("exp all", Command::ExpandAll),
+            ("new page", Command::NewPage),
+            ("fav", Command::ToggleFavorite),
+            ("fit", Command::FitGraph),
+            ("journals in graph", Command::ToggleGraphJournals),
+            ("rename", Command::RenamePage),
+            ("prev tab", Command::PrevTab),
+        ] {
+            assert_eq!(
+                top_hit(&view, cx, query),
+                Target::Command(command),
+                "{query}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn palette_commands_do_what_they_say(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "cmd-run", &command_pages(), "Test");
+
+        // Collapse all folds every block with children; Expand all undoes it.
+        run_in_palette(cx, "collapse all");
+        assert_eq!(shown(cx, 5), vec![0, 2]);
+        view.update(cx, |app, _| {
+            assert!(app.search.is_none(), "the palette closed");
+            assert!(app.undo_stack.is_empty(), "folding is not an undo step");
+        });
+        run_in_palette(cx, "expand all");
+        assert_eq!(shown(cx, 5), vec![0, 1, 2, 3, 4]);
+
+        // Toggle favorite stars the current page, and again unstars it.
+        run_in_palette(cx, "toggle favorite");
+        assert!(UiState::load(&dir).favorites.contains(&"Test".to_string()));
+        run_in_palette(cx, "toggle favorite");
+        assert!(UiState::load(&dir).favorites.is_empty());
+
+        // Copy page title.
+        run_in_palette(cx, "copy page title");
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("Test")
+        );
+
+        // Rename opens the rename field, Delete the confirm dialog.
+        run_in_palette(cx, "rename current page");
+        assert!(has(cx, "rename-input"));
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Test"));
+        cx.simulate_keystrokes("escape");
+        run_in_palette(cx, "delete current page");
+        assert!(has(cx, "confirm-delete"));
+        cx.simulate_keystrokes("escape");
+        assert!(dir.join("pages/Test.md").exists());
+
+        // Fit graph and Toggle journals open the graph first.
+        run_in_palette(cx, "toggle journals in graph");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+        let graph = view.update(cx, |app, _| app.graph.clone().unwrap());
+        assert!(!graph.update(cx, |g, _| g.includes_journals()));
+        cx.simulate_keystrokes("ctrl-w");
+        run_in_palette(cx, "fit graph");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+
+        // New page creates a page and opens it.
+        run_in_palette(cx, "new page");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Untitled");
+            assert_eq!(app.mode, Mode::Notes);
+        });
+        assert!(dir.join("pages/Untitled.md").exists());
+
+        // Tabs: previous / close.
+        let tabs = view.update(cx, |app, _| app.tabs.tabs.len());
+        run_in_palette(cx, "close tab");
+        view.update(cx, |app, _| assert_eq!(app.tabs.tabs.len(), tabs - 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn editor_commands_resume_the_block_the_palette_was_opened_from(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "cmd-editor", "- one\n- two\n");
+        click_block(cx, 1);
+        cx.simulate_keystrokes("ctrl-k");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        cx.simulate_input("cycle task");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.text, "TODO two");
+        });
+        assert_eq!(file(&dir), "- one\n- TODO two\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn shortcuts_dialog_opens_from_palette_and_key_and_esc_closes_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "cmd-shortcuts", "- hi\n");
+        run_in_palette(cx, "keyboard shortcuts");
+        assert!(has(cx, "shortcuts-dialog"));
+        view.update(cx, |app, _| assert!(app.search.is_none()));
+        // Modal: tab keys do nothing, Esc closes.
+        cx.simulate_keystrokes("ctrl-w");
+        view.update(cx, |app, _| assert_eq!(app.tabs.tabs.len(), 1));
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "shortcuts-dialog"));
+
+        // Ctrl+/ toggles it, even while editing (which it ends).
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-/");
+        assert!(has(cx, "shortcuts-dialog"));
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        cx.simulate_keystrokes("ctrl-/");
+        assert!(!has(cx, "shortcuts-dialog"));
+
+        // A click on the backdrop closes it; one inside does not.
+        cx.simulate_keystrokes("ctrl-/");
+        click_on(cx, "shortcut-row-0");
+        assert!(has(cx, "shortcuts-dialog"));
+        let backdrop = cx.debug_bounds("shortcuts-backdrop").unwrap();
+        cx.simulate_click(
+            backdrop.bottom_right() - point(px(5.0), px(5.0)),
+            Modifiers::none(),
+        );
+        assert!(!has(cx, "shortcuts-dialog"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn hints_and_cheatsheet_come_from_the_registered_bindings(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(cx, "cmd-hints", "- hi\n");
+        let table = shortcuts();
+        let keymap = cx.update(|_, cx| cx.key_bindings());
+        let keymap = keymap.borrow();
+
+        // Each command's hint is its action's first context-free binding in
+        // the table, else its first binding; no binding, no hint.
+        for c in Command::ALL {
+            let action = c.action();
+            let mine = |s: &&Shortcut| s.binding.action().partial_eq(action.as_ref());
+            let expected = table
+                .iter()
+                .filter(mine)
+                .find(|s| s.binding.predicate().is_none())
+                .or_else(|| table.iter().find(mine))
+                .map(|s| format_keystrokes(s.binding.keystrokes()));
+            assert_eq!(binding_hint(&keymap, action.as_ref()), expected, "{c:?}");
+        }
+        let hint = |c: Command| binding_hint(&keymap, c.action().as_ref());
+        assert_eq!(hint(Command::NewPage).as_deref(), Some("Ctrl+N"));
+        assert_eq!(hint(Command::Redo).as_deref(), Some("Ctrl+Shift+Z"));
+        assert_eq!(hint(Command::IncreaseFont).as_deref(), Some("Ctrl+="));
+        assert_eq!(hint(Command::ShowShortcuts).as_deref(), Some("Ctrl+/"));
+        assert_eq!(hint(Command::CycleTask).as_deref(), Some("Ctrl+Enter"));
+        assert_eq!(hint(Command::OpenAgenda), None);
+        assert_eq!(hint(Command::MoveBlockUp).as_deref(), Some("Alt+Up"));
+        assert_eq!(hint(Command::MoveBlockDown).as_deref(), Some("Alt+Down"));
+        assert_eq!(hint(Command::Paste).as_deref(), Some("Ctrl+V"));
+
+        // The cheatsheet lists every registered binding.
+        let sheet = cheatsheet(&table);
+        let listed: Vec<String> = sheet
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .flat_map(|(keys, _)| keys.split(" / ").map(str::to_string))
+            .collect();
+        assert_eq!(keymap.bindings().len(), table.len());
+        for binding in keymap.bindings() {
+            let keys = format_keystrokes(binding.keystrokes());
+            assert!(listed.contains(&keys), "{keys} missing from the cheatsheet");
+        }
+        assert_eq!(
+            sheet.iter().map(|(g, _)| *g).collect::<Vec<_>>(),
+            KeyGroup::ALL
+        );
+        drop(keymap);
+
+        // The dialog shows every row.
+        let rows: usize = sheet.iter().map(|(_, rows)| rows.len()).sum();
+        cx.simulate_keystrokes("ctrl-/");
+        assert!(has(cx, &format!("shortcut-row-{}", rows - 1)));
+        assert!(!has(cx, &format!("shortcut-row-{rows}")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- merge of the blocks and app tracks ---------------------------------
+
+    #[gpui::test]
+    fn rename_field_stays_one_line_and_enter_still_confirms(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "merge-rename-keys", &tab_pages(), "Test");
+        let test_before = page_file(&dir, "Test");
+        let test_before = std::fs::read_to_string(test_before).unwrap();
+        // Editing a block first: opening the menu ends that.
+        click_block(cx, 0);
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-rename");
+        cx.simulate_keystrokes("shift-home backspace");
+        cx.simulate_input("Gamma");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            crate::assets::tests::tiny_png(),
+        )));
+        cx.simulate_keystrokes("shift-enter up down alt-up alt-down ctrl-v");
+        view.update(cx, |app, _| {
+            assert!(app.renaming());
+            assert_eq!(app.editing, None);
+            assert_eq!(app.active_editor().text, "Gamma");
+        });
+        assert!(!dir.join("assets").exists(), "no image saved");
+        cx.simulate_keystrokes("enter");
+        assert!(menu_title(&view, cx).is_none());
+        assert!(page_file(&dir, "Gamma").exists() && !page_file(&dir, "Alpha").exists());
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Test")).unwrap(),
+            test_before,
+            "links are not rewritten (v1) and no key reached the block"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn palette_inserts_a_clipboard_image_into_the_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "merge-palette-image", "- one\n");
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            crate::assets::tests::tiny_png(),
+        )));
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("insert image");
+        cx.simulate_keystrokes("enter");
+        let content = view.update(cx, |app, _| {
+            assert!(app.search.is_none());
+            assert_eq!(app.editing, Some(0));
+            app.editor.text.clone()
+        });
+        assert!(
+            content.starts_with("one![image](../assets/image-"),
+            "{content}"
+        );
+        assert_eq!(assets(&dir), vec![referenced_file(&content)]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_scheduled_line_typed_with_shift_enter_reaches_the_agenda(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "merge-scheduled", "- TODO pay rent\n");
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end shift-enter");
+        cx.simulate_input("SCHEDULED: <2026-10-09 Fri>");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            file(&dir),
+            "- TODO pay rent\n  SCHEDULED: <2026-10-09 Fri>\n"
+        );
+        let agenda = view.update(cx, |app, _| {
+            Agenda::build(
+                &app.pages,
+                chrono::NaiveDate::from_ymd_opt(2026, 10, 8).unwrap(),
+            )
+        });
+        assert!(agenda.unscheduled.is_empty());
+        assert_eq!(agenda.upcoming.len(), 1);
+        let (day, items) = &agenda.upcoming[0];
+        assert_eq!(*day, chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap());
+        assert_eq!(items[0].text, "pay rent");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
