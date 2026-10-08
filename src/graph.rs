@@ -15,7 +15,7 @@
 //!   (`alpha`) cools each tick so the layout settles, and a hard tick cap
 //!   guarantees it can never run forever.
 
-use crate::model::{parse_references, Page};
+use crate::model::{page_aliases, parse_references, Page};
 use std::collections::{HashMap, HashSet};
 
 // --- tunable physics constants ------------------------------------------------
@@ -169,11 +169,18 @@ impl Graph {
     /// Build the graph from exactly these pages.
     fn build_from<'a>(pages: impl Iterator<Item = &'a Page>) -> Graph {
         let kept: Vec<&Page> = pages.collect();
-        let index: HashMap<String, usize> = kept
+        let mut index: HashMap<String, usize> = kept
             .iter()
             .enumerate()
             .map(|(i, p)| (p.title.to_lowercase(), i))
             .collect();
+        // A link to an alias is a link to its page (`model::resolve_page`):
+        // titles win, then the first page claiming the alias.
+        for (i, p) in kept.iter().enumerate() {
+            for alias in page_aliases(p) {
+                index.entry(alias.to_lowercase()).or_insert(i);
+            }
+        }
 
         let mut undirected: HashSet<(usize, usize)> = HashSet::new();
         // Distinct (source, target) pairs, so one page linking to another ten
@@ -523,6 +530,21 @@ mod tests {
         assert_eq!(g.edges, vec![(0, 1), (0, 2), (0, 4)]);
         assert_eq!(g.adj[0], vec![1, 2, 4]);
         assert!(g.adj[3].is_empty());
+    }
+
+    #[test]
+    fn links_to_an_alias_are_edges_to_its_page() {
+        let pages = vec![
+            Page::from_markdown("JavaScript", false, "- alias:: JS, Web\n"),
+            Page::from_markdown("A", false, "- uses [[js]] and #JS\n"),
+            Page::from_markdown("Web", false, "- links [[javascript]]\n"),
+            Page::from_markdown("B", false, "- [[Web]] is the real page\n"),
+        ];
+        let g = Graph::build(&pages, true);
+        // A-JavaScript (via the alias, counted once), Web-JavaScript, and
+        // B-Web: the real page wins over JavaScript's "Web" alias.
+        assert_eq!(g.edges, vec![(0, 1), (0, 2), (2, 3)]);
+        assert_eq!(g.nodes[0].backlinks, 2);
     }
 
     /// The local-graph fixture: Center links out to Out and tags #topic;

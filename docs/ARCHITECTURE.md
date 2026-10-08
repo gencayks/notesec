@@ -932,6 +932,25 @@ that mutate, and data races are essentially impossible.
     a block reference reads as the text it points at, not `((uuid))`. It
     is still a full scan per render, as before.
 
+36. **Page aliases are read from the page, not stored anywhere else.**
+    A page declares other names with an `alias::` line in its first block
+    (`alias:: JS, [[ECMAScript]]`, comma-separated; the key ignores case).
+    `model::page_aliases` reads them on demand and `model::resolve_page`
+    turns a link name into a page: a real title first, then the first
+    page (in order) claiming the alias, so an alias never steals a link
+    from a page that really has that name. Everything that follows links
+    goes through it: `navigate` (so clicking `[[JS]]` opens JavaScript
+    and committing the block creates no "JS" page), "Linked from", the
+    graph's edges and global search (an alias match ranks like a title
+    match, one hit per page). Typing `[[` now opens a page picker in the
+    same place as the `((` block picker (the same code, `RefKind`/
+    `RefItem`; whichever was typed last wins): it fuzzy-matches titles
+    and aliases, shows "alias: X" when an alias matched, and inserts the
+    real title, taking in a `]]` that's already after the cursor. Links
+    keep the alias text you typed by hand; nothing rewrites them. The
+    Ctrl-K palette still matches titles only. Reading aliases per lookup
+    is a scan over pages, like backlinks; fine at this size.
+
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
 code you've already seen above — that's the advantage of learning from your own

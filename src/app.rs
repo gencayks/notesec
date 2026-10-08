@@ -14,10 +14,12 @@ use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
 use crate::model::{
-    backlinks, cycle_task, find_block, parse_block_refs, parse_query, parse_references, tag_counts,
-    tag_query, BlockKind, Page, TaskState,
+    backlinks, cycle_task, find_block, parse_block_refs, parse_query, parse_references,
+    resolve_page, tag_counts, tag_query, BlockKind, Page, TaskState,
 };
-use crate::search::{search, search_blocks, search_templates, search_text, snippet, Hit, Target};
+use crate::search::{
+    search, search_blocks, search_link_pages, search_templates, search_text, snippet, Hit, Target,
+};
 use crate::state::UiState;
 use crate::storage::{today_title, validate_title, Storage, Template};
 use crate::table::{parse_table, Align};
@@ -313,6 +315,25 @@ enum Nav {
     Tab,
 }
 
+/// Which reference picker is open while editing (see `NoteSec::ref_query`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefKind {
+    /// `((query`: pick a block to reference.
+    Block,
+    /// `[[query`: pick a page to link to.
+    Page,
+}
+
+/// One entry of a reference picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RefItem {
+    /// A block, as `(page, block)` indices.
+    Block(usize, usize),
+    /// A page, with the alias it was found by (if that, not its title,
+    /// matched the query).
+    Page(usize, Option<String>),
+}
+
 /// How many page and block results the search overlay shows (commands
 /// come on top of these with an empty query).
 const MAX_RESULTS: usize = 12;
@@ -482,12 +503,13 @@ pub struct NoteSec {
     slash: Option<SlashState>,
     /// `Some` while the settings panel is open.
     settings: Option<SettingsState>,
-    /// The `((` block-reference picker's highlighted entry, with the
-    /// `((query` range it was chosen in (typing changes the range, which
-    /// starts again from the top). The picker itself shows whenever
-    /// `block_ref_query` finds a query; see `ref_query`.
+    /// The reference picker's highlighted entry (the `((` block picker or
+    /// the `[[` page picker), with the `((query` / `[[query` range it was
+    /// chosen in (typing changes the range, which starts again from the
+    /// top). The picker itself shows whenever `block_ref_query` or
+    /// `link_query` finds a query; see `ref_query`.
     ref_selected: (Range<usize>, usize),
-    /// Esc closed the picker for the `((` at this offset.
+    /// Esc closed the picker for the `((` or `[[` at this offset.
     ref_dismissed: Option<usize>,
     /// `Some` while a page's context menu (or its rename / delete step) is
     /// open.
@@ -1459,35 +1481,59 @@ impl NoteSec {
         cx.notify();
     }
 
-    // --- "((" block-reference picker ----------------------------------------
+    // --- "((" block-reference and "[[" page-link pickers ----------------------
 
-    /// The `((query` range the picker is open for, if it is: while editing a
-    /// block (and no other menu or overlay is up), unless Esc closed it.
-    fn ref_query(&self) -> Option<Range<usize>> {
+    /// The `((query` or `[[query` range the picker is open for, if it is,
+    /// and which picker: while editing a block (and no other menu or
+    /// overlay is up), unless Esc closed it. When both could apply (a `((`
+    /// inside a `[[`, say), the one typed last wins.
+    fn ref_query(&self) -> Option<(Range<usize>, RefKind)> {
         self.editing?;
         if self.search.is_some() || self.slash.is_some() || self.settings.is_some() {
             return None;
         }
-        let range = self.editor.block_ref_query()?;
-        (self.ref_dismissed != Some(range.start)).then_some(range)
+        let block = self.editor.block_ref_query().map(|r| (r, RefKind::Block));
+        let page = self.editor.link_query().map(|r| (r, RefKind::Page));
+        let (range, kind) = match (block, page) {
+            (Some(b), Some(p)) => {
+                if p.0.start > b.0.start {
+                    p
+                } else {
+                    b
+                }
+            }
+            (b, p) => b.or(p)?,
+        };
+        (self.ref_dismissed != Some(range.start)).then_some((range, kind))
     }
 
-    /// Blocks the open picker lists, as `(page, block)`; empty when closed.
-    fn ref_matches(&self) -> Vec<(usize, usize)> {
-        let Some(range) = self.ref_query() else {
+    /// What the open picker lists; empty when closed.
+    fn ref_matches(&self) -> Vec<RefItem> {
+        let Some((range, kind)) = self.ref_query() else {
             return Vec::new();
         };
         let query = &self.editor.text[range.start + 2..range.end];
-        let editing_id = self
-            .editing
-            .map(|ix| self.pages[self.selected].blocks[ix].id);
-        search_blocks(&self.pages, query, editing_id, 8)
+        match kind {
+            RefKind::Block => {
+                let editing_id = self
+                    .editing
+                    .map(|ix| self.pages[self.selected].blocks[ix].id);
+                search_blocks(&self.pages, query, editing_id, 8)
+                    .into_iter()
+                    .map(|(page, block)| RefItem::Block(page, block))
+                    .collect()
+            }
+            RefKind::Page => search_link_pages(&self.pages, query, 8)
+                .into_iter()
+                .map(|(page, alias)| RefItem::Page(page, alias))
+                .collect(),
+        }
     }
 
     /// The picker's highlighted entry, for the current query.
     fn ref_highlight(&self) -> usize {
         match self.ref_query() {
-            Some(range) if self.ref_selected.0 == range => self.ref_selected.1,
+            Some((range, _)) if self.ref_selected.0 == range => self.ref_selected.1,
             _ => 0,
         }
     }
@@ -1500,32 +1546,47 @@ impl NoteSec {
 
     fn move_ref_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.ref_matches().len();
-        if let (Some(range), true) = (self.ref_query(), count > 0) {
+        if let (Some((range, _)), true) = (self.ref_query(), count > 0) {
             let selected = (self.ref_highlight() as isize + delta).clamp(0, count as isize - 1);
             self.ref_selected = (range, selected as usize);
         }
         cx.notify();
     }
 
-    /// Replace the typed `((query` with a reference to block `target`
-    /// (`(page, block)`): `((<its id>))`, cursor after it. One undo step;
-    /// saved right away, which also writes the target's id to its page (see
-    /// `save_page`).
-    fn insert_block_ref(&mut self, target: (usize, usize), cx: &mut Context<Self>) {
-        let Some(range) = self.ref_query() else {
+    /// Replace the typed query with the picked entry, cursor after it: a
+    /// block becomes `((<its id>))`, a page `[[<its title>]]` (its real
+    /// title even when an alias matched; a `]]` already right after the
+    /// cursor is taken in, not doubled). One undo step; saved right away,
+    /// which also writes a block's id to its page (see `save_page`).
+    fn insert_ref(&mut self, item: RefItem, cx: &mut Context<Self>) {
+        let Some((mut range, _)) = self.ref_query() else {
             return;
         };
-        let Some(id) = self
-            .pages
-            .get(target.0)
-            .and_then(|page| page.blocks.get(target.1))
-            .map(|b| b.id)
-        else {
-            return;
+        let text = match item {
+            RefItem::Block(page, block) => {
+                let Some(id) = self
+                    .pages
+                    .get(page)
+                    .and_then(|page| page.blocks.get(block))
+                    .map(|b| b.id)
+                else {
+                    return;
+                };
+                format!("(({id}))")
+            }
+            RefItem::Page(page, _) => {
+                let Some(page) = self.pages.get(page) else {
+                    return;
+                };
+                if self.editor.text[range.end..].starts_with("]]") {
+                    range.end += 2;
+                }
+                format!("[[{}]]", page.title)
+            }
         };
         self.text_history_active = false;
         let before = self.history_state();
-        self.editor.replace_range(range, &format!("(({id}))"));
+        self.editor.replace_range(range, &text);
         self.record_state(before);
         self.sync_content();
         self.save_page();
@@ -1605,6 +1666,13 @@ impl NoteSec {
             .position(|p| p.title.to_lowercase() == wanted)
     }
 
+    /// The page a `[[link]]` (or `#tag`) to `name` goes to: the page with
+    /// that title, else the first page declaring it as an `alias::` (see
+    /// `model::resolve_page`).
+    fn link_target(&self, name: &str) -> Option<usize> {
+        resolve_page(&self.pages, name)
+    }
+
     /// Add a page, keeping the sidebar sorted and `selected` pointing at the
     /// same page as before (sorting can shift indices). With a custom order
     /// the new page goes at the end of it.
@@ -1637,7 +1705,7 @@ impl NoteSec {
     }
 
     /// Create (and save) a page for every `[[link]]` on the selected page that
-    /// doesn't have one yet.
+    /// doesn't have one yet (a link to an alias has one).
     fn ensure_link_targets(&mut self) {
         let targets: Vec<String> = self.pages[self.selected]
             .blocks
@@ -1646,7 +1714,7 @@ impl NoteSec {
             .map(|link| link.target)
             .collect();
         for target in targets {
-            if self.find_page(&target).is_none() {
+            if self.link_target(&target).is_none() {
                 let page = Page::with_empty_block(&target);
                 if let Err(err) = self.storage.save(&page) {
                     eprintln!("notesec: failed to create page {target}: {err}");
@@ -1663,13 +1731,13 @@ impl NoteSec {
         self.navigate(title, Nav::Replace, cx);
     }
 
-    /// Show the page called `title`, creating it if needed, in a tab as
-    /// `nav` says.
+    /// Show the page called `title` (or that has it as an alias), creating
+    /// it if needed, in a tab as `nav` says.
     fn navigate(&mut self, title: &str, nav: Nav, cx: &mut Context<Self>) {
         // Leave edit mode first so the block being edited is saved (which may
         // itself create pages and reorder the sidebar).
         self.stop_edit(cx);
-        let ix = match self.find_page(title) {
+        let ix = match self.link_target(title) {
             Some(ix) => ix,
             None => {
                 let page = Page::with_empty_block(title);
@@ -2350,8 +2418,8 @@ impl NoteSec {
             }
             return;
         }
-        if let Some(&target) = self.ref_matches().get(self.ref_highlight()) {
-            self.insert_block_ref(target, cx);
+        if let Some(item) = self.ref_matches().get(self.ref_highlight()).cloned() {
+            self.insert_ref(item, cx);
             return;
         }
         let Some(ix) = self.editing else { return };
@@ -2889,7 +2957,7 @@ impl NoteSec {
             self.close_search(cx);
         } else if self.slash.is_some() {
             self.dismiss_slash(cx);
-        } else if let (Some(range), true) = (self.ref_query(), self.ref_menu_open()) {
+        } else if let (Some((range, _)), true) = (self.ref_query(), self.ref_menu_open()) {
             self.ref_dismissed = Some(range.start);
             cx.notify();
         } else if self.editor.selection().is_some() {
@@ -3311,8 +3379,9 @@ impl EntityInputHandler for NoteSec {
             .or(self.active_editor().marked.clone())
             .unwrap_or(self.active_editor().selected_range());
         let in_block = self.search.is_none() && self.editing.is_some();
-        // Typing another "(" may start a new "((": show the picker again.
-        if new_text.contains('(') {
+        // Typing another "(" or "[" may start a new "((" or "[[": show the
+        // picker again.
+        if new_text.contains(['(', '[']) {
             self.ref_dismissed = None;
         }
         // "/" typed into an empty block, or over a selection, opens the
@@ -4889,17 +4958,30 @@ impl Render for NoteSec {
                 .children(items)
         });
 
-        // --- "((" block-reference picker (same place as the "/" menu) ------
+        // --- "((" and "[[" pickers (same place as the "/" menu) -------------
         let ref_matches = self.ref_matches();
         if slash_menu.is_none() && !ref_matches.is_empty() {
             let selected = self.ref_highlight();
             let items: Vec<AnyElement> = ref_matches
                 .into_iter()
                 .enumerate()
-                .map(|(i, target)| {
-                    let page = &self.pages[target.0];
-                    let block = &page.blocks[target.1];
-                    let text = DisplayBlock::new(&block.content).text.replace('\n', " ");
+                .map(|(i, item)| {
+                    // Main text, and the muted text on the right.
+                    let (text, side) = match &item {
+                        RefItem::Block(page, block) => {
+                            let page = &self.pages[*page];
+                            let content = &page.blocks[*block].content;
+                            let text = DisplayBlock::new(content).text.replace('\n', " ");
+                            (text, page.title.clone())
+                        }
+                        RefItem::Page(page, alias) => (
+                            self.pages[*page].title.clone(),
+                            match alias {
+                                Some(alias) => format!("alias: {alias}"),
+                                None => "page".to_string(),
+                            },
+                        ),
+                    };
                     div()
                         .id(("ref-item", i))
                         .debug_selector(move || format!("ref-item-{i}"))
@@ -4915,7 +4997,7 @@ impl Render for NoteSec {
                         .when(i == selected, |d| d.bg(theme.selected_bg))
                         .hover(|d| d.bg(theme.selected_bg))
                         .on_click(cx.listener(move |this, _e, _window, cx| {
-                            this.insert_block_ref(target, cx);
+                            this.insert_ref(item.clone(), cx);
                         }))
                         .child(
                             div()
@@ -4924,12 +5006,7 @@ impl Render for NoteSec {
                                 .whitespace_nowrap()
                                 .child(text),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(theme.muted)
-                                .child(page.title.clone()),
-                        )
+                        .child(div().flex_none().text_color(theme.muted).child(side))
                         .into_any_element()
                 })
                 .collect();
@@ -11092,6 +11169,125 @@ mod tests {
         cx.simulate_click(r.center(), Modifiers::none());
         view.update(cx, |app, _| {
             assert_eq!(app.pages[app.selected].title, "Alpha")
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Pages for the alias tests: JavaScript declares JS and ECMAScript.
+    fn alias_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- \n"),
+            ("JavaScript", "- alias:: JS, ECMAScript\n- the language\n"),
+            ("Jazz", "- music\n"),
+        ]
+    }
+
+    #[gpui::test]
+    fn double_bracket_picks_a_page_by_alias_and_links_its_title(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "alias-picker", &alias_pages(), "Test");
+        let pages_before = view.update(cx, |app, _| app.pages.len());
+        click_block(cx, 0);
+        cx.simulate_input("see [[ecma");
+        assert!(has(cx, "ref-menu"));
+        let js = view.update(cx, |app, _| app.find_page("JavaScript").unwrap());
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.ref_matches(),
+                vec![RefItem::Page(js, Some("ECMAScript".to_string()))]
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(!has(cx, "ref-menu"));
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "see [[JavaScript]]");
+            assert_eq!(app.editor.cursor, app.editor.text.len());
+            assert_eq!(app.editing, Some(0), "Enter picked, no new block");
+        });
+        assert_eq!(file(&dir), "- see [[JavaScript]]\n");
+
+        // Typed inside a "[[]]" already there: the "]]" isn't doubled.
+        cx.simulate_input(" [[]]");
+        cx.simulate_keystrokes("left left");
+        // An empty query lists pages.
+        assert!(has(cx, "ref-menu"));
+        cx.simulate_input("js");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.ref_matches(),
+                vec![RefItem::Page(js, Some("JS".to_string()))]
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "see [[JavaScript]] [[JavaScript]]");
+            assert_eq!(app.editor.cursor, app.editor.text.len());
+        });
+
+        // A title match shows no alias; Esc closes the picker and keeps the
+        // text, and stopping the edit doesn't create a "Ja" page.
+        cx.simulate_input(" [[ja");
+        view.update(cx, |app, _| {
+            let items = app.ref_matches();
+            assert!(items.contains(&RefItem::Page(js, None)));
+            assert_eq!(items.len(), 2, "JavaScript and Jazz");
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "ref-menu"));
+        view.update(cx, |app, _| assert!(app.editor.text.ends_with(" [[ja")));
+        cx.simulate_input("vascript]]");
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, None);
+            assert_eq!(app.pages.len(), pages_before);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn links_to_an_alias_go_to_the_page_and_count_as_backlinks(cx: &mut TestAppContext) {
+        let mut pages = alias_pages();
+        pages[0] = ("Test", "- \n");
+        let (view, cx, dir) = setup_pages(cx, "alias-links", &pages, "Test");
+        let pages_before = view.update(cx, |app, _| app.pages.len());
+        // Typed by hand (picker dismissed), then committed: [[JS]] already
+        // has a page, so no "JS" page is created.
+        click_block(cx, 0);
+        cx.simulate_input("about [[JS");
+        cx.simulate_keystrokes("escape");
+        cx.simulate_input("]] and #ecmascript");
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, None);
+            assert_eq!(app.pages.len(), pages_before);
+            assert!(app.find_page("JS").is_none());
+        });
+
+        // Following the link opens JavaScript, whose "Linked from" lists it.
+        view.update(cx, |app, cx| app.open_page("js", cx));
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "JavaScript");
+            assert_eq!(app.pages.len(), pages_before);
+            assert_eq!(app.backlink_texts, vec!["about [[JS]] and #ecmascript"]);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn global_search_finds_a_page_by_its_alias(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "alias-search", &alias_pages(), "Test");
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.simulate_input("js");
+        assert_eq!(
+            text_hits(&view, cx),
+            vec![
+                ("JavaScript".to_string(), None),
+                ("JavaScript".to_string(), Some("JS".to_string())),
+            ]
+        );
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "JavaScript")
         });
         let _ = std::fs::remove_dir_all(dir);
     }

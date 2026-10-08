@@ -12,7 +12,7 @@
 //! This module is pure (no UI, no I/O), so it is easy to unit-test.
 
 use crate::commands::Command;
-use crate::model::Page;
+use crate::model::{page_aliases, resolve_page, Page};
 use std::ops::Range;
 use uuid::Uuid;
 
@@ -307,8 +307,10 @@ fn title_rank(title: &str, query: &str) -> Option<i32> {
     })
 }
 
-/// Global search: every page (journals included) whose title contains
+/// Global search: every page (journals included) whose title, or one of
+/// whose aliases (`alias::`, where it resolves to that page), contains
 /// `query`, then every line of every block that contains it, ignoring case.
+/// A page is listed once, ranked by its best-matching name.
 ///
 /// Title matches come first, whole-title matches before prefix matches
 /// before the rest; body matches follow in page and document order, one
@@ -323,10 +325,17 @@ pub fn search_text(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
         .iter()
         .enumerate()
         .filter_map(|(page, p)| {
-            title_rank(&p.title, query).map(|score| Hit {
-                target: Target::Page(page),
-                score,
-            })
+            let alias_rank = page_aliases(p)
+                .iter()
+                .filter(|a| resolve_page(pages, a) == Some(page))
+                .filter_map(|a| title_rank(a, query))
+                .max();
+            title_rank(&p.title, query)
+                .max(alias_rank)
+                .map(|score| Hit {
+                    target: Target::Page(page),
+                    score,
+                })
         })
         .collect();
     // Stable: equal ranks keep page order.
@@ -355,6 +364,43 @@ pub fn search_text(pages: &[Page], query: &str, limit: usize) -> Vec<Hit> {
     }
     hits.truncate(limit);
     hits
+}
+
+/// Pages for the `[[` link picker, best first: each page whose title or
+/// alias fuzzy-matches `query`, once, with the alias when that is what
+/// matched better (the picker shows it, and inserts the page's real
+/// title). An alias that resolves to another page (a real title, or an
+/// earlier claim) is skipped. With an empty query, the first `limit`
+/// pages in the given order.
+pub fn search_link_pages(
+    pages: &[Page],
+    query: &str,
+    limit: usize,
+) -> Vec<(usize, Option<String>)> {
+    let query = query.trim();
+    let mut hits: Vec<(i32, usize, Option<String>)> = Vec::new();
+    for (ix, page) in pages.iter().enumerate() {
+        let mut best = fuzzy_score(query, &page.title).map(|s| (s, None));
+        for alias in page_aliases(page) {
+            if resolve_page(pages, &alias) != Some(ix) {
+                continue;
+            }
+            if let Some(score) = fuzzy_score(query, &alias) {
+                if best.as_ref().is_none_or(|(b, _)| score > *b) {
+                    best = Some((score, Some(alias)));
+                }
+            }
+        }
+        if let Some((score, alias)) = best {
+            hits.push((score, ix, alias));
+        }
+    }
+    // Stable: ties (and an empty query) keep page order.
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.into_iter()
+        .take(limit)
+        .map(|(_, ix, alias)| (ix, alias))
+        .collect()
 }
 
 /// What a global search result shows for a match: the line of `content`
@@ -712,5 +758,60 @@ mod tests {
         let (text, r) = snippet(&start_hit, 0..6, 30);
         assert_eq!(r, 0..6);
         assert!(text.starts_with("needle") && text.ends_with('…'));
+    }
+
+    #[test]
+    fn global_search_finds_pages_by_alias() {
+        let pages = [
+            page("JavaScript", "- alias:: JS, Web\n- body\n"),
+            page("Web", "- the real web page\n"),
+            page("Notes", "- js tips\n"),
+        ];
+        let hits = search_text(&pages, "js", 20);
+        let targets: Vec<Target> = hits.iter().map(|h| h.target).collect();
+        // The alias is a whole-name match, ranked like a title; the alias
+        // line itself and Notes' text are ordinary line matches.
+        assert_eq!(
+            targets,
+            vec![
+                Target::Page(0),
+                Target::Match {
+                    page: 0,
+                    block: 0,
+                    start: 8,
+                    end: 10
+                },
+                Target::Match {
+                    page: 2,
+                    block: 0,
+                    start: 0,
+                    end: 2
+                },
+            ]
+        );
+        // "Web" is a real page: JavaScript's alias doesn't claim it.
+        let hits = search_text(&pages, "web", 20);
+        assert_eq!(hits[0].target, Target::Page(1));
+        assert!(!hits.iter().any(|h| h.target == Target::Page(0)));
+    }
+
+    #[test]
+    fn link_picker_matches_titles_and_aliases_once() {
+        let pages = [
+            page("JavaScript", "- alias:: JS, Web\n"),
+            page("Web", "- real\n"),
+            page("Jazz", "- music\n"),
+        ];
+        assert_eq!(
+            search_link_pages(&pages, "js", 8),
+            vec![(0, Some("JS".to_string()))]
+        );
+        // The title matches better than any alias: no alias shown.
+        assert_eq!(search_link_pages(&pages, "javas", 8), vec![(0, None)]);
+        // "Web" belongs to the real page.
+        assert_eq!(search_link_pages(&pages, "web", 8), vec![(1, None)]);
+        // Empty query: pages in order, limited.
+        assert_eq!(search_link_pages(&pages, "", 2), vec![(0, None), (1, None)]);
+        assert_eq!(search_link_pages(&pages, "ja", 8).len(), 2);
     }
 }
