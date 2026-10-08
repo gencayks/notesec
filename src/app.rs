@@ -90,6 +90,9 @@ actions!(
         OpenTrash,
         ExportHtml,
         ToggleGitBackup,
+        SplitRight,
+        ClosePane,
+        FocusOtherPane,
         RenamePage,
         DeletePage,
         CopyPageTitle,
@@ -210,6 +213,11 @@ pub fn shortcuts() -> Vec<Shortcut> {
         s("ctrl-w",         CloseTab,      None, Tabs,       "Close tab"),
         s("ctrl-tab",       NextTab,       None, Tabs,       "Next tab"),
         s("ctrl-shift-tab", PrevTab,       None, Tabs,       "Previous tab"),
+        // Linux reports Ctrl+Shift+\ as `ctrl-|` (the shifted symbol, with
+        // Shift dropped), so that is what Focus other pane binds.
+        s("ctrl-\\",        SplitRight,     None, Tabs,       "Split right"),
+        s("ctrl-shift-w",   ClosePane,      None, Tabs,       "Close pane"),
+        s("ctrl-|",         FocusOtherPane, None, Tabs,       "Focus other pane"),
         s("ctrl-,",         OpenSettings,  None, App,        "Open / close settings"),
         s("ctrl-/",         ShowShortcuts, None, App,        "Keyboard shortcuts (this list)"),
         s("ctrl-q",         Quit,          None, App,        "Quit"),
@@ -391,6 +399,30 @@ enum TrashConfirm {
     Empty,
 }
 
+/// Side-by-side panes (decision 40). The left pane is the tab bar's: it
+/// shows the active tab. The right pane shows one page. Whichever has focus
+/// is the one `selected`, `mode` and editing describe, so everything that
+/// acts on "the current page" acts on the focused pane.
+#[derive(Clone, Debug, PartialEq)]
+struct Split {
+    /// The right pane's page, by title: indices shift when pages are added,
+    /// deleted or re-sorted, titles don't (renames update it).
+    right: String,
+    /// The right pane has focus (else the left one).
+    right_focused: bool,
+}
+
+/// What `render_page_view` draws for one pane.
+struct PageView {
+    element: AnyElement,
+    /// The reading-view text layouts by block, for tests (focused pane only).
+    #[cfg(test)]
+    layouts: Vec<(usize, gpui::TextLayout)>,
+}
+
+/// Debug selector prefix for the unfocused pane's page (`other-block-0`).
+const OTHER_PANE: &str = "other-";
+
 /// A short message at the bottom right (e.g. where an export was
 /// written), shown for `STATUS_FOR`.
 #[derive(Clone, Debug, PartialEq)]
@@ -562,8 +594,10 @@ pub struct NoteSec {
     text_history_active: bool,
     mode: Mode,
     /// Open tabs. The active one decides `mode` and, for a page tab,
-    /// `selected` (see `apply_tab`).
+    /// `selected` (see `apply_tab`), unless the right pane has focus.
     tabs: Tabs,
+    /// The second pane, if the view is split (decision 40).
+    split: Option<Split>,
     /// The graph view, created the first time it is opened and then kept so it
     /// remembers node positions between visits.
     graph: Option<Entity<GraphView>>,
@@ -578,6 +612,9 @@ pub struct NoteSec {
     /// tests can find where a displayed character is on screen.
     #[cfg(test)]
     reading_layouts: Vec<(usize, gpui::TextLayout)>,
+    /// The same for the unfocused pane while split (decision 40).
+    #[cfg(test)]
+    other_layouts: Vec<(usize, gpui::TextLayout)>,
     /// Monospace font for code blocks: the first of `MONO_FONTS` installed.
     mono_font: Option<SharedString>,
     /// The code block (block id, its number in the block) under the mouse;
@@ -703,12 +740,15 @@ impl NoteSec {
             text_history_active: false,
             mode: Mode::Notes,
             tabs: first_tab,
+            split: None,
             graph: None,
             _graph_subscription: None,
             last_layout: None,
             last_bounds: None,
             #[cfg(test)]
             reading_layouts: Vec::new(),
+            #[cfg(test)]
+            other_layouts: Vec::new(),
             mono_font,
             hovered_code: None,
             copied_code: None,
@@ -1216,7 +1256,14 @@ impl NoteSec {
             TabTarget::Page(title) => pages.iter().any(|p| p.title == *title),
             TabTarget::Graph | TabTarget::Agenda | TabTarget::Trash => true,
         });
-        if self.editing.is_some() || matches!(self.tabs.active_target(), Some(TabTarget::Page(_))) {
+        self.prune_split();
+        if let Some(split) = self.split.as_mut().filter(|s| s.right_focused) {
+            // The focused right pane shows the restored page.
+            split.right = self.pages[self.selected].title.clone();
+            self.mode = Mode::Notes;
+        } else if self.editing.is_some()
+            || matches!(self.tabs.active_target(), Some(TabTarget::Page(_)))
+        {
             // Not `show_page`: undo/redo isn't the user opening a page, so
             // RECENT is left alone (decision 21).
             let title = self.pages[self.selected].title.clone();
@@ -1419,6 +1466,7 @@ impl NoteSec {
             .filter(|c| match c {
                 Command::RenamePage => page.as_deref().is_some_and(|t| self.can_rename(t)),
                 Command::DeletePage => self.can_delete(),
+                Command::ClosePane | Command::FocusOtherPane => self.split.is_some(),
                 _ => true,
             })
             .collect()
@@ -1903,6 +1951,12 @@ impl NoteSec {
         let Some(page) = self.pages.get(ix) else {
             return;
         };
+        // The focused right pane shows the page itself (it has no tabs).
+        if let Some(split) = self.split.as_mut().filter(|s| s.right_focused) {
+            split.right = page.title.clone();
+            self.enter_page(ix, cx);
+            return;
+        }
         let target = TabTarget::Page(page.title.clone());
         match (nav, self.tabs.active_target()) {
             (Nav::Replace, Some(TabTarget::Page(_))) => self.tabs.replace_active(target),
@@ -1927,8 +1981,15 @@ impl NoteSec {
         cx.notify();
     }
 
-    /// Make `mode` and `selected` match the active tab.
+    /// Make `mode` and `selected` match the active tab, or the right pane's
+    /// page while that pane has focus. A right pane whose page is gone is
+    /// closed first.
     fn apply_tab(&mut self, cx: &mut Context<Self>) {
+        self.prune_split();
+        if let Some(ix) = self.right_focused().then(|| self.right_page()).flatten() {
+            self.enter_page(ix, cx);
+            return;
+        }
         match self.tabs.active_target().cloned() {
             Some(TabTarget::Page(title)) => {
                 // Focusing a page tab (click, Ctrl+Tab, or the neighbour after
@@ -1966,6 +2027,7 @@ impl NoteSec {
     /// editing ends, as with any navigation.
     fn activate_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.stop_edit(cx);
+        self.leave_right_pane();
         self.tabs.select(ix);
         self.apply_tab(cx);
     }
@@ -1974,6 +2036,7 @@ impl NoteSec {
     /// first. Closing the last tab shows the empty state.
     fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.stop_edit(cx);
+        self.leave_right_pane();
         self.tabs.close(ix);
         self.apply_tab(cx);
     }
@@ -1989,10 +2052,13 @@ impl NoteSec {
             || self.trash_confirm.is_some()
     }
 
-    /// Ctrl+W. Ignored while an overlay is open.
+    /// Ctrl+W. Ignored while an overlay is open. In the focused right pane
+    /// (which is like a single tab) it closes that pane.
     fn on_close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
         if !self.overlay_open() {
-            if let Some(ix) = self.tabs.active {
+            if self.right_focused() {
+                self.close_pane(true, cx);
+            } else if let Some(ix) = self.tabs.active {
                 self.close_tab(ix, cx);
             }
         }
@@ -2003,6 +2069,7 @@ impl NoteSec {
             return;
         }
         self.stop_edit(cx);
+        self.leave_right_pane();
         self.tabs.cycle(forward);
         self.apply_tab(cx);
     }
@@ -2038,6 +2105,103 @@ impl NoteSec {
         }
         let ix = self.find_journal(&today).unwrap_or(0);
         self.show_page(ix, cx);
+    }
+
+    // --- split panes (decision 40) ----------------------------------------------
+
+    /// The right pane has focus.
+    fn right_focused(&self) -> bool {
+        self.split.as_ref().is_some_and(|s| s.right_focused)
+    }
+
+    /// The index of the right pane's page, if split and it still exists.
+    fn right_page(&self) -> Option<usize> {
+        self.split.as_ref().and_then(|s| self.find_page(&s.right))
+    }
+
+    /// Close the right pane if its page no longer exists (deleted, or gone
+    /// after an undo), so it never shows a stale page.
+    fn prune_split(&mut self) {
+        if self.split.is_some() && self.right_page().is_none() {
+            self.split = None;
+        }
+    }
+
+    /// Give focus back to the left pane before a tab action (the tab bar
+    /// belongs to it); the caller then applies the active tab.
+    fn leave_right_pane(&mut self) {
+        if let Some(split) = &mut self.split {
+            split.right_focused = false;
+        }
+    }
+
+    /// Split right (Ctrl+\): show the current page (the page last shown,
+    /// from the graph, agenda or trash tab) in a right pane, and focus it.
+    /// When already split, just focus the right pane.
+    fn split_right(&mut self, cx: &mut Context<Self>) {
+        if self.split.is_none() {
+            self.stop_edit(cx);
+            let right = self.pages[self.selected].title.clone();
+            self.split = Some(Split {
+                right,
+                right_focused: false,
+            });
+        }
+        self.focus_pane(true, cx);
+    }
+
+    /// Focus the right (`right`) or left pane. The block being edited is
+    /// saved and editing stops: there is one editor, in the focused pane.
+    fn focus_pane(&mut self, right: bool, cx: &mut Context<Self>) {
+        if self.split.as_ref().is_none_or(|s| s.right_focused == right) {
+            return;
+        }
+        self.stop_edit(cx);
+        if let Some(split) = &mut self.split {
+            split.right_focused = right;
+        }
+        self.apply_tab(cx);
+    }
+
+    /// Close the right (`right`) or left pane; the other one becomes the
+    /// only one. Closing the left pane moves the right pane's page into the
+    /// tab bar (its tab, or a new one), so the tabs stay as they were.
+    fn close_pane(&mut self, right: bool, cx: &mut Context<Self>) {
+        if self.split.is_none() {
+            return;
+        }
+        self.stop_edit(cx);
+        let Some(split) = self.split.take() else {
+            return;
+        };
+        if !right {
+            if let Some(ix) = self.find_page(&split.right) {
+                let title = self.pages[ix].title.clone();
+                self.tabs.open(TabTarget::Page(title));
+            }
+        }
+        self.apply_tab(cx);
+    }
+
+    fn on_split_right(&mut self, _: &SplitRight, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.overlay_open() {
+            self.split_right(cx);
+        }
+    }
+
+    /// Ctrl+Shift+W: close the focused pane (nothing when not split).
+    fn on_close_pane(&mut self, _: &ClosePane, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.overlay_open() {
+            let right = self.right_focused();
+            self.close_pane(right, cx);
+        }
+    }
+
+    fn on_focus_other_pane(&mut self, _: &FocusOtherPane, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.overlay_open() {
+            let right = !self.right_focused();
+            self.focus_pane(right, cx);
+        }
     }
 
     // --- page context menu: rename, delete, copy title ----------------------
@@ -2162,6 +2326,9 @@ impl NoteSec {
         }
         self.sort_pages();
         self.tabs.rename(&old, &new);
+        if let Some(split) = self.split.as_mut().filter(|s| s.right == old) {
+            split.right = new.clone();
+        }
         self.forget_history();
         if self.mode == Mode::Graph {
             self.refresh_graph(cx);
@@ -2355,6 +2522,7 @@ impl NoteSec {
     fn show_agenda(&mut self, cx: &mut Context<Self>) {
         // Save the block being edited so the agenda sees it.
         self.stop_edit(cx);
+        self.leave_right_pane();
         self.tabs.open(TabTarget::Agenda);
         self.apply_tab(cx);
     }
@@ -2386,6 +2554,7 @@ impl NoteSec {
     fn show_trash(&mut self, cx: &mut Context<Self>) {
         self.stop_edit(cx);
         self.trash_error = None;
+        self.leave_right_pane();
         self.tabs.open(TabTarget::Trash);
         self.apply_tab(cx);
     }
@@ -2538,6 +2707,7 @@ impl NoteSec {
     fn show_graph(&mut self, cx: &mut Context<Self>) {
         // Save the block being edited so the graph sees up-to-date links.
         self.stop_edit(cx);
+        self.leave_right_pane();
         self.tabs.open(TabTarget::Graph);
         self.apply_tab(cx);
     }
@@ -3085,11 +3255,17 @@ impl NoteSec {
     /// An image in reading view: as wide as it is up to the page width and
     /// at most `IMAGE_MAX_HEIGHT` tall, keeping its shape. A file that's
     /// missing or can't be decoded shows a dashed placeholder instead.
-    fn render_image(&self, ix: usize, n: usize, image: &ImageRef) -> AnyElement {
+    fn render_image(
+        &self,
+        prefix: &'static str,
+        ix: usize,
+        n: usize,
+        image: &ImageRef,
+    ) -> AnyElement {
         let theme = self.theme;
         let placeholder = move |text: String| {
             div()
-                .debug_selector(move || format!("image-{ix}-{n}-missing"))
+                .debug_selector(move || format!("{prefix}image-{ix}-{n}-missing"))
                 .self_start()
                 .px_3()
                 .py_2()
@@ -3104,7 +3280,7 @@ impl NoteSec {
         let target = image.target.clone();
         match resolve(self.storage.root(), &image.target).filter(|path| path.is_file()) {
             Some(path) => gpui::img(path)
-                .debug_selector(move || format!("image-{ix}-{n}"))
+                .debug_selector(move || format!("{prefix}image-{ix}-{n}"))
                 .self_start()
                 .max_w_full()
                 .max_h(px(IMAGE_MAX_HEIGHT))
@@ -3120,6 +3296,7 @@ impl NoteSec {
     /// over it (or just after a copy) it shows a Copy button in its corner.
     fn render_code(
         &self,
+        prefix: &'static str,
         ix: usize,
         block: Uuid,
         n: usize,
@@ -3135,7 +3312,7 @@ impl NoteSec {
         let button = show_button.then(|| {
             div()
                 .id("copy")
-                .debug_selector(move || format!("code-{ix}-{n}-copy"))
+                .debug_selector(move || format!("{prefix}code-{ix}-{n}-copy"))
                 .absolute()
                 .top_1()
                 .right_1()
@@ -3154,7 +3331,7 @@ impl NoteSec {
                     this.copy_code(block, n, text.clone(), cx)
                 }))
                 .when(copied, |d| {
-                    d.debug_selector(move || format!("code-{ix}-{n}-copied"))
+                    d.debug_selector(move || format!("{prefix}code-{ix}-{n}-copied"))
                 })
                 .child(if copied { "Copied" } else { "Copy" })
         });
@@ -3166,7 +3343,7 @@ impl NoteSec {
         });
         div()
             .id(SharedString::from(format!("code-{ix}-{n}")))
-            .debug_selector(move || format!("code-{ix}-{n}"))
+            .debug_selector(move || format!("{prefix}code-{ix}-{n}"))
             .relative()
             .mt_1()
             .rounded_md()
@@ -5041,21 +5218,33 @@ impl NoteSec {
     }
 }
 
-impl Render for NoteSec {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // A drag released outside the sidebar just ends (GPUI drops it), so
-        // forget where it would have landed.
-        if !cx.has_active_drag() {
-            self.page_drop = None;
+impl NoteSec {
+    /// The unfocused pane's page (decision 40).
+    fn render_other_page(&mut self, page_ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let view = self.render_page_view(page_ix, false, None, cx);
+        #[cfg(test)]
+        {
+            self.other_layouts = view.layouts;
         }
+        view.element
+    }
+
+    /// One pane's page: its title, blocks and backlinks. Drawn for the
+    /// focused pane (`focused`, page `selected`: the one with the editor,
+    /// the "/" and "((" menus and drop targets) and, when split, for the
+    /// other pane too (read-only until a press focuses it, decision 40). The
+    /// other pane's debug selectors start with `OTHER_PANE` so tests can
+    /// tell the two apart; its element ids don't clash, since each pane's
+    /// container has its own id.
+    fn render_page_view(
+        &self,
+        page_ix: usize,
+        focused: bool,
+        mut slash_menu: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> PageView {
         let theme = self.theme;
         let font_size = self.config.font_size;
-        // Shortcut hints are read from the keymap (`bind_keys`), so they
-        // always show the real binding.
-        let keymap = cx.key_bindings();
-        let hint = move |action: &dyn gpui::Action| -> String {
-            binding_hint(&keymap.borrow(), action).unwrap_or_default()
-        };
         // Style for `[[wikilinks]]` in display mode: accent colour + underline.
         let link_style = HighlightStyle {
             color: Some(theme.accent.into()),
@@ -5087,6 +5276,653 @@ impl Render for NoteSec {
             ..Default::default()
         };
 
+        let prefix = if focused { "" } else { OTHER_PANE };
+        let page = &self.pages[page_ix];
+        #[cfg(test)]
+        let mut reading_layouts = Vec::new();
+        let visible = page.visible_blocks(&self.collapsed);
+        // The drop gap below each row's lower half: just before the next
+        // visible row, or the end of the page after the last one.
+        let gap_below: Vec<DropGap> = (0..page.blocks.len())
+            .map(|ix| {
+                (ix + 1..page.blocks.len())
+                    .find(|&i| visible[i])
+                    .map_or(DropGap::End, |i| DropGap::Before(page.blocks[i].id))
+            })
+            .collect();
+        let dragging = cx.has_active_drag();
+        let block_drop = if dragging { self.block_drop } else { None };
+        let file_over = dragging && self.file_drag.as_ref().is_some_and(|(_, inside)| *inside);
+        let rows: Vec<AnyElement> = page
+            .blocks
+            .iter()
+            .enumerate()
+            // Blocks inside a folded subtree aren't rendered at all.
+            .filter(|&(ix, _)| visible[ix])
+            .map(|(ix, block)| {
+                let is_editing = focused && self.editing == Some(ix);
+                let depth = page.depth_of(ix);
+                // Display mode (the reading view) hides the type prefix
+                // (`# `, `> `) and paired `**`/`*` markers and styles the row
+                // instead; the editor shows the raw markdown. `display` also
+                // maps shown offsets back to `content` offsets.
+                // The same page in the other pane mirrors the block being
+                // edited live, before it is committed.
+                let mirrored = !focused && page_ix == self.selected && self.editing == Some(ix);
+                let source = if mirrored {
+                    &self.editor.text
+                } else {
+                    &block.content
+                };
+                let display = (!is_editing).then(|| {
+                    Rc::new(DisplayBlock::with_refs(source, |id| {
+                        find_block(&self.pages, id)
+                            .map(|(p, b)| self.pages[p].blocks[b].content.clone())
+                    }))
+                });
+                let kind = match &display {
+                    Some(d) => d.kind,
+                    None => BlockKind::parse(&self.editor.text).0,
+                };
+                // Layout of this row's text, kept so a press can be mapped to
+                // the character (and so the link) under the mouse.
+                let mut text_layout = None;
+                let content: AnyElement = match &display {
+                    None => div()
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::on_text_mouse_down))
+                        .child(BlockText { app: cx.entity() })
+                        .into_any_element(),
+                    Some(d) => {
+                        // Code blocks, pipe tables and images are drawn as
+                        // their own boxes between the prose around them. They
+                        // aren't mapped back to `content`, so a press on
+                        // such a block starts editing at its start.
+                        let parts = split_code(&block.content);
+                        let rich = parts.iter().any(|part| match part {
+                            Part::Code(_) => true,
+                            Part::Text(text) => {
+                                parse_table(text).is_some() || !parse_images(text).is_empty()
+                            }
+                        });
+                        let text = if rich {
+                            let resolve = |id| {
+                                find_block(&self.pages, id)
+                                    .map(|(p, b)| self.pages[p].blocks[b].content.clone())
+                            };
+                            let styled = |text: &str, first: bool| {
+                                // Only the block's first line can carry its
+                                // type prefix and task keyword (hidden).
+                                let d = if first {
+                                    DisplayBlock::with_refs(text, resolve)
+                                } else {
+                                    DisplayBlock::inline(text, resolve)
+                                };
+                                StyledText::new(d.text.clone()).with_highlights(reading_highlights(
+                                    &d, link_style, tag_style, ref_style,
+                                ))
+                            };
+                            let mut pieces: Vec<AnyElement> = Vec::new();
+                            let (mut tables, mut codes, mut images) = (0, 0, 0);
+                            // Prose with images in it: each image is drawn on
+                            // its own between the text around it, and the line
+                            // breaks next to an image are dropped.
+                            let mut prose =
+                                |pieces: &mut Vec<AnyElement>, text: &str, first: bool| {
+                                    let mut pos = 0;
+                                    let mut first = first;
+                                    let text_piece =
+                                        |pieces: &mut Vec<AnyElement>,
+                                         t: &str,
+                                         first: &mut bool| {
+                                            let t = t.trim_matches('\n');
+                                            if !t.trim().is_empty() {
+                                                pieces.push(styled(t, *first).into_any_element());
+                                            }
+                                            *first = false;
+                                        };
+                                    for image in parse_images(text) {
+                                        text_piece(
+                                            pieces,
+                                            &text[pos..image.range.start],
+                                            &mut first,
+                                        );
+                                        pieces.push(self.render_image(prefix, ix, images, &image));
+                                        images += 1;
+                                        pos = image.range.end;
+                                    }
+                                    if pos == 0 {
+                                        pieces.push(styled(text, first).into_any_element());
+                                    } else {
+                                        text_piece(pieces, &text[pos..], &mut first);
+                                    }
+                                };
+                            for (p, part) in parts.iter().enumerate() {
+                                let mut rest = match part {
+                                    Part::Code(code) => {
+                                        pieces.push(
+                                            self.render_code(prefix, ix, block.id, codes, code, cx),
+                                        );
+                                        codes += 1;
+                                        continue;
+                                    }
+                                    Part::Text(text) => text.clone(),
+                                };
+                                let mut first = p == 0;
+                                while let Some(table) = parse_table(&rest) {
+                                    if !table.before.is_empty() {
+                                        prose(&mut pieces, &table.before, first);
+                                    }
+                                    let cells = table
+                                        .rows
+                                        .iter()
+                                        .map(|row| {
+                                            row.iter().map(|cell| styled(cell, false)).collect()
+                                        })
+                                        .collect();
+                                    let name = match tables {
+                                        0 => format!("{prefix}table-{ix}"),
+                                        k => format!("{prefix}table-{ix}-{k}"),
+                                    };
+                                    pieces.push(
+                                        table_grid(&theme, name, cells, &table.align)
+                                            .into_any_element(),
+                                    );
+                                    tables += 1;
+                                    first = false;
+                                    rest = table.after;
+                                }
+                                if !rest.is_empty() {
+                                    prose(&mut pieces, &rest, first);
+                                }
+                            }
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .children(pieces)
+                                .into_any_element()
+                        } else {
+                            let highlights =
+                                reading_highlights(d, link_style, tag_style, ref_style);
+                            // `with_highlights` resolves against the inherited
+                            // text style, so heading size/weight and quote
+                            // styling (and the theme's text colour) apply to
+                            // the unhighlighted parts.
+                            let text = StyledText::new(d.text.clone()).with_highlights(highlights);
+                            text_layout = Some(text.layout().clone());
+                            #[cfg(test)]
+                            reading_layouts.push((ix, text.layout().clone()));
+                            text.into_any_element()
+                        };
+                        // DONE text is dimmed and struck through.
+                        let text = div()
+                            .flex_1()
+                            .min_w_0()
+                            .when(d.task == Some(TaskState::Done), |t| {
+                                t.text_color(theme.muted)
+                                    .line_through()
+                                    .debug_selector(move || format!("{prefix}done-text-{ix}"))
+                            })
+                            .child(text);
+                        match d.task {
+                            None => text.into_any_element(),
+                            // The keyword is drawn as a checkbox; a press on
+                            // it cycles the state and never starts editing
+                            // (it stops the row's mouse-down handler).
+                            Some(state) => div()
+                                .flex()
+                                .flex_row()
+                                .items_start()
+                                .gap(px(6.0))
+                                .child(
+                                    task_checkbox(&theme, font_size, kind, state)
+                                        .debug_selector(move || {
+                                            format!(
+                                                "{prefix}task-{ix}-{}",
+                                                state.keyword().to_lowercase()
+                                            )
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                this.cycle_block_task(ix, cx);
+                                            }),
+                                        ),
+                                )
+                                .child(text)
+                                .into_any_element(),
+                        }
+                    }
+                };
+                // A `{{query #tag}}` block lists every block tagged #tag
+                // under its text. Computed each frame from the pages in
+                // memory, so it follows every save and navigation.
+                let query_list = display
+                    .as_ref()
+                    .and_then(|_| parse_query(&block.content))
+                    .map(|(_, tag)| {
+                        let hits = tag_query(&self.pages, &tag);
+                        let header = match hits.len() {
+                            0 => format!("No blocks tagged #{tag}"),
+                            1 => format!("1 block tagged #{tag}"),
+                            n => format!("{n} blocks tagged #{tag}"),
+                        };
+                        let items: Vec<AnyElement> = hits
+                            .iter()
+                            .enumerate()
+                            .map(|(n, &(p, b))| {
+                                let title = self.pages[p].title.clone();
+                                let text = DisplayBlock::new(&self.pages[p].blocks[b].content)
+                                    .text
+                                    .replace('\n', " ");
+                                div()
+                                    .id(("query-hit", n))
+                                    .debug_selector(move || format!("{prefix}query-{ix}-hit-{n}"))
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_md()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_3()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(theme.selected_bg))
+                                    // A press here never starts editing the
+                                    // query block; the click opens the page.
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.open_page(&title, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(theme.accent)
+                                            .child(self.pages[p].title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_color(theme.text)
+                                            .child(text),
+                                    )
+                                    .into_any_element()
+                            })
+                            .collect();
+                        div()
+                            .id(("query", ix))
+                            .debug_selector(move || format!("{prefix}query-{ix}"))
+                            .mt_1()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.sidebar_bg)
+                            .flex()
+                            .flex_col()
+                            .text_size(px(font_size * 0.9))
+                            .child(div().px_2().pb_1().text_color(theme.muted).child(header))
+                            .children(items)
+                    });
+                let content = match query_list {
+                    Some(list) => div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(content)
+                        .child(list)
+                        .into_any_element(),
+                    None => content,
+                };
+                // A press on a row that isn't being edited starts editing it
+                // with the cursor under the mouse, and a drag from there
+                // selects (the root's mouse-move handler extends it). A press
+                // on a link does nothing here: the click handler navigates.
+                let link_at = {
+                    let (layout, display) = (text_layout.clone(), display.clone());
+                    move |position: gpui::Point<Pixels>| {
+                        let (layout, display) = (layout.as_ref()?, display.as_ref()?);
+                        // `Ok` only when the mouse is over an actual glyph.
+                        let char_ix = layout.index_for_position(position).ok()?;
+                        display
+                            .links
+                            .iter()
+                            .find(|l| l.range.contains(&char_ix))
+                            .cloned()
+                    }
+                };
+                let block_ref_at = {
+                    let (layout, display) = (text_layout.clone(), display.clone());
+                    move |position: gpui::Point<Pixels>| {
+                        let (layout, display) = (layout.as_ref()?, display.as_ref()?);
+                        let char_ix = layout.index_for_position(position).ok()?;
+                        display
+                            .block_refs
+                            .iter()
+                            .find(|r| r.range.contains(&char_ix))
+                            .map(|r| r.id)
+                    }
+                };
+                let on_press = {
+                    let (layout, display, link_at, block_ref_at) = (
+                        text_layout.clone(),
+                        display.clone(),
+                        link_at.clone(),
+                        block_ref_at.clone(),
+                    );
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if link_at(event.position).is_some()
+                            || block_ref_at(event.position).is_some()
+                        {
+                            return;
+                        }
+                        let offset = layout.as_ref().map_or(0, |layout| {
+                            match layout.index_for_position(event.position) {
+                                Ok(i) | Err(i) => i,
+                            }
+                        });
+                        // Hidden prefix and markers are accounted for here;
+                        // see `DisplayBlock::to_source` for the boundary rule.
+                        let source = display.as_ref().map_or(0, |d| d.to_source(offset));
+                        this.start_edit(ix, window, cx);
+                        this.editor.set_cursor(source);
+                        this.selecting = true;
+                        cx.notify();
+                    })
+                };
+                let on_click = cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    // The press already started editing unless it was on a
+                    // link or a block reference; only those act on click.
+                    if this.editing == Some(ix) {
+                        return;
+                    }
+                    if let Some(link) = link_at(event.position()) {
+                        this.open_page(&link.target, cx);
+                    } else if let Some(id) = block_ref_at(event.position()) {
+                        this.open_block_ref(id, window, cx);
+                    }
+                });
+                // Blocks with children get a fold arrow; a folded one also
+                // shows how many blocks it hides. A press on the arrow stops
+                // there, so it never starts editing.
+                let hidden_count = page.descendant_count(ix);
+                let folded = hidden_count > 0 && self.collapsed.contains(&block.id);
+                let fold = (hidden_count > 0).then(|| {
+                    fold_arrow(&theme, folded)
+                        .debug_selector(move || format!("{prefix}fold-{ix}"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_fold(ix, cx);
+                            }),
+                        )
+                        .into_any_element()
+                });
+                // Dragging the bullet moves the block. The press on the handle
+                // stops there, so it never starts editing the row.
+                let block_id = block.id;
+                let handle = {
+                    let preview_text: SharedString = block
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                        .into();
+                    drag_handle()
+                        .id(("handle", ix))
+                        .debug_selector(move || format!("{prefix}handle-{ix}"))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_drag(DraggedBlock { id: block_id }, move |_, _, _, cx| {
+                            cx.new(|_| BlockDragPreview {
+                                text: preview_text.clone(),
+                                theme,
+                            })
+                        })
+                        .into_any_element()
+                };
+                let below = gap_below[ix];
+                let on_drag_move =
+                    cx.listener(move |this, event: &DragMoveEvent<DraggedBlock>, _, cx| {
+                        let position = event.event.position;
+                        if !event.bounds.contains(&position) {
+                            return;
+                        }
+                        let gap = if position.y < event.bounds.center().y {
+                            DropGap::Before(block_id)
+                        } else {
+                            below
+                        };
+                        let dragged = event.drag(cx).id;
+                        this.set_block_drop(dragged, Some(gap), cx);
+                    });
+                let drop_here = block_drop == Some(DropGap::Before(block_id));
+                let row = block_row(&theme, depth, font_size, kind, content, fold, handle)
+                    .relative()
+                    .when(drop_here, |d| {
+                        d.child(
+                            drop_line(&theme, depth)
+                                .debug_selector(move || format!("{prefix}drop-before-{ix}")),
+                        )
+                    })
+                    .when(focused, |d| d.on_drag_move(on_drag_move))
+                    .when(folded, |d| {
+                        d.child(fold_badge(&theme, font_size, hidden_count).debug_selector(
+                            move || format!("{prefix}fold-badge-{ix}-{hidden_count}"),
+                        ))
+                    })
+                    .id(("block", ix))
+                    // Lets tests find this row's on-screen bounds; a no-op in
+                    // normal builds.
+                    .debug_selector(|| format!("{prefix}block-{ix}"))
+                    .cursor_text()
+                    .when(!is_editing, |d| {
+                        d.on_mouse_down(MouseButton::Left, on_press)
+                            .on_click(on_click)
+                    });
+                let menu = if is_editing { slash_menu.take() } else { None };
+                match menu {
+                    // The menu hangs off a zero-height strip right under the
+                    // edited row, lined up with its text; `deferred` paints it
+                    // above the rows below.
+                    Some(menu) => div()
+                        .flex()
+                        .flex_col()
+                        .child(row)
+                        .child(
+                            div().h(px(0.)).child(deferred(
+                                anchored()
+                                    .offset(point(px(24.0 * depth as f32 + 14.0), px(2.0)))
+                                    .snap_to_window_with_margin(px(8.))
+                                    .child(menu),
+                            )),
+                        )
+                        .into_any_element(),
+                    None => row.into_any_element(),
+                }
+            })
+            .collect();
+
+        // --- Backlinks: blocks on other pages that link here ----------------
+        // Recomputed every frame. That is a scan of every block, which is fine
+        // for a personal graph; an index can replace it if it ever shows up in
+        // a profile.
+        let groups = backlinks(&self.pages, &page.title);
+        let total: usize = groups.iter().map(|g| g.blocks.len()).sum();
+        let mut backlink_items: Vec<AnyElement> = Vec::new();
+        let mut n: usize = 0; // running index over all references, for ids
+        for group in &groups {
+            let source = &self.pages[group.page];
+            let source_title = source.title.clone();
+            backlink_items.push(
+                div()
+                    .id(("backlink-page", group.page))
+                    .mt_2()
+                    .text_color(theme.accent)
+                    .cursor_pointer()
+                    .on_click(cx.listener({
+                        let title = source_title.clone();
+                        move |this, _e, _window, cx| this.open_page(&title, cx)
+                    }))
+                    .child(source_title.clone())
+                    .into_any_element(),
+            );
+            for &block_ix in &group.blocks {
+                let title = source_title.clone();
+                backlink_items.push(
+                    div()
+                        .id(("backlink", n))
+                        .debug_selector(|| format!("{prefix}backlink-{n}"))
+                        .pl_4()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_color(theme.text)
+                        .hover(|d| d.bg(theme.selected_bg))
+                        .on_click(cx.listener(move |this, _e, _window, cx| {
+                            this.open_page(&title, cx);
+                            // Unfold whatever hides the referencing block.
+                            if block_ix < this.pages[this.selected].blocks.len() {
+                                this.reveal(block_ix);
+                            }
+                        }))
+                        .child(source.blocks[block_ix].content.clone())
+                        .into_any_element(),
+                );
+                n += 1;
+            }
+        }
+        let backlinks_panel = (total > 0).then(|| {
+            div()
+                .id("backlinks")
+                .mt_8()
+                .pt_4()
+                .border_t_1()
+                .border_color(theme.border)
+                .flex()
+                .flex_col()
+                .child(div().text_color(theme.muted).child(format!(
+                    "{total} LINKED REFERENCE{}",
+                    if total == 1 { "" } else { "S" }
+                )))
+                .children(backlink_items)
+        });
+
+        let element = div()
+            .id("main")
+            .flex_1()
+            .h_full()
+            .overflow_y_scroll()
+            .p_8()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .mb_4()
+                    .text_size(px(font_size * 1.9))
+                    .text_color(theme.text)
+                    .child(page.title.clone()),
+            )
+            .children(rows)
+            // The drop line for "after the last block".
+            .when(block_drop == Some(DropGap::End), |d| {
+                d.child(
+                    div()
+                        .relative()
+                        .h(px(0.))
+                        .child(drop_line(&theme, 0).debug_selector(|| format!("{prefix}drop-end"))),
+                )
+            })
+            // Leaving the page area hides the drop line; dropping anywhere on
+            // the page moves the block to where the line is. Only the
+            // focused pane takes drops: a press in the other one focuses it
+            // first, and the drag then continues over the redrawn pane.
+            .when(focused, |d| {
+                d.on_drag_move(
+                    cx.listener(|this, event: &DragMoveEvent<DraggedBlock>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            let dragged = event.drag(cx).id;
+                            this.set_block_drop(dragged, None, cx);
+                        }
+                    }),
+                )
+                .on_drop(cx.listener(|this, dragged: &DraggedBlock, _, cx| {
+                    this.drop_block(dragged.id, cx)
+                }))
+                // Image files dragged in from outside: a faint wash while
+                // they are over the page; releasing them adds them
+                // (`finish_file_drop`).
+                .on_drag_move(
+                    cx.listener(|this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                        let inside = event.bounds.contains(&event.event.position);
+                        let was_inside = this.file_drag.as_ref().map(|(_, inside)| *inside);
+                        this.file_drag = Some((event.drag(cx).clone(), inside));
+                        if was_inside != Some(inside) {
+                            cx.notify();
+                        }
+                    }),
+                )
+                .when(file_over, |d| d.bg(theme.selected_bg))
+                .child({
+                    let app = cx.entity();
+                    gpui::canvas(
+                        |_, _, _| {},
+                        move |_, _, window, _| {
+                            let on_up = app.clone();
+                            window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                                if phase == gpui::DispatchPhase::Bubble {
+                                    on_up.update(cx, |this, cx| this.finish_file_drop(window, cx));
+                                }
+                            });
+                            // Outside files never press the mouse in this
+                            // window, so a press means any earlier file drag
+                            // is over.
+                            window.on_mouse_event(move |_: &MouseDownEvent, phase, _, cx| {
+                                if phase == gpui::DispatchPhase::Capture {
+                                    app.update(cx, |this, _| this.file_drag = None);
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .size_0()
+                })
+            })
+            .children(backlinks_panel)
+            // Empty space below the blocks: clicking it leaves edit mode.
+            .child(
+                div()
+                    .id("filler")
+                    .flex_1()
+                    .min_h(px(120.0))
+                    .on_click(cx.listener(|this, _e, _window, cx| this.stop_edit(cx))),
+            );
+        PageView {
+            element: element.into_any_element(),
+            #[cfg(test)]
+            layouts: reading_layouts,
+        }
+    }
+}
+
+impl Render for NoteSec {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A drag released outside the sidebar just ends (GPUI drops it), so
+        // forget where it would have landed.
+        if !cx.has_active_drag() {
+            self.page_drop = None;
+        }
+        let theme = self.theme;
+        let font_size = self.config.font_size;
+        // Shortcut hints are read from the keymap (`bind_keys`), so they
+        // always show the real binding.
+        let keymap = cx.key_bindings();
+        let hint = move |action: &dyn gpui::Action| -> String {
+            binding_hint(&keymap.borrow(), action).unwrap_or_default()
+        };
         // --- Sidebar: one clickable row per page ---------------------------
         // The accent line showing where a dragged page would land: above the
         // row it is drawn in, in the gap between rows.
@@ -5623,617 +6459,19 @@ impl Render for NoteSec {
             );
         }
 
-        // --- Main pane: title + blocks --------------------------------------
-        let page = &self.pages[self.selected];
-        #[cfg(test)]
-        let mut reading_layouts = Vec::new();
-        let visible = page.visible_blocks(&self.collapsed);
-        // The drop gap below each row's lower half: just before the next
-        // visible row, or the end of the page after the last one.
-        let gap_below: Vec<DropGap> = (0..page.blocks.len())
-            .map(|ix| {
-                (ix + 1..page.blocks.len())
-                    .find(|&i| visible[i])
-                    .map_or(DropGap::End, |i| DropGap::Before(page.blocks[i].id))
-            })
-            .collect();
-        let dragging = cx.has_active_drag();
-        let block_drop = if dragging { self.block_drop } else { None };
-        let file_over = dragging && self.file_drag.as_ref().is_some_and(|(_, inside)| *inside);
-        let rows: Vec<AnyElement> = page
-            .blocks
-            .iter()
-            .enumerate()
-            // Blocks inside a folded subtree aren't rendered at all.
-            .filter(|&(ix, _)| visible[ix])
-            .map(|(ix, block)| {
-                let is_editing = self.editing == Some(ix);
-                let depth = page.depth_of(ix);
-                // Display mode (the reading view) hides the type prefix
-                // (`# `, `> `) and paired `**`/`*` markers and styles the row
-                // instead; the editor shows the raw markdown. `display` also
-                // maps shown offsets back to `content` offsets.
-                let display = (!is_editing).then(|| {
-                    Rc::new(DisplayBlock::with_refs(&block.content, |id| {
-                        find_block(&self.pages, id)
-                            .map(|(p, b)| self.pages[p].blocks[b].content.clone())
-                    }))
-                });
-                let kind = match &display {
-                    Some(d) => d.kind,
-                    None => BlockKind::parse(&self.editor.text).0,
-                };
-                // Layout of this row's text, kept so a press can be mapped to
-                // the character (and so the link) under the mouse.
-                let mut text_layout = None;
-                let content: AnyElement = match &display {
-                    None => div()
-                        .on_mouse_down(MouseButton::Left, cx.listener(Self::on_text_mouse_down))
-                        .child(BlockText { app: cx.entity() })
-                        .into_any_element(),
-                    Some(d) => {
-                        // Code blocks, pipe tables and images are drawn as
-                        // their own boxes between the prose around them. They
-                        // aren't mapped back to `content`, so a press on
-                        // such a block starts editing at its start.
-                        let parts = split_code(&block.content);
-                        let rich = parts.iter().any(|part| match part {
-                            Part::Code(_) => true,
-                            Part::Text(text) => {
-                                parse_table(text).is_some() || !parse_images(text).is_empty()
-                            }
-                        });
-                        let text = if rich {
-                            let resolve = |id| {
-                                find_block(&self.pages, id)
-                                    .map(|(p, b)| self.pages[p].blocks[b].content.clone())
-                            };
-                            let styled = |text: &str, first: bool| {
-                                // Only the block's first line can carry its
-                                // type prefix and task keyword (hidden).
-                                let d = if first {
-                                    DisplayBlock::with_refs(text, resolve)
-                                } else {
-                                    DisplayBlock::inline(text, resolve)
-                                };
-                                StyledText::new(d.text.clone()).with_highlights(reading_highlights(
-                                    &d, link_style, tag_style, ref_style,
-                                ))
-                            };
-                            let mut pieces: Vec<AnyElement> = Vec::new();
-                            let (mut tables, mut codes, mut images) = (0, 0, 0);
-                            // Prose with images in it: each image is drawn on
-                            // its own between the text around it, and the line
-                            // breaks next to an image are dropped.
-                            let mut prose =
-                                |pieces: &mut Vec<AnyElement>, text: &str, first: bool| {
-                                    let mut pos = 0;
-                                    let mut first = first;
-                                    let text_piece =
-                                        |pieces: &mut Vec<AnyElement>,
-                                         t: &str,
-                                         first: &mut bool| {
-                                            let t = t.trim_matches('\n');
-                                            if !t.trim().is_empty() {
-                                                pieces.push(styled(t, *first).into_any_element());
-                                            }
-                                            *first = false;
-                                        };
-                                    for image in parse_images(text) {
-                                        text_piece(
-                                            pieces,
-                                            &text[pos..image.range.start],
-                                            &mut first,
-                                        );
-                                        pieces.push(self.render_image(ix, images, &image));
-                                        images += 1;
-                                        pos = image.range.end;
-                                    }
-                                    if pos == 0 {
-                                        pieces.push(styled(text, first).into_any_element());
-                                    } else {
-                                        text_piece(pieces, &text[pos..], &mut first);
-                                    }
-                                };
-                            for (p, part) in parts.iter().enumerate() {
-                                let mut rest = match part {
-                                    Part::Code(code) => {
-                                        pieces
-                                            .push(self.render_code(ix, block.id, codes, code, cx));
-                                        codes += 1;
-                                        continue;
-                                    }
-                                    Part::Text(text) => text.clone(),
-                                };
-                                let mut first = p == 0;
-                                while let Some(table) = parse_table(&rest) {
-                                    if !table.before.is_empty() {
-                                        prose(&mut pieces, &table.before, first);
-                                    }
-                                    let cells = table
-                                        .rows
-                                        .iter()
-                                        .map(|row| {
-                                            row.iter().map(|cell| styled(cell, false)).collect()
-                                        })
-                                        .collect();
-                                    let name = match tables {
-                                        0 => format!("table-{ix}"),
-                                        k => format!("table-{ix}-{k}"),
-                                    };
-                                    pieces.push(
-                                        table_grid(&theme, name, cells, &table.align)
-                                            .into_any_element(),
-                                    );
-                                    tables += 1;
-                                    first = false;
-                                    rest = table.after;
-                                }
-                                if !rest.is_empty() {
-                                    prose(&mut pieces, &rest, first);
-                                }
-                            }
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .children(pieces)
-                                .into_any_element()
-                        } else {
-                            let highlights =
-                                reading_highlights(d, link_style, tag_style, ref_style);
-                            // `with_highlights` resolves against the inherited
-                            // text style, so heading size/weight and quote
-                            // styling (and the theme's text colour) apply to
-                            // the unhighlighted parts.
-                            let text = StyledText::new(d.text.clone()).with_highlights(highlights);
-                            text_layout = Some(text.layout().clone());
-                            #[cfg(test)]
-                            reading_layouts.push((ix, text.layout().clone()));
-                            text.into_any_element()
-                        };
-                        // DONE text is dimmed and struck through.
-                        let text = div()
-                            .flex_1()
-                            .min_w_0()
-                            .when(d.task == Some(TaskState::Done), |t| {
-                                t.text_color(theme.muted)
-                                    .line_through()
-                                    .debug_selector(move || format!("done-text-{ix}"))
-                            })
-                            .child(text);
-                        match d.task {
-                            None => text.into_any_element(),
-                            // The keyword is drawn as a checkbox; a press on
-                            // it cycles the state and never starts editing
-                            // (it stops the row's mouse-down handler).
-                            Some(state) => div()
-                                .flex()
-                                .flex_row()
-                                .items_start()
-                                .gap(px(6.0))
-                                .child(
-                                    task_checkbox(&theme, font_size, kind, state)
-                                        .debug_selector(move || {
-                                            format!("task-{ix}-{}", state.keyword().to_lowercase())
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation();
-                                                this.cycle_block_task(ix, cx);
-                                            }),
-                                        ),
-                                )
-                                .child(text)
-                                .into_any_element(),
-                        }
-                    }
-                };
-                // A `{{query #tag}}` block lists every block tagged #tag
-                // under its text. Computed each frame from the pages in
-                // memory, so it follows every save and navigation.
-                let query_list = display
-                    .as_ref()
-                    .and_then(|_| parse_query(&block.content))
-                    .map(|(_, tag)| {
-                        let hits = tag_query(&self.pages, &tag);
-                        let header = match hits.len() {
-                            0 => format!("No blocks tagged #{tag}"),
-                            1 => format!("1 block tagged #{tag}"),
-                            n => format!("{n} blocks tagged #{tag}"),
-                        };
-                        let items: Vec<AnyElement> = hits
-                            .iter()
-                            .enumerate()
-                            .map(|(n, &(p, b))| {
-                                let title = self.pages[p].title.clone();
-                                let text = DisplayBlock::new(&self.pages[p].blocks[b].content)
-                                    .text
-                                    .replace('\n', " ");
-                                div()
-                                    .id(("query-hit", n))
-                                    .debug_selector(move || format!("query-{ix}-hit-{n}"))
-                                    .px_2()
-                                    .py(px(2.0))
-                                    .rounded_md()
-                                    .flex()
-                                    .flex_row()
-                                    .gap_3()
-                                    .cursor_pointer()
-                                    .hover(|d| d.bg(theme.selected_bg))
-                                    // A press here never starts editing the
-                                    // query block; the click opens the page.
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.open_page(&title, cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_color(theme.accent)
-                                            .child(self.pages[p].title.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_color(theme.text)
-                                            .child(text),
-                                    )
-                                    .into_any_element()
-                            })
-                            .collect();
-                        div()
-                            .id(("query", ix))
-                            .debug_selector(move || format!("query-{ix}"))
-                            .mt_1()
-                            .p_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.sidebar_bg)
-                            .flex()
-                            .flex_col()
-                            .text_size(px(font_size * 0.9))
-                            .child(div().px_2().pb_1().text_color(theme.muted).child(header))
-                            .children(items)
-                    });
-                let content = match query_list {
-                    Some(list) => div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .child(content)
-                        .child(list)
-                        .into_any_element(),
-                    None => content,
-                };
-                // A press on a row that isn't being edited starts editing it
-                // with the cursor under the mouse, and a drag from there
-                // selects (the root's mouse-move handler extends it). A press
-                // on a link does nothing here: the click handler navigates.
-                let link_at = {
-                    let (layout, display) = (text_layout.clone(), display.clone());
-                    move |position: gpui::Point<Pixels>| {
-                        let (layout, display) = (layout.as_ref()?, display.as_ref()?);
-                        // `Ok` only when the mouse is over an actual glyph.
-                        let char_ix = layout.index_for_position(position).ok()?;
-                        display
-                            .links
-                            .iter()
-                            .find(|l| l.range.contains(&char_ix))
-                            .cloned()
-                    }
-                };
-                let block_ref_at = {
-                    let (layout, display) = (text_layout.clone(), display.clone());
-                    move |position: gpui::Point<Pixels>| {
-                        let (layout, display) = (layout.as_ref()?, display.as_ref()?);
-                        let char_ix = layout.index_for_position(position).ok()?;
-                        display
-                            .block_refs
-                            .iter()
-                            .find(|r| r.range.contains(&char_ix))
-                            .map(|r| r.id)
-                    }
-                };
-                let on_press = {
-                    let (layout, display, link_at, block_ref_at) = (
-                        text_layout.clone(),
-                        display.clone(),
-                        link_at.clone(),
-                        block_ref_at.clone(),
-                    );
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        if link_at(event.position).is_some()
-                            || block_ref_at(event.position).is_some()
-                        {
-                            return;
-                        }
-                        let offset = layout.as_ref().map_or(0, |layout| {
-                            match layout.index_for_position(event.position) {
-                                Ok(i) | Err(i) => i,
-                            }
-                        });
-                        // Hidden prefix and markers are accounted for here;
-                        // see `DisplayBlock::to_source` for the boundary rule.
-                        let source = display.as_ref().map_or(0, |d| d.to_source(offset));
-                        this.start_edit(ix, window, cx);
-                        this.editor.set_cursor(source);
-                        this.selecting = true;
-                        cx.notify();
-                    })
-                };
-                let on_click = cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    // The press already started editing unless it was on a
-                    // link or a block reference; only those act on click.
-                    if this.editing == Some(ix) {
-                        return;
-                    }
-                    if let Some(link) = link_at(event.position()) {
-                        this.open_page(&link.target, cx);
-                    } else if let Some(id) = block_ref_at(event.position()) {
-                        this.open_block_ref(id, window, cx);
-                    }
-                });
-                // Blocks with children get a fold arrow; a folded one also
-                // shows how many blocks it hides. A press on the arrow stops
-                // there, so it never starts editing.
-                let hidden_count = page.descendant_count(ix);
-                let folded = hidden_count > 0 && self.collapsed.contains(&block.id);
-                let fold = (hidden_count > 0).then(|| {
-                    fold_arrow(&theme, folded)
-                        .debug_selector(move || format!("fold-{ix}"))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_fold(ix, cx);
-                            }),
-                        )
-                        .into_any_element()
-                });
-                // Dragging the bullet moves the block. The press on the handle
-                // stops there, so it never starts editing the row.
-                let block_id = block.id;
-                let handle = {
-                    let preview_text: SharedString = block
-                        .content
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .to_string()
-                        .into();
-                    drag_handle()
-                        .id(("handle", ix))
-                        .debug_selector(move || format!("handle-{ix}"))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_drag(DraggedBlock { id: block_id }, move |_, _, _, cx| {
-                            cx.new(|_| BlockDragPreview {
-                                text: preview_text.clone(),
-                                theme,
-                            })
-                        })
-                        .into_any_element()
-                };
-                let below = gap_below[ix];
-                let on_drag_move =
-                    cx.listener(move |this, event: &DragMoveEvent<DraggedBlock>, _, cx| {
-                        let position = event.event.position;
-                        if !event.bounds.contains(&position) {
-                            return;
-                        }
-                        let gap = if position.y < event.bounds.center().y {
-                            DropGap::Before(block_id)
-                        } else {
-                            below
-                        };
-                        let dragged = event.drag(cx).id;
-                        this.set_block_drop(dragged, Some(gap), cx);
-                    });
-                let drop_here = block_drop == Some(DropGap::Before(block_id));
-                let row = block_row(&theme, depth, font_size, kind, content, fold, handle)
-                    .relative()
-                    .when(drop_here, |d| {
-                        d.child(
-                            drop_line(&theme, depth)
-                                .debug_selector(move || format!("drop-before-{ix}")),
-                        )
-                    })
-                    .on_drag_move(on_drag_move)
-                    .when(folded, |d| {
-                        d.child(
-                            fold_badge(&theme, font_size, hidden_count)
-                                .debug_selector(move || format!("fold-badge-{ix}-{hidden_count}")),
-                        )
-                    })
-                    .id(("block", ix))
-                    // Lets tests find this row's on-screen bounds; a no-op in
-                    // normal builds.
-                    .debug_selector(|| format!("block-{ix}"))
-                    .cursor_text()
-                    .when(!is_editing, |d| {
-                        d.on_mouse_down(MouseButton::Left, on_press)
-                            .on_click(on_click)
-                    });
-                let menu = if is_editing { slash_menu.take() } else { None };
-                match menu {
-                    // The menu hangs off a zero-height strip right under the
-                    // edited row, lined up with its text; `deferred` paints it
-                    // above the rows below.
-                    Some(menu) => div()
-                        .flex()
-                        .flex_col()
-                        .child(row)
-                        .child(
-                            div().h(px(0.)).child(deferred(
-                                anchored()
-                                    .offset(point(px(24.0 * depth as f32 + 14.0), px(2.0)))
-                                    .snap_to_window_with_margin(px(8.))
-                                    .child(menu),
-                            )),
-                        )
-                        .into_any_element(),
-                    None => row.into_any_element(),
-                }
-            })
-            .collect();
+        // --- The focused pane's page (decision 40: the other pane, if any,
+        // is drawn further down) ---------------------------------------------
+        let page_view = self.render_page_view(
+            self.selected,
+            true,
+            slash_menu.map(IntoElement::into_any_element),
+            cx,
+        );
         #[cfg(test)]
         {
-            self.reading_layouts = reading_layouts;
+            self.reading_layouts = page_view.layouts;
         }
-
-        // --- Backlinks: blocks on other pages that link here ----------------
-        // Recomputed every frame. That is a scan of every block, which is fine
-        // for a personal graph; an index can replace it if it ever shows up in
-        // a profile.
-        let groups = backlinks(&self.pages, &page.title);
-        let total: usize = groups.iter().map(|g| g.blocks.len()).sum();
-        let mut backlink_items: Vec<AnyElement> = Vec::new();
-        let mut n: usize = 0; // running index over all references, for ids
-        for group in &groups {
-            let source = &self.pages[group.page];
-            let source_title = source.title.clone();
-            backlink_items.push(
-                div()
-                    .id(("backlink-page", group.page))
-                    .mt_2()
-                    .text_color(theme.accent)
-                    .cursor_pointer()
-                    .on_click(cx.listener({
-                        let title = source_title.clone();
-                        move |this, _e, _window, cx| this.open_page(&title, cx)
-                    }))
-                    .child(source_title.clone())
-                    .into_any_element(),
-            );
-            for &block_ix in &group.blocks {
-                let title = source_title.clone();
-                backlink_items.push(
-                    div()
-                        .id(("backlink", n))
-                        .debug_selector(|| format!("backlink-{n}"))
-                        .pl_4()
-                        .py_1()
-                        .cursor_pointer()
-                        .text_color(theme.text)
-                        .hover(|d| d.bg(theme.selected_bg))
-                        .on_click(cx.listener(move |this, _e, _window, cx| {
-                            this.open_page(&title, cx);
-                            // Unfold whatever hides the referencing block.
-                            if block_ix < this.pages[this.selected].blocks.len() {
-                                this.reveal(block_ix);
-                            }
-                        }))
-                        .child(source.blocks[block_ix].content.clone())
-                        .into_any_element(),
-                );
-                n += 1;
-            }
-        }
-        let backlinks_panel = (total > 0).then(|| {
-            div()
-                .id("backlinks")
-                .mt_8()
-                .pt_4()
-                .border_t_1()
-                .border_color(theme.border)
-                .flex()
-                .flex_col()
-                .child(div().text_color(theme.muted).child(format!(
-                    "{total} LINKED REFERENCE{}",
-                    if total == 1 { "" } else { "S" }
-                )))
-                .children(backlink_items)
-        });
-
-        let main = div()
-            .id("main")
-            .flex_1()
-            .h_full()
-            .overflow_y_scroll()
-            .p_8()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .mb_4()
-                    .text_size(px(font_size * 1.9))
-                    .text_color(theme.text)
-                    .child(page.title.clone()),
-            )
-            .children(rows)
-            // The drop line for "after the last block".
-            .when(block_drop == Some(DropGap::End), |d| {
-                d.child(
-                    div()
-                        .relative()
-                        .h(px(0.))
-                        .child(drop_line(&theme, 0).debug_selector(|| "drop-end".to_string())),
-                )
-            })
-            // Leaving the page area hides the drop line; dropping anywhere on
-            // the page moves the block to where the line is.
-            .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<DraggedBlock>, _, cx| {
-                    if !event.bounds.contains(&event.event.position) {
-                        let dragged = event.drag(cx).id;
-                        this.set_block_drop(dragged, None, cx);
-                    }
-                }),
-            )
-            .on_drop(
-                cx.listener(|this, dragged: &DraggedBlock, _, cx| this.drop_block(dragged.id, cx)),
-            )
-            // Image files dragged in from outside: a faint wash while they
-            // are over the page; releasing them adds them (`finish_file_drop`).
-            .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
-                    let inside = event.bounds.contains(&event.event.position);
-                    let was_inside = this.file_drag.as_ref().map(|(_, inside)| *inside);
-                    this.file_drag = Some((event.drag(cx).clone(), inside));
-                    if was_inside != Some(inside) {
-                        cx.notify();
-                    }
-                }),
-            )
-            .when(file_over, |d| d.bg(theme.selected_bg))
-            .child({
-                let app = cx.entity();
-                gpui::canvas(
-                    |_, _, _| {},
-                    move |_, _, window, _| {
-                        let on_up = app.clone();
-                        window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
-                            if phase == gpui::DispatchPhase::Bubble {
-                                on_up.update(cx, |this, cx| this.finish_file_drop(window, cx));
-                            }
-                        });
-                        // Outside files never press the mouse in this window,
-                        // so a press means any earlier file drag is over.
-                        window.on_mouse_event(move |_: &MouseDownEvent, phase, _, cx| {
-                            if phase == gpui::DispatchPhase::Capture {
-                                app.update(cx, |this, _| this.file_drag = None);
-                            }
-                        });
-                    },
-                )
-                .absolute()
-                .size_0()
-            })
-            .children(backlinks_panel)
-            // Empty space below the blocks: clicking it leaves edit mode.
-            .child(
-                div()
-                    .id("filler")
-                    .flex_1()
-                    .min_h(px(120.0))
-                    .on_click(cx.listener(|this, _e, _window, cx| this.stop_edit(cx))),
-            );
+        let main = page_view.element;
 
         // --- Search overlay (Ctrl-K) -----------------------------------------
         let overlay = self.search.as_ref().map(|state| {
@@ -6468,7 +6706,7 @@ impl Render for NoteSec {
             .children(tab_items);
 
         // No tabs: say so and offer the usual ways to open one.
-        let empty_state = || {
+        let empty_state = |cx: &mut Context<Self>| {
             let hint_row = |keys: String, what: &'static str| {
                 div()
                     .flex()
@@ -6529,17 +6767,169 @@ impl Render for NoteSec {
             (Mode::Graph, Some(graph)) => graph.clone().into_any_element(),
             (Mode::Agenda, _) => self.render_agenda(cx),
             (Mode::Trash, _) => self.render_trash(cx),
-            (Mode::Empty, _) => empty_state().into_any_element(),
+            (Mode::Empty, _) => empty_state(cx).into_any_element(),
             _ => main.into_any_element(),
         };
-        let content = div()
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .child(tab_bar)
-            .child(view);
+
+        // Split (decision 40): the focused pane shows `view`; the other one
+        // what it holds, drawn read-only. A press anywhere in the other pane
+        // focuses it first (capture phase), so the click then acts there.
+        let split = self.split.clone();
+        #[cfg(test)]
+        self.other_layouts.clear();
+        let other: Option<AnyElement> = match &split {
+            None => None,
+            // The left pane: its active tab.
+            Some(s) if s.right_focused => Some(match self.tabs.active_target().cloned() {
+                Some(TabTarget::Page(title)) => match self.find_page(&title) {
+                    Some(ix) => self.render_other_page(ix, cx),
+                    None => div().into_any_element(),
+                },
+                Some(TabTarget::Graph) => match &self.graph {
+                    Some(graph) => graph.clone().into_any_element(),
+                    None => div().into_any_element(),
+                },
+                Some(TabTarget::Agenda) => self.render_agenda(cx),
+                Some(TabTarget::Trash) => self.render_trash(cx),
+                None => empty_state(cx).into_any_element(),
+            }),
+            // The right pane: its page.
+            Some(_) => Some(match self.right_page() {
+                Some(ix) => self.render_other_page(ix, cx),
+                None => div().into_any_element(),
+            }),
+        };
+        let content =
+            match (split, other) {
+                (Some(split), Some(other)) => {
+                    let right_focused = split.right_focused;
+                    // A pane's × (each pane has one while split).
+                    let close_button = |right: bool| {
+                        let side = if right { "right" } else { "left" };
+                        div()
+                            .id(if right {
+                                "pane-close-right"
+                            } else {
+                                "pane-close-left"
+                            })
+                            .debug_selector(move || format!("pane-close-{side}"))
+                            .flex_shrink_0()
+                            .px_2()
+                            .mx_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(theme.muted)
+                            .hover(|d| d.bg(theme.selected_bg).text_color(theme.text))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.close_pane(right, cx);
+                                }),
+                            )
+                            .child("×")
+                    };
+                    // The focused pane gets an accent line along its top.
+                    let focus_line = |focused: bool, side: &'static str| {
+                        div()
+                            .flex_shrink_0()
+                            .h(px(2.0))
+                            .bg(if focused { theme.accent } else { theme.border })
+                            .when(focused, |d| {
+                                d.debug_selector(move || format!("pane-focus-{side}"))
+                            })
+                    };
+                    let left_header = div()
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .bg(theme.sidebar_bg)
+                        .child(div().flex_1().min_w_0().child(tab_bar))
+                        .child(close_button(false));
+                    let right_title = div()
+                        .debug_selector(|| "pane-right-title".to_string())
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if right_focused {
+                            theme.accent
+                        } else {
+                            theme.muted
+                        })
+                        .child(split.right.clone());
+                    let right_header = div()
+                        .flex_shrink_0()
+                        .h(px(font_size * 2.2))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .pl_3()
+                        .bg(theme.sidebar_bg)
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(right_title)
+                        .child(close_button(true));
+                    let (left_view, right_view) = if right_focused {
+                        (other, view)
+                    } else {
+                        (view, other)
+                    };
+                    let left = div()
+                        .id("pane-left")
+                        .debug_selector(|| "pane-left".to_string())
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .when(right_focused, |d| {
+                            d.capture_any_mouse_down(cx.listener(
+                                |this, _: &MouseDownEvent, _, cx| this.focus_pane(false, cx),
+                            ))
+                        })
+                        .child(focus_line(!right_focused, "left"))
+                        .child(left_header)
+                        .child(left_view);
+                    let right = div()
+                        .id("pane-right")
+                        .debug_selector(|| "pane-right".to_string())
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .border_l_1()
+                        .border_color(theme.border)
+                        .when(!right_focused, |d| {
+                            d.capture_any_mouse_down(cx.listener(
+                                |this, _: &MouseDownEvent, _, cx| this.focus_pane(true, cx),
+                            ))
+                        })
+                        .child(focus_line(right_focused, "right"))
+                        .child(right_header)
+                        .child(right_view);
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_row()
+                        .child(left)
+                        .child(right)
+                }
+                _ => div().flex_1().h_full().min_w_0().flex().flex_row().child(
+                    div()
+                        .id("pane-left")
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(tab_bar)
+                        .child(view),
+                ),
+            };
 
         let settings_overlay = self
             .settings
@@ -6660,6 +7050,9 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_reset_font))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_toggle_git_backup))
+            .on_action(cx.listener(Self::on_split_right))
+            .on_action(cx.listener(Self::on_close_pane))
+            .on_action(cx.listener(Self::on_focus_other_pane))
             .on_action(cx.listener(Self::on_open_agenda))
             .on_action(cx.listener(Self::on_open_trash))
             .on_action(cx.listener(Self::on_export_html))
@@ -11219,7 +11612,9 @@ mod tests {
     #[gpui::test]
     fn every_command_is_listed_with_an_empty_query(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup_pages(cx, "cmd-all", &command_pages(), "Test");
-        // Opened while editing a block, so editor commands are offered too.
+        // Split, so the pane commands are offered, and opened while editing
+        // a block, so editor commands are offered too.
+        cx.simulate_keystrokes("ctrl-\\");
         click_block(cx, 0);
         cx.simulate_keystrokes("ctrl-k");
         assert!(has(cx, "palette-commands-header"));
@@ -11280,6 +11675,8 @@ mod tests {
             ("export html", Command::ExportHtml),
             ("git backup", Command::ToggleGitBackup),
             ("autosave", Command::ToggleGitBackup),
+            ("side by side", Command::SplitRight),
+            ("split", Command::SplitRight),
             ("html", Command::ExportHtml),
             ("col all", Command::CollapseAll),
             ("exp all", Command::ExpandAll),
@@ -12137,6 +12534,475 @@ mod tests {
         cx.simulate_keystrokes("escape");
         edit_and_leave(cx, 0, " still");
         assert!(file(&dir).contains("still"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- split panes (decision 40) -------------------------------------------
+
+    fn split_of(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Option<Split> {
+        view.update(cx, |app, _| app.split.clone())
+    }
+
+    fn split_is(right: &str, right_focused: bool) -> Option<Split> {
+        Some(Split {
+            right: right.to_string(),
+            right_focused,
+        })
+    }
+
+    /// Whether element `selector` is drawn inside pane `side` ("left" or
+    /// "right").
+    fn in_pane(cx: &mut VisualTestContext, selector: &str, side: &str) -> bool {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        let pane: &'static str = Box::leak(format!("pane-{side}").into_boxed_str());
+        let element = cx.debug_bounds(selector).expect(selector);
+        let pane = cx.debug_bounds(pane).expect(pane);
+        pane.contains(&element.center())
+    }
+
+    /// The text the unfocused pane shows for reading-view row `row`.
+    fn other_text(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        row: usize,
+    ) -> Option<String> {
+        view.update(cx, |app, _| {
+            app.other_layouts
+                .iter()
+                .find(|(r, _)| *r == row)
+                .map(|(_, l)| l.text())
+        })
+    }
+
+    fn tab_labels(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+    ) -> (Vec<String>, Option<usize>) {
+        tab_state(view, cx)
+    }
+
+    fn labels(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[gpui::test]
+    fn split_right_key_opens_the_current_page_on_the_right_and_focuses_it(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "split-open", &tab_pages(), "Test");
+        assert!(has(cx, "block-0"));
+        for selector in [
+            "pane-right",
+            "pane-focus-left",
+            "pane-close-left",
+            "pane-close-right",
+        ] {
+            assert!(!has(cx, selector), "{selector} before splitting");
+        }
+
+        cx.simulate_keystrokes("ctrl-\\");
+        assert_eq!(split_of(&view, cx), split_is("Test", true));
+        for selector in [
+            "pane-left",
+            "pane-right",
+            "pane-focus-right",
+            "pane-close-left",
+        ] {
+            assert!(has(cx, selector), "{selector}");
+        }
+        assert!(has(cx, "pane-close-right") && has(cx, "pane-right-title"));
+        assert!(!has(cx, "pane-focus-left"));
+        // The focused (right) pane has the plain selectors, the other pane
+        // the `other-` ones; both show the page.
+        assert!(in_pane(cx, "block-0", "right"));
+        assert!(in_pane(cx, "other-block-0", "left"));
+        assert!(in_pane(cx, "tab-0", "left"));
+        assert_eq!(reading_text(&view, cx, 0).as_deref(), Some("see [[Alpha]]"));
+        assert_eq!(other_text(&view, cx, 0).as_deref(), Some("see [[Alpha]]"));
+        // The tab bar (the left pane's) is unchanged.
+        tabs_are(&view, cx, &["Test"], 0);
+
+        // Never a third pane: splitting again only focuses the right pane.
+        cx.simulate_keystrokes("ctrl-|");
+        assert_eq!(split_of(&view, cx), split_is("Test", false));
+        cx.simulate_keystrokes("ctrl-\\");
+        assert_eq!(split_of(&view, cx), split_is("Test", true));
+
+        // From the graph tab, the page last shown opens on the right.
+        cx.simulate_keystrokes("ctrl-shift-w ctrl-g");
+        assert_eq!(split_of(&view, cx), None);
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+        cx.simulate_keystrokes("ctrl-\\");
+        assert_eq!(split_of(&view, cx), split_is("Test", true));
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Notes);
+            assert_eq!(app.tabs.active_target(), Some(&TabTarget::Graph));
+        });
+        assert!(in_pane(cx, "block-0", "right"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn navigation_goes_to_the_focused_pane(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "split-nav", &tab_pages(), "Test");
+        cx.simulate_keystrokes("ctrl-\\");
+
+        // Right pane focused: the sidebar, links and the palette replace its
+        // page, and the tabs stay as they are.
+        click_sidebar_page(&view, cx, "Alpha");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", true));
+        assert_eq!(tab_labels(&view, cx), (labels(&["Test"]), Some(0)));
+        assert_eq!(selected_title(&view, cx), "Alpha");
+        assert_eq!(reading_text(&view, cx, 0).as_deref(), Some("alpha"));
+        assert_eq!(other_text(&view, cx, 0).as_deref(), Some("see [[Alpha]]"));
+        assert!(in_pane(cx, "block-0", "right"));
+        view.update(cx, |app, cx| app.open_page("Beta", cx));
+        assert_eq!(split_of(&view, cx), split_is("Beta", true));
+        assert_eq!(tab_labels(&view, cx), (labels(&["Test"]), Some(0)));
+        run_in_palette(cx, "Alpha");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", true));
+        assert_eq!(tab_labels(&view, cx), (labels(&["Test"]), Some(0)));
+        // A link in the left (unfocused) pane: the press focuses the left
+        // pane, then the link opens there, in the tab bar.
+        let link = view.update(cx, |app, _| {
+            let (_, layout) = app.other_layouts.iter().find(|(r, _)| *r == 0).unwrap();
+            let p = layout.position_for_index(7).unwrap();
+            point(p.x + px(1.), p.y + layout.line_height() / 2.)
+        });
+        cx.simulate_click(link, Modifiers::none());
+        assert_eq!(split_of(&view, cx), split_is("Alpha", false));
+        tabs_are(&view, cx, &["Alpha"], 0);
+
+        // Left pane focused: navigation uses the tabs as before.
+        click_sidebar_page(&view, cx, "Beta");
+        tabs_are(&view, cx, &["Alpha", "Beta"], 1);
+        assert_eq!(split_of(&view, cx), split_is("Alpha", false));
+        assert!(in_pane(cx, "block-0", "left"));
+        assert_eq!(other_text(&view, cx, 0).as_deref(), Some("alpha"));
+
+        // Tab actions belong to the left pane and focus it.
+        cx.simulate_keystrokes("ctrl-\\");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", true));
+        click_on(cx, "tab-0");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", false));
+        tabs_are(&view, cx, &["Alpha", "Beta"], 0);
+        cx.simulate_keystrokes("ctrl-\\ ctrl-tab");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", false));
+        tabs_are(&view, cx, &["Alpha", "Beta"], 1);
+        // Agenda, trash and graph open as left tabs, and the right pane
+        // keeps its page.
+        for (query, mode) in [
+            ("open agenda", Mode::Agenda),
+            ("open trash", Mode::Trash),
+            ("toggle graph view", Mode::Graph),
+        ] {
+            cx.simulate_keystrokes("ctrl-\\");
+            run_in_palette(cx, query);
+            assert_eq!(split_of(&view, cx), split_is("Alpha", false), "{query}");
+            view.update(cx, |app, _| assert_eq!(app.mode, mode));
+            assert_eq!(other_text(&view, cx, 0).as_deref(), Some("alpha"));
+        }
+        // A press in the right pane focuses it again, the graph stays left.
+        click_on(cx, "pane-right-title");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", true));
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Notes);
+            assert_eq!(app.tabs.active_target(), Some(&TabTarget::Graph));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn focus_other_pane_moves_the_indicator_and_the_editor(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "split-focus", &tab_pages(), "Test");
+        cx.simulate_keystrokes("ctrl-\\");
+        click_sidebar_page(&view, cx, "Alpha");
+        click_block(cx, 0);
+        cx.simulate_input(" one");
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+
+        // The key: the edit is saved, editing stops, the indicator moves.
+        cx.simulate_keystrokes("ctrl-|");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", false));
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Alpha")).unwrap(),
+            "- alpha one\n"
+        );
+        assert!(has(cx, "pane-focus-left") && !has(cx, "pane-focus-right"));
+        assert_eq!(selected_title(&view, cx), "Test");
+        assert!(in_pane(cx, "block-0", "left") && in_pane(cx, "other-block-0", "right"));
+
+        // A click on a block in the other pane focuses it and edits there.
+        click_on(cx, "other-block-0");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", true));
+        assert!(has(cx, "pane-focus-right") && !has(cx, "pane-focus-left"));
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.pages[app.selected].title, "Alpha");
+        });
+        cx.simulate_input("!");
+        click_on(cx, "other-block-0");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", false));
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.pages[app.selected].title, "Test");
+        });
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Alpha")).unwrap(),
+            "- alpha one!\n"
+        );
+        // Back with the key; then with the palette command.
+        cx.simulate_keystrokes("escape ctrl-|");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", true));
+        run_in_palette(cx, "focus other pane");
+        assert_eq!(split_of(&view, cx), split_is("Alpha", false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn close_pane_closes_the_focused_pane_either_side(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "split-close", &tab_pages(), "Test");
+        // Not split: the pane keys do nothing.
+        cx.simulate_keystrokes("ctrl-shift-w ctrl-|");
+        assert_eq!(split_of(&view, cx), None);
+        tabs_are(&view, cx, &["Test"], 0);
+
+        // The right pane, with the key: the tabs are as they were.
+        cx.simulate_keystrokes("ctrl-\\");
+        click_sidebar_page(&view, cx, "Alpha");
+        cx.simulate_keystrokes("ctrl-shift-w");
+        assert_eq!(split_of(&view, cx), None);
+        tabs_are(&view, cx, &["Test"], 0);
+        for selector in [
+            "pane-right",
+            "pane-focus-left",
+            "pane-close-left",
+            "other-block-0",
+        ] {
+            assert!(!has(cx, selector), "{selector}");
+        }
+
+        // The left pane, with the key: the right page moves into the tabs.
+        cx.simulate_keystrokes("ctrl-\\");
+        click_sidebar_page(&view, cx, "Alpha");
+        cx.simulate_keystrokes("ctrl-| ctrl-shift-w");
+        assert_eq!(split_of(&view, cx), None);
+        tabs_are(&view, cx, &["Test", "Alpha"], 1);
+
+        // Ctrl+W in the right pane closes the pane, not a tab.
+        cx.simulate_keystrokes("ctrl-\\ ctrl-w");
+        assert_eq!(split_of(&view, cx), None);
+        tabs_are(&view, cx, &["Test", "Alpha"], 1);
+
+        // The ×s: the left one while the right pane has focus (its page
+        // already has a tab, which gets focus), and the right one.
+        cx.simulate_keystrokes("ctrl-\\");
+        click_sidebar_page(&view, cx, "Beta");
+        click_on(cx, "pane-close-left");
+        assert_eq!(split_of(&view, cx), None);
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 2);
+        cx.simulate_keystrokes("ctrl-\\ ctrl-|");
+        click_on(cx, "pane-close-right");
+        assert_eq!(split_of(&view, cx), None);
+        tabs_are(&view, cx, &["Test", "Alpha", "Beta"], 2);
+        // The palette command.
+        cx.simulate_keystrokes("ctrl-\\");
+        run_in_palette(cx, "close pane");
+        assert_eq!(split_of(&view, cx), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn an_edit_in_one_pane_shows_in_the_other(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "split-edit", "- hello\n- second\n");
+        cx.simulate_keystrokes("ctrl-\\");
+        click_block(cx, 0);
+        cx.simulate_input(" world");
+        // Live, while typing (the same page on both sides).
+        assert_eq!(other_text(&view, cx, 0).as_deref(), Some("hello world"));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("new");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(other_text(&view, cx, 0).as_deref(), Some("hello world"));
+        assert_eq!(other_text(&view, cx, 1).as_deref(), Some("new"));
+        assert_eq!(other_text(&view, cx, 2).as_deref(), Some("second"));
+        assert!(has(cx, "other-block-2"));
+        // And back the other way.
+        cx.simulate_keystrokes("ctrl-|");
+        click_block(cx, 2);
+        cx.simulate_input(" too");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(other_text(&view, cx, 2).as_deref(), Some("second too"));
+        assert_eq!(file(&dir), "- hello world\n- new\n- second too\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn renaming_sorting_and_trashing_the_right_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "split-pages", &tab_pages(), "Test");
+        cx.simulate_keystrokes("ctrl-\\");
+        click_sidebar_page(&view, cx, "Alpha");
+        cx.simulate_keystrokes("ctrl-|");
+
+        // Rename (from the sidebar's page menu): the pane follows by title.
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-rename");
+        cx.simulate_input("Gamma");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(split_of(&view, cx), split_is("Gamma", false));
+        assert_eq!(other_text(&view, cx, 0).as_deref(), Some("alpha"));
+        assert_eq!(selected_title(&view, cx), "Test");
+
+        // A new order moves the pages around; the pane keeps its page.
+        view.update(cx, |app, cx| {
+            app.state.page_order = labels(&["Test", "Gamma", "Beta"]);
+            app.sort_pages();
+            cx.notify();
+        });
+        assert_eq!(non_journal_titles(&view, cx), ["Test", "Gamma", "Beta"]);
+        cx.simulate_keystrokes("ctrl-|");
+        assert_eq!(selected_title(&view, cx), "Gamma");
+        run_in_palette(cx, "sort pages");
+        assert_eq!(non_journal_titles(&view, cx), ["Beta", "Gamma", "Test"]);
+        assert_eq!(split_of(&view, cx), split_is("Gamma", true));
+        assert_eq!(selected_title(&view, cx), "Gamma");
+        assert_eq!(reading_text(&view, cx, 0).as_deref(), Some("alpha"));
+        assert_eq!(other_text(&view, cx, 0).as_deref(), Some("see [[Alpha]]"));
+
+        // Trashing it from the left pane closes the right pane.
+        cx.simulate_keystrokes("ctrl-|");
+        right_click_page(&view, cx, "Gamma");
+        click_on(cx, "page-menu-delete");
+        click_on(cx, "confirm-delete-ok");
+        assert_eq!(split_of(&view, cx), None);
+        tabs_are(&view, cx, &["Test"], 0);
+        assert!(!has(cx, "pane-right") && !has(cx, "other-block-0"));
+        assert!(!page_file(&dir, "Gamma").exists());
+
+        // Trashing it while it has focus: the left pane takes over.
+        cx.simulate_keystrokes("ctrl-\\");
+        click_sidebar_page(&view, cx, "Beta");
+        run_in_palette(cx, "delete current page");
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Beta"));
+        click_on(cx, "confirm-delete-ok");
+        assert_eq!(split_of(&view, cx), None);
+        tabs_are(&view, cx, &["Test"], 0);
+        assert!(!page_file(&dir, "Beta").exists());
+        // Restoring it from the trash brings the page back, not the pane.
+        run_in_palette(cx, "open trash");
+        let id = view.update(cx, |app, _| app.trash[0].id.clone());
+        view.update(cx, |app, cx| app.restore_from_trash(&id, cx));
+        assert!(page_file(&dir, "Beta").exists());
+        assert_eq!(split_of(&view, cx), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn current_page_commands_target_the_focused_pane(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "split-cmds", &command_pages(), "Beta");
+        cx.simulate_keystrokes("ctrl-\\");
+        click_sidebar_page(&view, cx, "Test");
+        // Right: Test (with children), left: Beta.
+        run_in_palette(cx, "collapse all");
+        assert_eq!(shown(cx, 5), vec![0, 2]);
+        run_in_palette(cx, "expand all");
+        assert_eq!(shown(cx, 5), vec![0, 1, 2, 3, 4]);
+        run_in_palette(cx, "toggle favorite");
+        assert_eq!(UiState::load(&dir).favorites, labels(&["Test"]));
+        run_in_palette(cx, "copy page title");
+        let clip = |cx: &mut VisualTestContext| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        };
+        assert_eq!(clip(cx), "Test");
+        run_in_palette(cx, "export page to html");
+        assert!(dir.join("exports/Test.html").exists());
+        assert!(!dir.join("exports/Beta.html").exists());
+        run_in_palette(cx, "rename current page");
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Test"));
+        cx.simulate_keystrokes("escape");
+
+        // The left pane.
+        cx.simulate_keystrokes("ctrl-|");
+        run_in_palette(cx, "copy page title");
+        assert_eq!(clip(cx), "Beta");
+        run_in_palette(cx, "toggle favorite");
+        assert_eq!(UiState::load(&dir).favorites, labels(&["Test", "Beta"]));
+        run_in_palette(cx, "export page to html");
+        assert!(dir.join("exports/Beta.html").exists());
+        run_in_palette(cx, "delete current page");
+        assert_eq!(menu_title(&view, cx).as_deref(), Some("Beta"));
+        cx.simulate_keystrokes("escape");
+        // The local graph is the focused page's.
+        cx.simulate_keystrokes("ctrl-|");
+        run_in_palette(cx, "toggle local graph");
+        assert_eq!(split_of(&view, cx), split_is("Test", false));
+        view.update(cx, |app, _| {
+            assert_eq!(app.mode, Mode::Graph);
+            assert_eq!(app.pages[app.selected].title, "Test");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn pane_commands_are_offered_only_while_split(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "split-palette", &tab_pages(), "Test");
+        let offered = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| app.available_commands())
+        };
+        let list = offered(&view, cx);
+        assert!(list.contains(&Command::SplitRight));
+        assert!(!list.contains(&Command::ClosePane));
+        assert!(!list.contains(&Command::FocusOtherPane));
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("pane");
+        assert!(!has(cx, "command-ClosePane") && !has(cx, "command-FocusOtherPane"));
+        cx.simulate_keystrokes("escape");
+        // Dispatched anyway (no key, no palette row): nothing happens.
+        cx.dispatch_action(ClosePane);
+        cx.dispatch_action(FocusOtherPane);
+        assert_eq!(split_of(&view, cx), None);
+        tabs_are(&view, cx, &["Test"], 0);
+
+        run_in_palette(cx, "split right");
+        assert_eq!(split_of(&view, cx), split_is("Test", true));
+        let list = offered(&view, cx);
+        assert!(list.contains(&Command::ClosePane) && list.contains(&Command::FocusOtherPane));
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("pane");
+        assert!(has(cx, "command-ClosePane") && has(cx, "command-FocusOtherPane"));
+        // The pane keys don't act under the palette.
+        cx.simulate_keystrokes("ctrl-|");
+        assert_eq!(split_of(&view, cx), split_is("Test", true));
+        cx.simulate_keystrokes("escape");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn pane_keys_are_bound_as_linux_reports_them(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(cx, "split-keys", "- hi\n");
+        let keymap = cx.update(|_, cx| cx.key_bindings());
+        let keymap = keymap.borrow();
+        let hint = |c: Command| binding_hint(&keymap, c.action().as_ref());
+        assert_eq!(hint(Command::SplitRight).as_deref(), Some("Ctrl+\\"));
+        assert_eq!(hint(Command::ClosePane).as_deref(), Some("Ctrl+Shift+W"));
+        assert_eq!(hint(Command::FocusOtherPane).as_deref(), Some("Ctrl+|"));
+        // Ctrl+Shift+W is its own binding, apart from Ctrl+W.
+        let ctrl_shift_w = gpui::Keystroke::parse("ctrl-shift-w").unwrap();
+        let ctrl_w = gpui::Keystroke::parse("ctrl-w").unwrap();
+        for binding in keymap.bindings() {
+            if binding.keystrokes().len() != 1 {
+                continue;
+            }
+            let action = binding.action();
+            if ctrl_shift_w.should_match(&binding.keystrokes()[0]) {
+                assert!(action.partial_eq(&ClosePane), "{}", action.name());
+            }
+            if ctrl_w.should_match(&binding.keystrokes()[0]) {
+                assert!(action.partial_eq(&CloseTab), "{}", action.name());
+            }
+        }
+        drop(keymap);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

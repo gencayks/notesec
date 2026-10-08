@@ -1111,6 +1111,75 @@ that mutate, and data races are essentially impossible.
     (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM`,
     `GIT_CEILING_DIRECTORIES`). The UI tests drive the timer with
     `advance_clock`.
+40. **Split panes: two pages side by side, one shared tab bar.**
+    *Commands* (palette group Tabs): "Split right" (`SplitRight`,
+    Ctrl+\\, keywords split view, side by side, second pane, two pages),
+    "Close pane" (`ClosePane`, Ctrl+Shift+W, unsplit, single pane) and
+    "Focus other pane" (`FocusOtherPane`, Ctrl+|, switch pane, other
+    side). Close pane and Focus other pane are offered only while split
+    and do nothing otherwise. None of the three acts under an overlay
+    (palette, settings, page menu, shortcuts). *Keys*: the bindings are
+    `ctrl-\` and `ctrl-|`, not `ctrl-shift-\`. On Linux GPUI reports
+    the shifted character with shift dropped (`keystroke_from_xkb` in
+    gpui_linux: Shift+\\ arrives as key `|` without shift), and a binding
+    matches only with equal modifiers and key, so `ctrl-shift-\` would
+    never fire. Same rule as `ctrl-+` for Increase font. So Focus other
+    pane is Ctrl+Shift+\\ on a US layout, shown as "Ctrl+|". Ctrl+Shift+W
+    arrives as `ctrl-shift-w` (a letter keeps its shift) and doesn't
+    collide with Ctrl+W (Close tab): modifiers must match. A test checks
+    both bindings. *At most two panes*: `split: Option<Split>`, where
+    `Split { right: String, right_focused: bool }`. Splitting again only
+    focuses the right pane. **Tab bar: one, shared, owned by the left
+    pane.** The left pane is the existing main view: the tab bar and its
+    active tab (page, graph, agenda or trash). The right pane shows one
+    page with a small header: its title (accent while focused,
+    `pane-right-title`) and a × (`pane-close-right`). The left header is
+    the tab bar plus a × (`pane-close-left`). Per-pane tab bars were
+    rejected: a second `Tabs`, with its own RECENT, history and close
+    rules, would double the state every tab action has to keep straight,
+    and everything that already works through the tab bar (graph,
+    agenda, trash, the neighbour after a close) would need a "which bar"
+    argument. The right pane holds pages only; graph, agenda, trash and
+    settings stay where they were, and opening one (or any tab action:
+    clicking a tab, Ctrl+Tab, Ctrl+W on a tab) focuses the left pane.
+    *One focused pane*: `selected`, `mode`, `editing` and the current
+    page always describe the focused pane, so every existing command
+    (rename, delete, favorite, copy title, export, collapse / expand all,
+    templates, the local graph, undo) acts on the focused pane's page
+    without knowing about panes. A 2px accent line tops the focused pane
+    (`pane-focus-left` / `pane-focus-right`); the other pane's line is
+    the border colour. *Navigation*: `show_page` / `navigate` /
+    `open_page` keep their signatures; their funnel `show_page_in` sends
+    the page to the focused pane: with the right pane focused it replaces
+    the right pane's page and leaves the tabs alone; otherwise tabs work
+    as before. So the sidebar, links, block references, backlinks,
+    search and the agenda all open into the focused pane. *One editor*:
+    only the focused pane edits. Switching focus (key, palette, or a
+    press anywhere in the other pane) saves and ends the edit. The press
+    is caught in the capture phase on the pane (`capture_any_mouse_down`)
+    and focuses it before the children's handlers run, so the same click
+    then acts there (starts editing the block, follows the link, clicks
+    the ×). The unfocused pane draws the page read-only (no drag-move
+    targets, no image or file drop). Its debug selectors start with
+    `other-` (`other-block-0`): selectors are a per-frame map, so the two
+    panes can't share them. *Same page in both*: both draw from the same
+    `pages`. The other pane mirrors the block being edited live (it reads
+    the editor's text for that row), and structure changes show at once.
+    Folds are per block, so they show on both sides. *Close pane* closes
+    the focused pane. Closing the right pane leaves the tabs as they
+    were. Closing the left pane moves the right page into the tab bar
+    (its tab, or a new one, focused). Ctrl+W in the focused right pane
+    closes that pane rather than a tab. *Stable identity*: the right
+    pane stores its page's title, not an index, so sorting and reordering
+    are harmless. Rename updates it. When the page goes away (deleted
+    from either pane, or an undo removing it), `prune_split` in
+    `apply_tab` / `restore_history` closes the right pane, so no stale
+    index is ever drawn. Restoring the page from the trash doesn't reopen
+    the pane. *Undo* stays app-wide; with the right pane focused, the
+    restored page is shown there. *Not persisted*: the split isn't saved
+    in `state.toml` (a fresh start has one pane). Nice to have later:
+    save `Split` with the tabs, and a draggable divider (the panes are
+    equal halves now).
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

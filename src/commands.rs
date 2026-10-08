@@ -118,6 +118,9 @@ commands! {
     CloseTab => "Close tab", [], Nothing;
     NextTab => "Next tab", [], Nothing;
     PrevTab => "Previous tab", [], Nothing;
+    SplitRight => "Split right", ["split view", "side by side", "second pane", "two pages"], Nothing;
+    ClosePane => "Close pane", ["unsplit", "single pane"], Nothing;
+    FocusOtherPane => "Focus other pane", ["switch pane", "other side"], Nothing;
     // App
     OpenSettings => "Open settings", ["preferences", "theme", "font"], Nothing;
     ToggleGitBackup => "Toggle git auto-backup", ["git", "backup", "version", "history", "autosave"], Nothing;
