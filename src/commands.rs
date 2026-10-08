@@ -19,8 +19,8 @@ use gpui::{Action, KeyBinding, KeybindingKeystroke, Keymap};
 pub enum Needs {
     /// Nothing: works from any tab, even with no tabs open.
     Nothing,
-    /// A current page: a page tab is showing (not the graph, the agenda
-    /// or the empty state). The palette hides it otherwise.
+    /// A current page: a page tab is showing (not the graph, the agenda,
+    /// the trash or the empty state). The palette hides it otherwise.
     Page,
     /// A block being edited: offered only when the palette was opened
     /// while editing one. Running it goes back to that block (cursor and
@@ -87,6 +87,7 @@ commands! {
     NewPage => "New page", ["create", "add page"], Nothing;
     OpenToday => "Open today's journal", ["today", "daily", "journal"], Nothing;
     OpenAgenda => "Open agenda", ["tasks", "todo", "scheduled", "deadline"], Nothing;
+    OpenTrash => "Open trash", ["deleted", "restore", "bin", "recycle", "undelete"], Nothing;
     RenamePage => "Rename current page", ["title", "name"], Page;
     DeletePage => "Delete current page", ["remove", "trash"], Page;
     CopyPageTitle => "Copy page title", ["clipboard", "name"], Page;

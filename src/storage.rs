@@ -6,9 +6,18 @@
 //! <graph>/pages/<title>.md
 //! <graph>/journals/YYYY_MM_DD.md      (page title is shown as YYYY-MM-DD)
 //! <graph>/templates/<name>.md         (notesec only; Logseq ignores it)
+//! <graph>/.trash/<millis>/pages/<title>.md        (deleted pages, see below)
+//! <graph>/.trash/<millis>/journals/YYYY_MM_DD.md
 //! ```
 //!
 //! The markdown files are the source of truth; nothing is cached elsewhere.
+//!
+//! Deleting a page moves its file into the trash: a folder per deleted page,
+//! named by the deletion time (milliseconds since the Unix epoch, which
+//! sorts and needs no time zone), holding the file under its original path
+//! relative to the graph. Restoring moves it back to that
+//! path. Only `pages/` and `journals/` are read as pages, so nothing in the
+//! hidden `.trash/` folder is ever loaded as one.
 
 use crate::model::Page;
 use std::fs;
@@ -185,12 +194,157 @@ impl Storage {
         }
     }
 
-    /// Delete `page`'s file. A file that is already gone counts as deleted.
-    pub fn delete(&self, page: &Page) -> io::Result<()> {
-        match fs::remove_file(self.path_for(page)) {
+    /// Where deleted pages go: `<graph>/.trash/`.
+    pub fn trash_dir(&self) -> PathBuf {
+        self.root.join(TRASH_DIR)
+    }
+
+    /// Move `page`'s file into the trash, deleted now. See [`Storage::trash_at`].
+    pub fn trash(&self, page: &Page) -> io::Result<TrashEntry> {
+        let now = chrono::Local::now().timestamp_millis();
+        self.trash_at(page, now)
+    }
+
+    /// Move `page`'s file into a new trash folder named by `deleted_at`
+    /// (milliseconds since the epoch; bumped by one until the name is free,
+    /// so two deletions in the same millisecond don't collide), keeping its
+    /// path relative to the graph (`pages/<title>.md` or
+    /// `journals/YYYY_MM_DD.md`). The page's current content must already
+    /// be saved; if its file is missing, that content is written into the
+    /// trash instead, so the page can still be restored.
+    pub fn trash_at(&self, page: &Page, deleted_at: i64) -> io::Result<TrashEntry> {
+        let source = self.path_for(page);
+        let relative = source
+            .strip_prefix(&self.root)
+            .map_err(|_| io::Error::other("page file outside the graph"))?
+            .to_path_buf();
+        let trash = self.trash_dir();
+        fs::create_dir_all(&trash)?;
+        let mut deleted_at = deleted_at;
+        let folder = loop {
+            let folder = trash.join(deleted_at.to_string());
+            match fs::create_dir(&folder) {
+                Ok(()) => break folder,
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => deleted_at += 1,
+                Err(err) => return Err(err),
+            }
+        };
+        let file = folder.join(&relative);
+        let moved = (|| {
+            fs::create_dir_all(file.parent().unwrap_or(&folder))?;
+            if source.exists() {
+                fs::rename(&source, &file)
+            } else {
+                write_atomic(&file, &page.to_markdown())
+            }
+        })();
+        if let Err(err) = moved {
+            // Leave no half-made entry behind; the page file is untouched.
+            let _ = fs::remove_dir_all(&folder);
+            return Err(err);
+        }
+        Ok(TrashEntry {
+            id: deleted_at.to_string(),
+            title: page.title.clone(),
+            is_journal: page.is_journal,
+            deleted_at,
+            relative,
+        })
+    }
+
+    /// Every page in the trash, newest first. Folders that don't look like
+    /// a trash entry (not a number, or not exactly one page file under
+    /// `pages/` or `journals/`) are skipped and left alone.
+    pub fn list_trash(&self) -> Vec<TrashEntry> {
+        let Ok(folders) = fs::read_dir(self.trash_dir()) else {
+            return Vec::new();
+        };
+        let mut entries: Vec<TrashEntry> = folders
+            .flatten()
+            .filter_map(|folder| {
+                let id = folder.file_name().to_str()?.to_string();
+                let deleted_at: i64 = id.parse().ok()?;
+                let mut files = Vec::new();
+                for (sub, is_journal) in [("pages", false), ("journals", true)] {
+                    let Ok(found) = fs::read_dir(folder.path().join(sub)) else {
+                        continue;
+                    };
+                    for file in found.flatten() {
+                        let path = file.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                            continue;
+                        }
+                        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
+                        if stem.starts_with('.') {
+                            continue;
+                        }
+                        files.push(TrashEntry {
+                            id: id.clone(),
+                            title: title_from_filename(stem, is_journal),
+                            is_journal,
+                            deleted_at,
+                            relative: Path::new(sub).join(file.file_name()),
+                        });
+                    }
+                }
+                (files.len() == 1).then(|| files.remove(0))
+            })
+            .collect();
+        entries.sort_by(|a, b| (b.deleted_at, &b.id).cmp(&(a.deleted_at, &a.id)));
+        entries
+    }
+
+    /// Move `entry`'s file back to where it was and return the page read
+    /// from it. Fails with `AlreadyExists` (and changes nothing) if a file
+    /// is at that path again; the caller also checks titles ignoring case.
+    pub fn restore(&self, entry: &TrashEntry) -> io::Result<Page> {
+        let file = self.trash_file(entry);
+        let target = self.root.join(&entry.relative);
+        if target.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", target.display()),
+            ));
+        }
+        let markdown = fs::read_to_string(&file)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&file, &target)?;
+        // The entry's folder only held that file.
+        let _ = fs::remove_dir_all(self.trash_dir().join(&entry.id));
+        Ok(Page::from_markdown(
+            &entry.title,
+            entry.is_journal,
+            &markdown,
+        ))
+    }
+
+    /// Delete `entry` for good: its whole trash folder. An entry that is
+    /// already gone counts as deleted.
+    pub fn delete_forever(&self, entry: &TrashEntry) -> io::Result<()> {
+        match fs::remove_dir_all(self.trash_dir().join(&entry.id)) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             other => other,
         }
+    }
+
+    /// Delete every trash entry for good (only the folders `list_trash`
+    /// recognises; anything else in `.trash/` is left alone). Returns how
+    /// many were deleted.
+    pub fn empty_trash(&self) -> io::Result<usize> {
+        let entries = self.list_trash();
+        for entry in &entries {
+            self.delete_forever(entry)?;
+        }
+        Ok(entries.len())
+    }
+
+    /// The trashed file of `entry`.
+    fn trash_file(&self, entry: &TrashEntry) -> PathBuf {
+        self.trash_dir().join(&entry.id).join(&entry.relative)
     }
 
     /// The graph directory.
@@ -210,6 +364,24 @@ impl Storage {
                 .join(format!("{}.md", filename_from_title(&page.title)))
         }
     }
+}
+
+/// The trash folder inside the graph. Hidden (a dot folder), and outside
+/// `pages/` and `journals/`, so its files are never loaded as pages.
+pub const TRASH_DIR: &str = ".trash";
+
+/// A deleted page in the trash (see the module docs for the layout).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashEntry {
+    /// The entry's folder name in `.trash/` (its deletion time).
+    pub id: String,
+    pub title: String,
+    pub is_journal: bool,
+    /// When it was deleted, in milliseconds since the Unix epoch.
+    pub deleted_at: i64,
+    /// Where its file was (and goes back to), relative to the graph:
+    /// `pages/<file>.md` or `journals/<file>.md`.
+    pub relative: PathBuf,
 }
 
 /// Longest file name most filesystems allow, in bytes.
@@ -425,16 +597,185 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn ids(entries: &[TrashEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.id.as_str()).collect()
+    }
+
     #[test]
-    fn delete_removes_the_file_and_tolerates_a_missing_one() {
-        let root = temp_root("delete");
+    fn trash_keeps_the_relative_path_and_restore_puts_the_page_back() {
+        let root = temp_root("trash");
         let storage = Storage::open(root.clone()).unwrap();
-        let journal = Page::from_markdown("2026-10-08", true, "- day\n");
+        let page = Page::from_markdown(
+            "Area/Sub",
+            false,
+            "- body
+  - child
+",
+        );
+        let journal = Page::from_markdown(
+            "2026-10-08",
+            true,
+            "- day
+",
+        );
+        storage.save(&page).unwrap();
         storage.save(&journal).unwrap();
+
+        let entry = storage.trash_at(&page, 1_000).unwrap();
+        assert_eq!(entry.id, "1000");
+        assert_eq!(entry.relative, Path::new("pages/Area___Sub.md"));
+        assert!(!root.join("pages/Area___Sub.md").exists());
+        assert_eq!(
+            fs::read_to_string(root.join(".trash/1000/pages/Area___Sub.md")).unwrap(),
+            "- body\n  - child\n"
+        );
+        storage.trash_at(&journal, 2_000).unwrap();
+        assert!(root.join(".trash/2000/journals/2026_10_08.md").exists());
+        // Gone from the pages, listed in the trash newest first.
+        assert!(storage.load_all().is_empty());
+        let trash = storage.list_trash();
+        assert_eq!(ids(&trash), ["2000", "1000"]);
+        assert_eq!(
+            (
+                trash[0].title.as_str(),
+                trash[0].is_journal,
+                trash[0].deleted_at
+            ),
+            ("2026-10-08", true, 2_000)
+        );
+        assert_eq!(
+            (trash[1].title.as_str(), trash[1].is_journal),
+            ("Area/Sub", false)
+        );
+        assert_eq!(trash[1], entry);
+
+        // Restore: same file, same content, and its trash folder is gone.
+        let restored = storage.restore(&entry).unwrap();
+        assert_eq!(restored.title, "Area/Sub");
+        assert!(!restored.is_journal);
+        assert_eq!(restored.to_markdown(), "- body\n  - child\n");
+        assert_eq!(
+            fs::read_to_string(root.join("pages/Area___Sub.md")).unwrap(),
+            "- body\n  - child\n"
+        );
+        assert!(!root.join(".trash/1000").exists());
+        assert_eq!(ids(&storage.list_trash()), ["2000"]);
+        let journal = storage.restore(&storage.list_trash()[0]).unwrap();
+        assert!(journal.is_journal);
         assert!(root.join("journals/2026_10_08.md").exists());
-        storage.delete(&journal).unwrap();
-        assert!(!root.join("journals/2026_10_08.md").exists());
-        storage.delete(&journal).unwrap();
+        assert_eq!(storage.load_all().len(), 2);
+        assert!(storage.list_trash().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_millisecond_deletions_get_their_own_folders() {
+        let root = temp_root("trash-same-ms");
+        let storage = Storage::open(root.clone()).unwrap();
+        // The same title deleted twice (re-created in between), and another.
+        for (title, body) in [("A", "- first\n"), ("A", "- second\n"), ("B", "- b\n")] {
+            let page = Page::from_markdown(title, false, body);
+            storage.save(&page).unwrap();
+            storage.trash_at(&page, 5).unwrap();
+        }
+        let trash = storage.list_trash();
+        assert_eq!(ids(&trash), ["7", "6", "5"]);
+        assert_eq!(
+            fs::read_to_string(root.join(".trash/5/pages/A.md")).unwrap(),
+            "- first\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(".trash/6/pages/A.md")).unwrap(),
+            "- second\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_page_without_a_file_is_trashed_with_its_content() {
+        let root = temp_root("trash-no-file");
+        let storage = Storage::open(root.clone()).unwrap();
+        let page = Page::from_markdown("Unsaved", false, "- only in memory\n");
+        let entry = storage.trash_at(&page, 9).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".trash/9/pages/Unsaved.md")).unwrap(),
+            "- only in memory\n"
+        );
+        assert_eq!(storage.list_trash(), [entry]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_refuses_when_the_file_exists_again() {
+        let root = temp_root("trash-clash");
+        let storage = Storage::open(root.clone()).unwrap();
+        let old = Page::from_markdown("Notes", false, "- old\n");
+        storage.save(&old).unwrap();
+        let entry = storage.trash_at(&old, 1).unwrap();
+        storage
+            .save(&Page::from_markdown("Notes", false, "- new\n"))
+            .unwrap();
+
+        let err = storage.restore(&entry).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // Nothing moved: the new page and the trashed one are both intact.
+        assert_eq!(
+            fs::read_to_string(root.join("pages/Notes.md")).unwrap(),
+            "- new\n"
+        );
+        assert_eq!(storage.list_trash(), [entry]);
+        assert_eq!(
+            fs::read_to_string(root.join(".trash/1/pages/Notes.md")).unwrap(),
+            "- old\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_forever_and_empty_trash_leave_unknown_files_alone() {
+        let root = temp_root("trash-empty");
+        let storage = Storage::open(root.clone()).unwrap();
+        for (i, title) in ["One", "Two", "Three"].into_iter().enumerate() {
+            let page = Page::from_markdown(title, false, "- x\n");
+            storage.save(&page).unwrap();
+            storage.trash_at(&page, i as i64).unwrap();
+        }
+        // Things that aren't trash entries are neither listed nor deleted.
+        let trash = root.join(".trash");
+        fs::create_dir_all(trash.join("notes/pages")).unwrap();
+        fs::write(trash.join("notes/pages/Keep.md"), "- keep\n").unwrap();
+        fs::write(trash.join("README.txt"), "mine").unwrap();
+        fs::create_dir_all(trash.join("42")).unwrap();
+        assert_eq!(ids(&storage.list_trash()), ["2", "1", "0"]);
+
+        let two = storage.list_trash()[0].clone();
+        storage.delete_forever(&two).unwrap();
+        assert!(!trash.join("2").exists());
+        assert_eq!(ids(&storage.list_trash()), ["1", "0"]);
+        // Already gone counts as deleted.
+        storage.delete_forever(&two).unwrap();
+
+        assert_eq!(storage.empty_trash().unwrap(), 2);
+        assert!(storage.list_trash().is_empty());
+        assert!(!trash.join("1").exists() && !trash.join("0").exists());
+        assert!(trash.join("notes/pages/Keep.md").exists());
+        assert!(trash.join("README.txt").exists() && trash.join("42").exists());
+        assert_eq!(storage.empty_trash().unwrap(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_trash_is_never_loaded_as_pages() {
+        let root = temp_root("trash-not-pages");
+        let storage = Storage::open(root.clone()).unwrap();
+        let page = Page::from_markdown("Gone", false, "- bye\n");
+        storage.save(&page).unwrap();
+        storage.trash_at(&page, 3).unwrap();
+        // Even files laid out like a graph inside the trash folder.
+        fs::create_dir_all(root.join(".trash/pages")).unwrap();
+        fs::write(root.join(".trash/pages/Stray.md"), "- stray\n").unwrap();
+        assert!(storage.load_all().is_empty());
+        assert!(storage.load_templates().iter().all(|t| t.name != "Gone"));
         let _ = fs::remove_dir_all(root);
     }
 

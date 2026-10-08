@@ -742,8 +742,9 @@ that mutate, and data races are essentially impossible.
     renamed: their name is their date and their file
     `journals/YYYY_MM_DD.md`. *Delete* asks first in a modal (danger-styled
     Delete, Cancel; Esc or a backdrop click cancels, Enter does nothing),
-    then removes the file (no trash, v1), the page, its tabs (with the same
-    neighbour rule as closing a tab) and its favorites/recent entries.
+    then removes the file (since decision 37: moves it to the trash), the
+    page, its tabs (with the same neighbour rule as closing a tab) and its
+    favorites/recent entries.
     Journals can be deleted (today's comes back on Ctrl-J or at startup),
     but the last remaining page can't: the app always has a page to show.
     *Undo:* neither can be undone, and both clear the undo/redo history,
@@ -881,8 +882,8 @@ that mutate, and data races are essentially impossible.
     not greyed out (Enter always runs something real): `Needs::Page`
     commands (Rename, Delete, Copy title, Toggle favorite, Insert
     template, Collapse all, Expand all) need a page tab on screen (not the
-    graph, the agenda or no tab), Rename also a non-journal and Delete
-    more than one page, as in the page menu; `Needs::Editing` commands
+    graph, the agenda, the trash or no tab), Rename also a non-journal and
+    Delete more than one page, as in the page menu; `Needs::Editing` commands
     (Cycle task, and Coder 1's Move block / image paste at merge) need
     the palette to have been opened while editing a block — running one
     resumes that block with its cursor and selection, then dispatches.
@@ -900,6 +901,69 @@ that mutate, and data races are essentially impossible.
     Shift+Enter adds no line break, Up / Down don't move between lines,
     and Ctrl+V pastes text only and never saves an image. The sidebar's
     reorder line is `page_drop_line`, so it doesn't shadow `ui::drop_line`.
+37. **Trash: deleting moves the file to `.trash/`; restore, delete
+    forever, empty** (34-36 are the pages track's). *Layout*: one folder
+    per deleted page, `<graph>/.trash/<millis>/<relative path>`, e.g.
+    `.trash/1791545112345/pages/Area___Sub.md` or
+    `.../journals/2026_10_08.md`. The folder name is the deletion time in
+    milliseconds since the Unix epoch (sorts, needs no time zone, unique:
+    `create_dir` bumps it by one if two deletions share a millisecond, so
+    the same title can be in the trash several times). Keeping the path
+    relative to the graph is what lets Restore put the file back exactly
+    where it was. A hidden folder outside `pages/` and `journals/` is
+    never read as pages (`load_all` only reads those two), so the page
+    list, graph, agenda, palette search and tags (all built from the
+    loaded pages) ignore it without a filter; a test drops a fake
+    `.trash/pages/*.md` to prove it. Anything that later scans the graph
+    folder itself (git backup, a full-text index on disk) must skip
+    `.trash/` too. *Storage* (`storage.rs`, pure `std::fs`): `trash`
+    (move with `fs::rename`, atomic on one filesystem; a page whose file
+    is missing gets its content written instead), `list_trash` (newest
+    first; folders that aren't a number with exactly one page file are
+    skipped and left alone), `restore`, `delete_forever`, `empty_trash`
+    (only the entries `list_trash` recognises, so stray files a user put
+    there survive). The old `Storage::delete` is gone. *Delete*: the page
+    menu and the palette's "Delete current page" keep decision 29's
+    confirm dialog, now "Move “X” to the trash?" with a danger "Move to
+    trash" button. Everything else is as before: tabs close, undo history
+    is cleared, and favorites, recent and the custom order *forget* the
+    page (`UiState::forget`). A restored page comes back like a new one:
+    unstarred, at the end of a custom order (`add_page`), in RECENT once
+    opened. Remembering them would mean stale `state.toml` entries that a
+    new page with the same name would inherit. *Last page*: still can't
+    be deleted. The reason is unchanged: the app always has a loaded page
+    to show (`pages[selected]`); that the file could be restored doesn't
+    change what is loaded. *Trash view*: a tab like the agenda
+    (`TabTarget::Trash`, `Mode::Trash`), opened by the sidebar's "Trash"
+    row under Agenda (`sidebar-trash`, with a count, `sidebar-trash-count`,
+    while non-empty) or the palette's "Open trash" (keywords deleted,
+    restore, bin, recycle, undelete; no key). It lists entries newest
+    first (`trash-item-{i}`): title, "Journal" for journals, "Deleted
+    today 14:05" / "yesterday" / a date (local time, `deleted_label`), and
+    Restore (`trash-restore-{i}`) and Delete forever (`trash-delete-{i}`)
+    buttons; Empty trash (`trash-empty`) is at the top, muted and inert
+    while empty (`trash-empty-state`). The list is cached in `NoteSec::trash`
+    and re-read at startup, when the tab is focused and after each change.
+    *Restore* moves the file back and adds the page, so it is in the
+    sidebar, graph, agenda and search right away; the trash tab stays
+    open. *Name clash*: Restore is refused while a page with that name
+    exists (ignoring case for regular pages, as links and rename do; the
+    same date for journals, e.g. today's journal re-created by Ctrl-J),
+    with the reason in the view (`trash-error`) and the entry kept.
+    Nothing is restored under another name, because `[[links]]` find
+    pages by name and a "Notes (restored)" would silently lose them; the
+    user renames or deletes the other page, then restores. Restore also
+    clears the undo history (a snapshot from before it would drop the
+    page). *Delete forever / Empty trash* ask first in the same modal as
+    the page delete, now shared as `render_confirm` (dimmed backdrop,
+    Cancel, danger button; backdrop click or Esc cancels, Enter does
+    nothing): `trash-confirm`, `-ok`, `-cancel`. Esc works through a
+    "TrashDialog" key context (one more `escape` row in `shortcuts()`).
+    The question closes when the palette, settings, shortcuts list or
+    another tab or page takes over. *Later features*: git auto-backup
+    should put `.trash/` in the graph's `.gitignore` (the history already
+    keeps deleted content, and the trash would double it); split panes can
+    show the trash in either pane like any tab target.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

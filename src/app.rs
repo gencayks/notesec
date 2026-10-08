@@ -19,7 +19,7 @@ use crate::model::{
 };
 use crate::search::{search, search_blocks, search_templates, Hit, Target};
 use crate::state::UiState;
-use crate::storage::{today_title, validate_title, Storage, Template};
+use crate::storage::{today_title, validate_title, Storage, Template, TrashEntry};
 use crate::table::{parse_table, Align};
 use crate::tabs::{TabTarget, Tabs};
 use crate::ui::{
@@ -86,6 +86,7 @@ actions!(
         // Palette commands without a key of their own (except
         // ShowShortcuts, Ctrl+/).
         OpenAgenda,
+        OpenTrash,
         RenamePage,
         DeletePage,
         CopyPageTitle,
@@ -210,12 +211,13 @@ pub fn shortcuts() -> Vec<Shortcut> {
         s("ctrl-/",         ShowShortcuts, None, App,        "Keyboard shortcuts (this list)"),
         s("ctrl-q",         Quit,          None, App,        "Quit"),
         // While the settings panel, a page menu (or its delete
-        // confirmation) or this list is open, the root's key context is
-        // that instead, so Esc closes it. (Renaming uses "BlockEditor":
-        // it types.)
-        s("escape",         Escape,        Some("Settings"),  App, "Close a dialog or menu"),
-        s("escape",         Escape,        Some("PageMenu"),  App, "Close a dialog or menu"),
-        s("escape",         Escape,        Some("Shortcuts"), App, "Close a dialog or menu"),
+        // confirmation), this list or a trash confirmation is open, the
+        // root's key context is that instead, so Esc closes it. (Renaming
+        // uses "BlockEditor": it types.)
+        s("escape",         Escape,        Some("Settings"),    App, "Close a dialog or menu"),
+        s("escape",         Escape,        Some("PageMenu"),    App, "Close a dialog or menu"),
+        s("escape",         Escape,        Some("Shortcuts"),   App, "Close a dialog or menu"),
+        s("escape",         Escape,        Some("TrashDialog"), App, "Close a dialog or menu"),
     ]
 }
 
@@ -297,6 +299,8 @@ enum Mode {
     Graph,
     /// The agenda: open tasks by date.
     Agenda,
+    /// The trash: deleted pages.
+    Trash,
     /// No tab is open: an empty state with hints.
     Empty,
 }
@@ -373,6 +377,41 @@ enum MenuStep {
     },
     /// The confirm dialog before deleting.
     ConfirmDelete { error: Option<String> },
+}
+
+/// The trash view's confirm step before something is deleted for good.
+#[derive(Clone, Debug, PartialEq)]
+enum TrashConfirm {
+    /// "Delete forever" on one entry.
+    DeleteForever(TrashEntry),
+    /// "Empty trash": every entry.
+    Empty,
+}
+
+/// What a confirmation dialog says (see `NoteSec::render_confirm`).
+struct Confirm {
+    /// Debug selector and element id prefix.
+    id: &'static str,
+    title: String,
+    body: String,
+    /// Why the last confirm failed, shown in the dialog.
+    error: Option<String>,
+    /// The danger button's label.
+    ok_label: &'static str,
+}
+
+/// When a trash entry was deleted, for its row: "Deleted today 14:05",
+/// "Deleted yesterday 09:12", else "Deleted 2026-10-03 18:40" (local time).
+fn deleted_label(deleted_at: i64, now: chrono::DateTime<chrono::Local>) -> String {
+    let Some(at) = chrono::DateTime::from_timestamp_millis(deleted_at) else {
+        return String::new();
+    };
+    let at = at.with_timezone(&chrono::Local);
+    match (now.date_naive() - at.date_naive()).num_days() {
+        0 => format!("Deleted today {}", at.format("%H:%M")),
+        1 => format!("Deleted yesterday {}", at.format("%H:%M")),
+        _ => format!("Deleted {}", at.format("%Y-%m-%d %H:%M")),
+    }
 }
 
 /// What a sidebar page row carries while it is dragged (`on_drag`): the
@@ -482,6 +521,14 @@ pub struct NoteSec {
     page_menu: Option<PageMenu>,
     /// True while the keyboard shortcuts dialog is open.
     shortcuts_open: bool,
+    /// The pages in the trash, newest first (`Storage::list_trash`). Read
+    /// at startup, when the trash tab is focused and after every change.
+    trash: Vec<TrashEntry>,
+    /// `Some` while the trash view asks before deleting for good.
+    trash_confirm: Option<TrashConfirm>,
+    /// Why the last trash action failed (e.g. Restore with the name
+    /// taken), shown at the top of the trash view until the next one.
+    trash_error: Option<String>,
     /// Where the page being dragged in the sidebar would land. Only
     /// meaningful while a drag is active; `render` clears it otherwise.
     page_drop: Option<PageDrop>,
@@ -583,6 +630,7 @@ impl NoteSec {
             .and_then(|family| installed_font(family, cx));
 
         let mono_font = mono_font(cx);
+        let trash = storage.list_trash();
 
         let mut app = NoteSec {
             storage,
@@ -600,6 +648,9 @@ impl NoteSec {
             settings: None,
             page_menu: None,
             shortcuts_open: false,
+            trash,
+            trash_confirm: None,
+            trash_error: None,
             page_drop: None,
             selecting: false,
             collapsed: HashSet::new(),
@@ -749,6 +800,7 @@ impl NoteSec {
         self.close_search(cx);
         self.page_menu = None;
         self.shortcuts_open = false;
+        self.trash_confirm = None;
         let fonts = cx.text_system().all_font_names();
         self.settings = Some(SettingsState { fonts });
         cx.notify();
@@ -876,6 +928,7 @@ impl NoteSec {
         self.settings = None;
         self.page_menu = None;
         self.shortcuts_open = false;
+        self.trash_confirm = None;
         self.search = Some(SearchState {
             query: EditorState::default(),
             selected: 0,
@@ -953,7 +1006,7 @@ impl NoteSec {
         let pages = &self.pages;
         self.tabs.retain(|t| match t {
             TabTarget::Page(title) => pages.iter().any(|p| p.title == *title),
-            TabTarget::Graph | TabTarget::Agenda => true,
+            TabTarget::Graph | TabTarget::Agenda | TabTarget::Trash => true,
         });
         if self.editing.is_some() || matches!(self.tabs.active_target(), Some(TabTarget::Page(_))) {
             // Not `show_page`: undo/redo isn't the user opening a page, so
@@ -1130,7 +1183,8 @@ impl NoteSec {
     // --- palette commands ------------------------------------------------------
 
     /// The page the palette's page commands act on: the one on screen, if a
-    /// page tab is showing (not the graph, the agenda or no tab at all).
+    /// page tab is showing (not the graph, the agenda, the trash or no tab
+    /// at all).
     fn current_page(&self) -> Option<String> {
         (self.mode == Mode::Notes).then(|| self.pages[self.selected].title.clone())
     }
@@ -1164,6 +1218,10 @@ impl NoteSec {
 
     fn on_open_agenda(&mut self, _: &OpenAgenda, _: &mut Window, cx: &mut Context<Self>) {
         self.show_agenda(cx);
+    }
+
+    fn on_open_trash(&mut self, _: &OpenTrash, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_trash(cx);
     }
 
     fn on_sort_pages_az(&mut self, _: &SortPagesAz, _: &mut Window, cx: &mut Context<Self>) {
@@ -1302,6 +1360,7 @@ impl NoteSec {
         self.close_search(cx);
         self.settings = None;
         self.page_menu = None;
+        self.trash_confirm = None;
         self.shortcuts_open = true;
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -1646,6 +1705,8 @@ impl NoteSec {
     /// Put page `ix` in the main pane and record it in RECENT. The tab bar
     /// is left alone: callers have already opened or focused its tab.
     fn enter_page(&mut self, ix: usize, cx: &mut Context<Self>) {
+        // A trash confirmation belongs to the trash tab.
+        self.trash_confirm = None;
         self.selected = ix;
         self.mode = Mode::Notes;
         self.record_recent();
@@ -1662,16 +1723,25 @@ impl NoteSec {
                 self.enter_page(ix, cx);
             }
             Some(TabTarget::Graph) => {
+                self.trash_confirm = None;
                 self.refresh_graph(cx);
                 self.mode = Mode::Graph;
                 cx.notify();
             }
             // Built from the pages on every render, so it is never stale.
             Some(TabTarget::Agenda) => {
+                self.trash_confirm = None;
                 self.mode = Mode::Agenda;
                 cx.notify();
             }
+            // Read from disk again, in case files changed meanwhile.
+            Some(TabTarget::Trash) => {
+                self.refresh_trash();
+                self.mode = Mode::Trash;
+                cx.notify();
+            }
             None => {
+                self.trash_confirm = None;
                 self.mode = Mode::Empty;
                 cx.notify();
             }
@@ -1694,13 +1764,15 @@ impl NoteSec {
         self.apply_tab(cx);
     }
 
-    /// The Ctrl-K palette, the settings panel or a page menu covers the
-    /// page. All are modal, so the tab keys do nothing while one is open.
+    /// The Ctrl-K palette, the settings panel, a page menu, the shortcuts
+    /// list or a trash confirmation covers the page. All are modal, so the
+    /// tab keys do nothing while one is open.
     fn overlay_open(&self) -> bool {
         self.search.is_some()
             || self.settings.is_some()
             || self.page_menu.is_some()
             || self.shortcuts_open
+            || self.trash_confirm.is_some()
     }
 
     /// Ctrl+W. Ignored while an overlay is open.
@@ -1789,7 +1861,9 @@ impl NoteSec {
             .is_some_and(|ix| !self.pages[ix].is_journal)
     }
 
-    /// The last page can't be deleted: there is always a page to show.
+    /// The last page can't be moved to the trash: the app always has a page
+    /// to show (`pages[selected]`). That it could be restored later doesn't
+    /// change this; the rule is about the pages loaded now.
     fn can_delete(&self) -> bool {
         self.pages.len() > 1
     }
@@ -1913,9 +1987,10 @@ impl NoteSec {
         }
     }
 
-    /// Delete the page called `title`: its file (no trash in v1), the page,
-    /// its tabs (the neighbour tab takes focus, as when closing a tab) and
-    /// its favorites/recent entries.
+    /// Delete the page called `title`: move its file to the trash, and drop
+    /// the page, its tabs (the neighbour tab takes focus, as when closing a
+    /// tab) and its favorites/recent/order entries (a restored page comes
+    /// back like a new one).
     fn delete_page(&mut self, title: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let ix = self
             .find_page(title)
@@ -1925,8 +2000,9 @@ impl NoteSec {
         }
         self.stop_edit(cx);
         self.storage
-            .delete(&self.pages[ix])
-            .map_err(|err| format!("Could not delete the file: {err}"))?;
+            .trash(&self.pages[ix])
+            .map_err(|err| format!("Could not move the file to the trash: {err}"))?;
+        self.refresh_trash();
 
         let current = &self.pages[self.selected];
         let current = (current.title.clone(), current.is_journal);
@@ -1950,8 +2026,9 @@ impl NoteSec {
 
     /// Undo snapshots hold whole pages under their titles, and restoring
     /// one saves every page in it, so replaying a snapshot from before a
-    /// rename or delete would write the old file back. Those two actions
-    /// can't be undone (v1), and edits from before them can't either.
+    /// rename or delete would write the old file back (and one from before
+    /// a restore would drop the restored page). Those actions can't be
+    /// undone (v1), and edits from before them can't either.
     fn forget_history(&mut self) {
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -2086,6 +2163,112 @@ impl NoteSec {
         {
             self.reveal(ix);
         }
+        cx.notify();
+    }
+
+    // --- trash -----------------------------------------------------------------
+
+    /// "Open trash" (palette, sidebar): open or focus the trash tab.
+    fn show_trash(&mut self, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+        self.trash_error = None;
+        self.tabs.open(TabTarget::Trash);
+        self.apply_tab(cx);
+    }
+
+    /// Read the trash list from disk again.
+    fn refresh_trash(&mut self) {
+        self.trash = self.storage.list_trash();
+    }
+
+    /// The trash entry with folder `id`, if it is still listed.
+    fn trash_entry(&self, id: &str) -> Option<TrashEntry> {
+        self.trash.iter().find(|e| e.id == id).cloned()
+    }
+
+    /// "Restore": move the page's file back and load it, so it is in the
+    /// sidebar, graph, agenda and search straight away (at the end of a
+    /// custom order, like a new page). Refused, with the reason shown in
+    /// the trash view, if a page with that name exists again (ignoring
+    /// case for regular pages, as links do; the same date for journals):
+    /// the user renames or deletes that one first. Nothing is renamed
+    /// automatically, since `[[links]]` find pages by name.
+    fn restore_from_trash(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.trash_error = None;
+        if let Err(message) = self.try_restore(id, cx) {
+            self.trash_error = Some(message);
+        }
+        self.refresh_trash();
+        cx.notify();
+    }
+
+    fn try_restore(&mut self, id: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let entry = self
+            .trash_entry(id)
+            .ok_or_else(|| "This page is no longer in the trash".to_string())?;
+        let taken = if entry.is_journal {
+            self.find_journal(&entry.title).is_some()
+        } else {
+            self.find_page(&entry.title).is_some()
+        };
+        let taken_message = || {
+            format!(
+                "Can't restore \u{201c}{}\u{201d}: a page with that name exists. \
+                 Rename or delete it first.",
+                entry.title
+            )
+        };
+        if taken {
+            return Err(taken_message());
+        }
+        self.stop_edit(cx);
+        let page = self.storage.restore(&entry).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                taken_message()
+            } else {
+                format!("Could not restore the file: {err}")
+            }
+        })?;
+        self.add_page(page);
+        self.forget_history();
+        Ok(())
+    }
+
+    /// "Delete forever" on a trash row: ask first.
+    fn ask_delete_forever(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.trash_error = None;
+        if let Some(entry) = self.trash_entry(id) {
+            self.trash_confirm = Some(TrashConfirm::DeleteForever(entry));
+        }
+        cx.notify();
+    }
+
+    /// "Empty trash": ask first (nothing to ask with an empty trash).
+    fn ask_empty_trash(&mut self, cx: &mut Context<Self>) {
+        self.trash_error = None;
+        if !self.trash.is_empty() {
+            self.trash_confirm = Some(TrashConfirm::Empty);
+        }
+        cx.notify();
+    }
+
+    fn close_trash_confirm(&mut self, cx: &mut Context<Self>) {
+        self.trash_confirm = None;
+        cx.notify();
+    }
+
+    /// The confirmation's danger button: delete the entry, or every entry,
+    /// for good. The loaded pages are not affected.
+    fn confirm_trash(&mut self, cx: &mut Context<Self>) {
+        let result = match self.trash_confirm.take() {
+            Some(TrashConfirm::DeleteForever(entry)) => self.storage.delete_forever(&entry),
+            Some(TrashConfirm::Empty) => self.storage.empty_trash().map(|_| ()),
+            None => Ok(()),
+        };
+        if let Err(err) = result {
+            self.trash_error = Some(format!("Could not delete from the trash: {err}"));
+        }
+        self.refresh_trash();
         cx.notify();
     }
 
@@ -2238,6 +2421,7 @@ impl NoteSec {
         self.settings = None;
         self.page_menu = None;
         self.shortcuts_open = false;
+        self.trash_confirm = None;
         self.commit();
         self.text_history_active = false;
         self.load_editor(ix, false);
@@ -2809,7 +2993,9 @@ impl NoteSec {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.page_menu.is_some() {
+        if self.trash_confirm.is_some() {
+            self.close_trash_confirm(cx);
+        } else if self.page_menu.is_some() {
             // Closes the menu, cancels a rename or a delete.
             self.close_page_menu(cx);
         } else if self.shortcuts_open {
@@ -3892,81 +4078,15 @@ impl NoteSec {
         };
 
         if let MenuStep::ConfirmDelete { error } = &menu.step {
-            // A modal like the settings panel: dimmed backdrop, centred box.
-            let title = menu.title.clone();
-            return div()
-                .id("confirm-delete-backdrop")
-                .absolute()
-                .inset_0()
-                .occlude()
-                .bg(gpui::black().opacity(0.45))
-                .flex()
-                .flex_col()
-                .items_center()
-                .pt(px(160.0))
-                .on_click(cx.listener(|this, _e, _window, cx| this.close_page_menu(cx)))
-                .child(
-                    panel()
-                        .id("confirm-delete")
-                        .debug_selector(|| "confirm-delete".to_string())
-                        .w(px(420.0))
-                        .gap_2()
-                        .p_4()
-                        .child(
-                            div()
-                                .font_weight(FontWeight::BOLD)
-                                .child(format!("Delete \u{201c}{title}\u{201d}?")),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme.muted)
-                                .child("Its file is deleted from the graph. This can't be undone."),
-                        )
-                        .when_some(error.clone(), |d, error| {
-                            d.child(div().text_color(theme.danger).child(error))
-                        })
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("confirm-delete-cancel")
-                                        .debug_selector(|| "confirm-delete-cancel".to_string())
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .cursor_pointer()
-                                        .hover(|d| d.bg(theme.selected_bg))
-                                        .on_click(cx.listener(|this, _e, _window, cx| {
-                                            this.close_page_menu(cx)
-                                        }))
-                                        .child("Cancel"),
-                                )
-                                .child(
-                                    div()
-                                        .id("confirm-delete-ok")
-                                        .debug_selector(|| "confirm-delete-ok".to_string())
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(theme.danger)
-                                        .text_color(theme.bg)
-                                        .font_weight(FontWeight::BOLD)
-                                        .cursor_pointer()
-                                        .hover(|d| d.opacity(0.85))
-                                        .on_click(cx.listener(|this, _e, _window, cx| {
-                                            this.confirm_delete(cx)
-                                        }))
-                                        .child("Delete"),
-                                ),
-                        ),
-                )
-                .into_any_element();
+            let confirm = Confirm {
+                id: "confirm-delete",
+                title: format!("Move \u{201c}{}\u{201d} to the trash?", menu.title),
+                body: "You can restore it from Trash in the sidebar, or delete it forever there."
+                    .into(),
+                error: error.clone(),
+                ok_label: "Move to trash",
+            };
+            return self.render_confirm(confirm, Self::close_page_menu, Self::confirm_delete, cx);
         }
 
         let content = match &menu.step {
@@ -4083,6 +4203,287 @@ impl NoteSec {
 }
 
 impl NoteSec {
+    /// A confirmation before a destructive step (moving a page to the
+    /// trash, deleting from the trash): a modal like the settings panel,
+    /// with a dimmed backdrop, a centred box, Cancel and a danger-coloured
+    /// button. A backdrop click cancels, as does Esc (through the caller's
+    /// key context); Enter does nothing, so it always takes a click.
+    /// Selectors: `{id}`, `{id}-cancel`, `{id}-ok`, `{id}-backdrop`.
+    fn render_confirm(
+        &self,
+        confirm: Confirm,
+        cancel: fn(&mut Self, &mut Context<Self>),
+        ok: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let id = confirm.id;
+        div()
+            .id(format!("{id}-backdrop"))
+            .debug_selector(move || format!("{id}-backdrop"))
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(gpui::black().opacity(0.45))
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(160.0))
+            .on_click(cx.listener(move |this, _e, _window, cx| cancel(this, cx)))
+            .child(
+                div()
+                    .id(id)
+                    .debug_selector(move || id.to_string())
+                    .occlude()
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .bg(theme.sidebar_bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_lg()
+                    .w(px(420.0))
+                    .gap_2()
+                    .p_4()
+                    .child(div().font_weight(FontWeight::BOLD).child(confirm.title))
+                    .child(div().text_color(theme.muted).child(confirm.body))
+                    .when_some(confirm.error, |d, error| {
+                        d.child(div().text_color(theme.danger).child(error))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(format!("{id}-cancel"))
+                                    .debug_selector(move || format!("{id}-cancel"))
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(theme.selected_bg))
+                                    .on_click(
+                                        cx.listener(move |this, _e, _window, cx| cancel(this, cx)),
+                                    )
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("{id}-ok"))
+                                    .debug_selector(move || format!("{id}-ok"))
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(theme.danger)
+                                    .text_color(theme.bg)
+                                    .font_weight(FontWeight::BOLD)
+                                    .cursor_pointer()
+                                    .hover(|d| d.opacity(0.85))
+                                    .on_click(
+                                        cx.listener(move |this, _e, _window, cx| ok(this, cx)),
+                                    )
+                                    .child(confirm.ok_label),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The trash tab: deleted pages, newest first, each with when it was
+    /// deleted and Restore / Delete forever buttons (`trash-item-{i}`,
+    /// `trash-restore-{i}`, `trash-delete-{i}`), plus Empty trash.
+    fn render_trash(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let now = chrono::Local::now();
+        let button = |id: ElementId, selector: String, label: &'static str, danger: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || selector)
+                .flex_shrink_0()
+                .px_2()
+                .rounded_md()
+                .border_1()
+                .border_color(if danger { theme.danger } else { theme.border })
+                .text_color(if danger { theme.danger } else { theme.text })
+                .cursor_pointer()
+                .hover(|d| d.bg(theme.selected_bg))
+                .child(label)
+        };
+        let rows: Vec<AnyElement> = self
+            .trash
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let (restore_id, delete_id) = (entry.id.clone(), entry.id.clone());
+                div()
+                    .id(("trash-item", i))
+                    .debug_selector(move || format!("trash-item-{i}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .hover(|d| d.bg(theme.selected_bg))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.text)
+                            .child(entry.title.clone()),
+                    )
+                    .when(entry.is_journal, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(theme.muted)
+                                .child("Journal"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(theme.muted)
+                            .child(deleted_label(entry.deleted_at, now)),
+                    )
+                    .child(
+                        button(
+                            ("trash-restore", i).into(),
+                            format!("trash-restore-{i}"),
+                            "Restore",
+                            false,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _e, _window, cx| this.restore_from_trash(&restore_id, cx),
+                        )),
+                    )
+                    .child(
+                        button(
+                            ("trash-delete", i).into(),
+                            format!("trash-delete-{i}"),
+                            "Delete forever",
+                            true,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _e, _window, cx| this.ask_delete_forever(&delete_id, cx),
+                        )),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let has_entries = !rows.is_empty();
+        // Disabled (muted, no handler) while there is nothing to empty.
+        let empty_button = div()
+            .id("trash-empty")
+            .debug_selector(|| "trash-empty".to_string())
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if has_entries {
+                theme.danger
+            } else {
+                theme.border
+            })
+            .text_color(if has_entries {
+                theme.danger
+            } else {
+                theme.muted
+            })
+            .when(has_entries, |d| {
+                d.cursor_pointer()
+                    .hover(|d| d.bg(theme.selected_bg))
+                    .on_click(cx.listener(|this, _e, _window, cx| this.ask_empty_trash(cx)))
+            })
+            .child("Empty trash");
+
+        div()
+            .id("trash")
+            .debug_selector(|| "trash".to_string())
+            .flex_1()
+            .h_full()
+            .overflow_y_scroll()
+            .p_8()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(self.config.font_size * 1.9))
+                            .text_color(theme.text)
+                            .child("Trash"),
+                    )
+                    .child(empty_button),
+            )
+            .child(
+                div()
+                    .mb_4()
+                    .text_color(theme.muted)
+                    .child("Deleted pages wait here, in the graph's .trash folder, until you restore them or delete them forever."),
+            )
+            .when_some(self.trash_error.clone(), |d, error| {
+                d.child(
+                    div()
+                        .debug_selector(|| "trash-error".to_string())
+                        .px_3()
+                        .py_1()
+                        .text_color(theme.danger)
+                        .child(error),
+                )
+            })
+            .children(rows)
+            .when(!has_entries, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "trash-empty-state".to_string())
+                        .px_3()
+                        .text_color(theme.muted)
+                        .child("The trash is empty."),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The trash's confirmation before deleting for good.
+    fn render_trash_confirm(&self, confirm: &TrashConfirm, cx: &mut Context<Self>) -> AnyElement {
+        let confirm = match confirm {
+            TrashConfirm::DeleteForever(entry) => Confirm {
+                id: "trash-confirm",
+                title: format!("Delete \u{201c}{}\u{201d} forever?", entry.title),
+                body: "Its file is removed from the trash. This can't be undone.".into(),
+                error: None,
+                ok_label: "Delete forever",
+            },
+            TrashConfirm::Empty => {
+                let n = self.trash.len();
+                Confirm {
+                    id: "trash-confirm",
+                    title: "Empty the trash?".into(),
+                    body: format!(
+                        "{n} deleted {} removed for good. This can't be undone.",
+                        if n == 1 { "page is" } else { "pages are" }
+                    ),
+                    error: None,
+                    ok_label: "Empty trash",
+                }
+            }
+        };
+        self.render_confirm(confirm, Self::close_trash_confirm, Self::confirm_trash, cx)
+    }
+
     /// The keyboard shortcuts dialog (Ctrl+/ or "Keyboard shortcuts"): the
     /// `shortcuts` table, grouped, in a modal like the settings panel.
     fn render_shortcuts(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -4657,6 +5058,33 @@ impl Render for NoteSec {
             .on_click(cx.listener(|this, _e, _window, cx| this.show_agenda(cx)))
             .child("Agenda");
 
+        // "Trash" entry: deleted pages, with how many; highlighted while open.
+        let in_trash = self.mode == Mode::Trash;
+        let trash_count = self.trash.len();
+        let trash_item = div()
+            .id("sidebar-trash")
+            .debug_selector(|| "sidebar-trash".to_string())
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .cursor_pointer()
+            .text_color(if in_trash { theme.accent } else { theme.text })
+            .when(in_trash, |d| d.bg(theme.selected_bg))
+            .hover(|d| d.bg(theme.selected_bg))
+            .on_click(cx.listener(|this, _e, _window, cx| this.show_trash(cx)))
+            .child("Trash")
+            .when(trash_count > 0, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "sidebar-trash-count".to_string())
+                        .text_color(theme.muted)
+                        .child(trash_count.to_string()),
+                )
+            });
+
         let pages_header = div()
             .px_3()
             .py_2()
@@ -4731,6 +5159,7 @@ impl Render for NoteSec {
             .child(today_item)
             .child(graph_item)
             .child(agenda_item)
+            .child(trash_item)
             .when(!favorite_rows.is_empty(), |d| {
                 d.child(section_header("FAVORITES")).children(favorite_rows)
             })
@@ -5673,6 +6102,7 @@ impl Render for NoteSec {
                     TabTarget::Page(title) => title.clone(),
                     TabTarget::Graph => "Graph".to_string(),
                     TabTarget::Agenda => "Agenda".to_string(),
+                    TabTarget::Trash => "Trash".to_string(),
                 };
                 div()
                     .id(("tab", i))
@@ -5787,6 +6217,7 @@ impl Render for NoteSec {
         let view: AnyElement = match (&self.mode, &self.graph) {
             (Mode::Graph, Some(graph)) => graph.clone().into_any_element(),
             (Mode::Agenda, _) => self.render_agenda(cx),
+            (Mode::Trash, _) => self.render_trash(cx),
             (Mode::Empty, _) => empty_state().into_any_element(),
             _ => main.into_any_element(),
         };
@@ -5811,10 +6242,20 @@ impl Render for NoteSec {
 
         let shortcuts_overlay = self.shortcuts_open.then(|| self.render_shortcuts(cx));
 
+        let trash_confirm_overlay = self
+            .trash_confirm
+            .as_ref()
+            .map(|confirm| self.render_trash_confirm(confirm, cx));
+
         let is_editing = self.editing.is_some() || self.text_input_open();
         let shortcuts_open = self.shortcuts_open;
         let settings_open = self.settings.is_some() && !shortcuts_open;
         let page_menu_open = self.page_menu.is_some() && !is_editing && !shortcuts_open;
+        let trash_confirm_open = self.trash_confirm.is_some()
+            && !is_editing
+            && !shortcuts_open
+            && !settings_open
+            && !page_menu_open;
         div()
             .size_full()
             .relative()
@@ -5837,6 +6278,7 @@ impl Render for NoteSec {
             .when(!settings_open && page_menu_open, |d| {
                 d.key_context("PageMenu")
             })
+            .when(trash_confirm_open, |d| d.key_context("TrashDialog"))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::tab))
             .on_action(cx.listener(Self::shift_tab))
@@ -5879,6 +6321,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_reset_font))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_open_agenda))
+            .on_action(cx.listener(Self::on_open_trash))
             .on_action(cx.listener(Self::on_rename_page))
             .on_action(cx.listener(Self::on_delete_page))
             .on_action(cx.listener(Self::on_copy_page_title))
@@ -5897,6 +6340,7 @@ impl Render for NoteSec {
             .children(settings_overlay)
             .children(page_menu_overlay)
             .children(shortcuts_overlay)
+            .children(trash_confirm_overlay)
     }
 }
 
@@ -8102,6 +8546,7 @@ mod tests {
                     TabTarget::Page(title) => title.clone(),
                     TabTarget::Graph => "Graph".to_string(),
                     TabTarget::Agenda => "Agenda".to_string(),
+                    TabTarget::Trash => "Trash".to_string(),
                 })
                 .collect();
             (labels, app.tabs.active)
@@ -8127,6 +8572,7 @@ mod tests {
         view.update(cx, |app, _| match labels[active] {
             "Graph" => assert_eq!(app.mode, Mode::Graph),
             "Agenda" => assert_eq!(app.mode, Mode::Agenda),
+            "Trash" => assert_eq!(app.mode, Mode::Trash),
             title => {
                 assert_eq!(app.mode, Mode::Notes);
                 assert_eq!(app.pages[app.selected].title, title);
@@ -9848,7 +10294,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn delete_after_confirm_removes_file_page_and_tab(cx: &mut TestAppContext) {
+    fn delete_after_confirm_trashes_file_and_removes_page_and_tab(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup_pages(cx, "menu-delete", &tab_pages(), "Test");
         click_sidebar_page(&view, cx, "Alpha");
         click_sidebar_page(&view, cx, "Beta");
@@ -9866,6 +10312,13 @@ mod tests {
         click_on(cx, "confirm-delete-ok");
         assert!(menu_title(&view, cx).is_none() && !has(cx, "confirm-delete"));
         assert!(!page_file(&dir, "Alpha").exists());
+        let trashed = view.update(cx, |app, _| app.trash[0].clone());
+        assert_eq!(trashed.title, "Alpha");
+        assert!(dir
+            .join(".trash")
+            .join(&trashed.id)
+            .join("pages/Alpha.md")
+            .exists());
         assert_eq!(non_journal_titles(&view, cx), ["Beta", "Test"]);
         // Its tab closed and the neighbour that took its place has focus.
         tabs_are(&view, cx, &["Test", "Beta"], 1);
@@ -9904,6 +10357,9 @@ mod tests {
 
         assert!(page_file(&dir, "Beta").exists());
         assert_eq!(non_journal_titles(&view, cx), ["Alpha", "Beta", "Test"]);
+        // Nothing went to the trash either.
+        view.update(cx, |app, _| assert!(app.trash.is_empty()));
+        assert!(!dir.join(".trash").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -9918,6 +10374,9 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.pages.len(), 1);
             assert_eq!(app.pages[app.selected].title, "Test");
+            // It went to the trash, as a journal.
+            assert_eq!(app.trash[0].title, today_title());
+            assert!(app.trash[0].is_journal);
         });
 
         // The last page: Delete is disabled.
@@ -10473,6 +10932,9 @@ mod tests {
         for (query, command) in [
             ("shrt", Command::ShowShortcuts),
             ("agnd", Command::OpenAgenda),
+            ("trash", Command::OpenTrash),
+            ("recycle", Command::OpenTrash),
+            ("undelete", Command::OpenTrash),
             ("col all", Command::CollapseAll),
             ("exp all", Command::ExpandAll),
             ("new page", Command::NewPage),
@@ -10630,6 +11092,7 @@ mod tests {
         assert_eq!(hint(Command::ShowShortcuts).as_deref(), Some("Ctrl+/"));
         assert_eq!(hint(Command::CycleTask).as_deref(), Some("Ctrl+Enter"));
         assert_eq!(hint(Command::OpenAgenda), None);
+        assert_eq!(hint(Command::OpenTrash), None);
         assert_eq!(hint(Command::MoveBlockUp).as_deref(), Some("Alt+Up"));
         assert_eq!(hint(Command::MoveBlockDown).as_deref(), Some("Alt+Down"));
         assert_eq!(hint(Command::Paste).as_deref(), Some("Ctrl+V"));
@@ -10743,5 +11206,287 @@ mod tests {
         assert_eq!(*day, chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap());
         assert_eq!(items[0].text, "pay rent");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- trash ---------------------------------------------------------------
+
+    fn trash_pages() -> [(&'static str, &'static str); 3] {
+        [
+            ("Test", "- see [[Alpha]]\n"),
+            ("Alpha", "- alpha\n"),
+            ("Beta", "- TODO beta task zqgone\n  - child\n"),
+        ]
+    }
+
+    /// Titles in the trash list, newest first.
+    fn trash_titles(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        view.update(cx, |app, _| {
+            app.trash.iter().map(|e| e.title.clone()).collect()
+        })
+    }
+
+    /// Whether the palette finds a page or a block for `query`.
+    fn search_finds(view: &Entity<NoteSec>, cx: &mut VisualTestContext, query: &str) -> bool {
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input(query);
+        let found = view.update(cx, |app, _| {
+            app.search_results()
+                .iter()
+                .any(|h| matches!(h.target, Target::Page(_) | Target::Block(..)))
+        });
+        cx.simulate_keystrokes("escape");
+        found
+    }
+
+    #[gpui::test]
+    fn deleting_moves_the_page_to_the_trash_and_restore_brings_it_back(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "trash-flow", &trash_pages(), "Test");
+        let (graph, _) = open_graph(&view, cx);
+        assert!(graph_titles(&graph, cx).contains(&"Beta".to_string()));
+        click_sidebar_page(&view, cx, "Beta");
+        view.update(cx, |app, cx| app.toggle_favorite("Beta", cx));
+        // An unsaved edit is saved before the file moves.
+        click_block(cx, 1);
+        cx.simulate_input(" edited");
+        assert!(search_finds(&view, cx, "zqgone"));
+        view.update(cx, |app, _| assert_eq!(app.agenda().unscheduled.len(), 1));
+        assert!(!has(cx, "sidebar-trash-count"));
+
+        right_click_page(&view, cx, "Beta");
+        click_on(cx, "page-menu-delete");
+        assert!(has(cx, "confirm-delete"));
+        click_on(cx, "confirm-delete-ok");
+        assert!(menu_title(&view, cx).is_none() && !has(cx, "confirm-delete"));
+
+        // The file moved into the trash, under its old relative path.
+        assert!(!page_file(&dir, "Beta").exists());
+        let entry = view.update(cx, |app, _| app.trash[0].clone());
+        assert_eq!(entry.relative, std::path::Path::new("pages/Beta.md"));
+        let trashed = dir.join(".trash").join(&entry.id).join("pages/Beta.md");
+        assert_eq!(
+            std::fs::read_to_string(&trashed).unwrap(),
+            "- TODO beta task zqgone\n  - child edited\n"
+        );
+        // Gone from the list, the tabs, favorites/recent, search, the
+        // agenda and the graph.
+        assert_eq!(non_journal_titles(&view, cx), ["Alpha", "Test"]);
+        tabs_are(&view, cx, &["Test", "Graph"], 1);
+        view.update(cx, |app, _| {
+            assert!(!app.state.is_favorite("Beta"));
+            assert!(!app.state.recent.iter().any(|t| t == "Beta"));
+            assert!(app.agenda().is_empty());
+        });
+        assert!(!search_finds(&view, cx, "zqgone"));
+        assert!(!graph_titles(&graph, cx).contains(&"Beta".to_string()));
+        assert!(has(cx, "sidebar-trash-count"));
+
+        // The trash tab lists it.
+        click_on(cx, "sidebar-trash");
+        tabs_are(&view, cx, &["Test", "Graph", "Trash"], 2);
+        assert!(has(cx, "trash") && has(cx, "trash-item-0"));
+        assert!(!has(cx, "trash-item-1") && !has(cx, "trash-empty-state"));
+        assert_eq!(trash_titles(&view, cx), ["Beta"]);
+
+        // Restore: back in the list with its content, trash empty again.
+        click_on(cx, "trash-restore-0");
+        assert_eq!(non_journal_titles(&view, cx), ["Alpha", "Beta", "Test"]);
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Beta")).unwrap(),
+            "- TODO beta task zqgone\n  - child edited\n"
+        );
+        assert!(!dir.join(".trash").join(&entry.id).exists());
+        assert!(has(cx, "trash-empty-state") && !has(cx, "trash-item-0"));
+        assert!(!has(cx, "sidebar-trash-count") && !has(cx, "trash-error"));
+        tabs_are(&view, cx, &["Test", "Graph", "Trash"], 2);
+        view.update(cx, |app, _| {
+            let beta = &app.pages[app.find_page("Beta").unwrap()];
+            assert_eq!(beta.blocks[1].content, "child edited");
+            assert_eq!(app.agenda().unscheduled.len(), 1);
+            // It comes back like a new page: not a favorite any more.
+            assert!(!app.state.is_favorite("Beta"));
+        });
+        assert!(search_finds(&view, cx, "zqgone"));
+        click_on(cx, "tab-1");
+        assert!(graph_titles(&graph, cx).contains(&"Beta".to_string()));
+        click_sidebar_page(&view, cx, "Beta");
+        assert_eq!(selected_title(&view, cx), "Beta");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn restore_is_refused_while_the_name_is_taken(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "trash-clash", &trash_pages(), "Test");
+        view.update(cx, |app, cx| app.delete_page("Beta", cx))
+            .unwrap();
+        // A new page with the same name, in another case.
+        view.update(cx, |app, cx| app.navigate("beta", Nav::Tab, cx));
+        cx.run_until_parked();
+        click_on(cx, "sidebar-trash");
+        click_on(cx, "trash-restore-0");
+        let error = view.update(cx, |app, _| app.trash_error.clone()).unwrap();
+        assert!(
+            error.contains("Beta") && error.contains("exists"),
+            "{error}"
+        );
+        assert!(has(cx, "trash-error") && has(cx, "trash-item-0"));
+        assert_eq!(non_journal_titles(&view, cx), ["Alpha", "beta", "Test"]);
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "beta")).unwrap(),
+            "- \n"
+        );
+        assert_eq!(trash_titles(&view, cx), ["Beta"]);
+
+        // Deleting the new one makes room: both are in the trash, newest
+        // first, and the old one restores.
+        view.update(cx, |app, cx| app.delete_page("beta", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(trash_titles(&view, cx), ["beta", "Beta"]);
+        click_on(cx, "trash-restore-1");
+        assert!(!has(cx, "trash-error"));
+        assert_eq!(non_journal_titles(&view, cx), ["Alpha", "Beta", "Test"]);
+        assert_eq!(trash_titles(&view, cx), ["beta"]);
+        assert!(std::fs::read_to_string(page_file(&dir, "Beta"))
+            .unwrap()
+            .contains("zqgone"));
+
+        // Journals: today's comes back on Ctrl-J, so the trashed one waits.
+        let today = today_title();
+        view.update(cx, |app, cx| app.delete_page(&today, cx))
+            .unwrap();
+        cx.simulate_keystrokes("ctrl-j");
+        assert!(todays_journal_file(&dir).exists());
+        click_on(cx, "sidebar-trash");
+        assert_eq!(trash_titles(&view, cx), [today.clone(), "beta".to_string()]);
+        click_on(cx, "trash-restore-0");
+        assert!(has(cx, "trash-error"));
+        assert_eq!(trash_titles(&view, cx), [today, "beta".to_string()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn delete_forever_and_empty_trash_ask_first(cx: &mut TestAppContext) {
+        // A graph that already has pages in its trash when the app starts.
+        let dir =
+            std::env::temp_dir().join(format!("notesec-test-trash-forever-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        for (i, title) in ["Old", "Older", "Test"].into_iter().enumerate() {
+            let page = Page::from_markdown(title, false, "- text\n");
+            storage.save(&page).unwrap();
+            if title != "Test" {
+                storage.trash_at(&page, 1_000 - i as i64).unwrap();
+            }
+        }
+        cx.update(bind_keys);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| NoteSec::new(storage, Config::default(), window, cx));
+        cx.run_until_parked();
+        assert!(has(cx, "sidebar-trash-count"));
+        assert_eq!(trash_titles(&view, cx), ["Old", "Older"]);
+
+        // The palette command opens the trash tab.
+        run_in_palette(cx, "open trash");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Trash));
+        assert!(has(cx, "trash-item-1"));
+
+        let ask = |cx: &mut VisualTestContext| {
+            click_on(cx, "trash-delete-0");
+            assert!(has(cx, "trash-confirm"));
+        };
+        // Enter doesn't confirm; Esc, Cancel and a backdrop click cancel.
+        ask(cx);
+        cx.simulate_keystrokes("enter");
+        assert!(has(cx, "trash-confirm"));
+        // Modal: the tab keys do nothing.
+        cx.simulate_keystrokes("ctrl-w");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Trash));
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "trash-confirm"));
+        ask(cx);
+        click_on(cx, "trash-confirm-cancel");
+        assert!(!has(cx, "trash-confirm"));
+        ask(cx);
+        let dialog = cx.debug_bounds("trash-confirm").unwrap();
+        cx.simulate_click(dialog.origin - point(px(20.), px(20.)), Modifiers::none());
+        assert!(!has(cx, "trash-confirm"));
+        assert_eq!(trash_titles(&view, cx), ["Old", "Older"]);
+        assert!(dir.join(".trash/1000/pages/Old.md").exists());
+
+        // Confirmed: that entry is gone for good, the other stays.
+        ask(cx);
+        click_on(cx, "trash-confirm-ok");
+        assert!(!has(cx, "trash-confirm"));
+        assert_eq!(trash_titles(&view, cx), ["Older"]);
+        assert!(!dir.join(".trash/1000").exists());
+        assert!(dir.join(".trash/999/pages/Older.md").exists());
+        assert!(!has(cx, "trash-item-1"));
+
+        // Empty trash asks too; cancelling keeps everything.
+        click_on(cx, "trash-empty");
+        assert!(has(cx, "trash-confirm"));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(trash_titles(&view, cx), ["Older"]);
+        click_on(cx, "trash-empty");
+        click_on(cx, "trash-confirm-ok");
+        assert!(view.update(cx, |app, _| app.trash.is_empty()));
+        assert!(Storage::open(dir.clone()).unwrap().list_trash().is_empty());
+        assert!(has(cx, "trash-empty-state") && !has(cx, "sidebar-trash-count"));
+        // Nothing left to empty: the button does nothing.
+        click_on(cx, "trash-empty");
+        assert!(!has(cx, "trash-confirm"));
+        // The loaded pages were never touched.
+        assert!(page_file(&dir, "Test").exists());
+        assert_eq!(non_journal_titles(&view, cx), ["Test"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn leaving_the_trash_tab_closes_its_confirmation(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "trash-leave", &trash_pages(), "Test");
+        view.update(cx, |app, cx| app.delete_page("Alpha", cx))
+            .unwrap();
+        view.update(cx, |app, cx| app.show_trash(cx));
+        cx.run_until_parked();
+        click_on(cx, "trash-delete-0");
+        assert!(has(cx, "trash-confirm"));
+        // Ctrl-J (global) shows a page; the question goes with the tab.
+        cx.simulate_keystrokes("ctrl-j");
+        assert!(!has(cx, "trash-confirm"));
+        view.update(cx, |app, _| assert!(app.trash_confirm.is_none()));
+        // Ctrl-K closes it too.
+        view.update(cx, |app, cx| app.show_trash(cx));
+        cx.run_until_parked();
+        click_on(cx, "trash-delete-0");
+        cx.simulate_keystrokes("ctrl-k");
+        assert!(!has(cx, "trash-confirm"));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(trash_titles(&view, cx), ["Alpha"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleted_times_read_relative_to_today() {
+        use chrono::TimeZone;
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 10, 9, 14, 5, 0)
+            .single()
+            .unwrap();
+        let millis = at.timestamp_millis();
+        let later = |d: u32, h: u32| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 10, d, h, 0, 0)
+                .single()
+                .unwrap()
+        };
+        assert_eq!(deleted_label(millis, later(9, 23)), "Deleted today 14:05");
+        assert_eq!(
+            deleted_label(millis, later(10, 1)),
+            "Deleted yesterday 14:05"
+        );
+        assert_eq!(
+            deleted_label(millis, later(12, 9)),
+            "Deleted 2026-10-09 14:05"
+        );
     }
 }
