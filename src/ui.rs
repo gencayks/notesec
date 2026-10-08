@@ -4,7 +4,7 @@
 //! needs click handlers is built in `app.rs`, where `cx.listener` is available.
 
 use crate::config::ThemeKind;
-use crate::model::BlockKind;
+use crate::model::{BlockKind, TaskState};
 use gpui::{div, prelude::*, px, rgb, rgba, Div, FontWeight, Rgba};
 
 /// Colours used across the UI. Every colour comes from here, so switching
@@ -75,6 +75,40 @@ pub fn kind_scale(kind: BlockKind) -> f32 {
         BlockKind::Heading2 => 1.35,
         BlockKind::Heading3 => 1.15,
         BlockKind::Text | BlockKind::Quote => 1.0,
+    }
+}
+
+/// The checkbox drawn in place of a task keyword, sized and vertically
+/// centred for a block of `kind`: an empty box for TODO/LATER, a half-filled
+/// one for DOING/NOW, a filled box with a tick for DONE. `app.rs` adds the
+/// click handler.
+pub fn task_checkbox(theme: &Theme, font_size: f32, kind: BlockKind, state: TaskState) -> Div {
+    let size = font_size * kind_scale(kind);
+    let line_height = size * LINE_HEIGHT_RATIO;
+    let side = (size * 0.9).round();
+    let check = div()
+        .flex_shrink_0()
+        .mt(px((line_height - side) / 2.0))
+        .size(px(side))
+        .rounded_sm()
+        .border_1()
+        .overflow_hidden()
+        .cursor_pointer();
+    match state {
+        TaskState::Done => check
+            .border_color(theme.accent)
+            .bg(theme.accent)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(side * 0.8))
+            .text_color(theme.bg)
+            .font_weight(FontWeight::BOLD)
+            .child("✓"),
+        state if state.is_started() => check
+            .border_color(theme.accent)
+            .child(div().w(px(side / 2.0)).h_full().bg(theme.accent)),
+        _ => check.border_color(theme.muted),
     }
 }
 

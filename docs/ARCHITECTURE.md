@@ -443,6 +443,26 @@ that mutate, and data races are essentially impossible.
     snaps to graphemes as usual.
     Bold/italic are applied as highlights on top of link/tag styles and
     under the row's heading/quote style.
+16. **Task states are Logseq keywords, not `[ ]`/`[x]`** — Logseq's
+    markdown writes a task as a keyword at the start of the block, after any
+    heading prefix: `TODO x`, `DOING x`, `DONE x` (and `LATER`/`NOW` for
+    its other workflow), e.g. `## TODO Plan`. Checked in Logseq 0.10.9
+    `frontend/util/marker.cljs`: `marker-pattern` is `^(#+\s+)?(NOW|LATER|
+    TODO|DOING|DONE|...)?\s?` and `cycle-marker-state` goes TODO -> DOING ->
+    DONE -> none -> TODO and LATER -> NOW -> DONE; `[ ]`/`[x]` are plain
+    markdown checklists that Logseq doesn't treat as task state. So
+    `TaskState` (`model.rs`) parses the keyword after the `BlockKind` prefix
+    (it must be the whole text or be followed by a space; `TODOS` and
+    lowercase `todo` are text) and `cycle_task` follows Logseq's order.
+    Quotes take the keyword after `> ` too, which Logseq would read as
+    quoted text rather than a task. `WAITING`/`CANCELED` etc. stay text.
+    Ctrl+Enter (edit mode) or a click on the checkbox (reading view) cycles;
+    both are one undo step and save right away. The reading view hides the
+    keyword through `DisplayBlock` and draws a checkbox (empty for
+    TODO/LATER, half-filled for DOING/NOW, ticked for DONE, with DONE text
+    dimmed and struck through); its mouse-down stops propagation, so it
+    never starts editing. The edited block shows the raw keyword. The "/"
+    menu doesn't offer TODO: it lists block kinds only.
 
 ---
 

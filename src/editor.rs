@@ -15,7 +15,7 @@
 //! Typing, pasting, Backspace and Delete replace or remove the selected text;
 //! plain Left/Right collapse it to its start/end.
 
-use crate::model::BlockKind;
+use crate::model::{cycle_task, task_split, BlockKind};
 use crate::search::fuzzy_score;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -219,6 +219,32 @@ impl EditorState {
         let rest = self.text.split_off(self.cursor);
         self.marked = None;
         rest
+    }
+
+    // --- task state --------------------------------------------------------------
+
+    /// Ctrl+Enter: move the block to its next task state (see
+    /// `TaskState::next`). The cursor and selection stay on the same text:
+    /// offsets in the text after the marker move with it, offsets before the
+    /// marker stay, and offsets inside the old keyword go to the start of the
+    /// text.
+    pub fn cycle_task(&mut self) {
+        let (marker, _, old_body) = task_split(&self.text);
+        let text = cycle_task(&self.text);
+        let (_, _, new_body) = task_split(&text);
+        let map = |offset: usize| {
+            if offset >= old_body {
+                offset - old_body + new_body
+            } else if offset <= marker {
+                offset
+            } else {
+                new_body
+            }
+        };
+        self.cursor = map(self.cursor);
+        self.anchor = self.anchor.map(map);
+        self.text = text;
+        self.marked = None;
     }
 
     // --- inline formatting -----------------------------------------------------
@@ -642,6 +668,33 @@ mod tests {
             selected: 0,
         };
         assert_eq!(menu.query(&e), Some("q"));
+    }
+
+    #[test]
+    fn cycling_the_task_keeps_the_cursor_on_the_text() {
+        let mut e = EditorState::new("## buy milk");
+        e.cursor = 7; // "buy |milk"
+        e.cycle_task();
+        assert_eq!((e.text.as_str(), e.cursor), ("## TODO buy milk", 12));
+        e.cycle_task();
+        assert_eq!((e.text.as_str(), e.cursor), ("## DOING buy milk", 13));
+        // A selection follows its text too.
+        e.cursor = 9;
+        e.select_to(12);
+        e.cycle_task();
+        assert_eq!(e.text, "## DONE buy milk");
+        assert_eq!(&e.text[e.selection().unwrap()], "buy");
+        e.cycle_task();
+        assert_eq!(e.text, "## buy milk");
+        assert_eq!(&e.text[e.selection().unwrap()], "buy");
+        // Inside the keyword: to the start of the text; before it: stays.
+        let mut e = EditorState::new("DOING x");
+        e.cursor = 2;
+        e.cycle_task();
+        assert_eq!((e.text.as_str(), e.cursor), ("DONE x", 5));
+        e.cursor = 0;
+        e.cycle_task();
+        assert_eq!((e.text.as_str(), e.cursor), ("x", 0));
     }
 
     fn selected(text: &str, range: Range<usize>) -> EditorState {

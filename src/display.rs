@@ -3,7 +3,8 @@
 //! that shown text ("display" offsets) and offsets in the block's `content`
 //! ("source" offsets, what the editor and the file use).
 //!
-//! Hidden are the block-type prefix (`# `, `> `, ...) and the `*` markers of
+//! Hidden are the block-type prefix (`# `, `> `, ...), the task keyword
+//! (`TODO `, `DONE `, ..., drawn as a checkbox instead) and the `*` markers of
 //! properly paired emphasis (`**bold**`, `*italic*`, `***both***`). Stray
 //! stars stay visible. Nothing here changes `content`; storage still writes
 //! the raw markers.
@@ -22,7 +23,7 @@
 
 use std::ops::Range;
 
-use crate::model::{parse_references, BlockKind, Reference};
+use crate::model::{parse_references, BlockKind, Reference, TaskState};
 
 /// How one stretch of displayed text is styled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,6 +46,7 @@ struct Chunk {
 #[derive(Clone, Debug)]
 pub struct DisplayBlock {
     pub kind: BlockKind,
+    pub task: Option<TaskState>,
     /// The text as shown.
     pub text: String,
     /// Wikilinks and tags, with ranges in display offsets.
@@ -60,6 +62,7 @@ pub struct DisplayBlock {
 impl DisplayBlock {
     pub fn new(content: &str) -> Self {
         let (kind, body) = BlockKind::parse(content);
+        let (task, body) = TaskState::parse(body);
         let prefix = content.len() - body.len();
         let refs = parse_references(body);
         let (mut hidden, spans) = parse_emphasis(body, &refs);
@@ -84,6 +87,7 @@ impl DisplayBlock {
 
         let mut block = DisplayBlock {
             kind,
+            task,
             text,
             links: Vec::new(),
             emphasis: Vec::new(),
@@ -113,8 +117,8 @@ impl DisplayBlock {
     /// An offset sticks to the visible character before it, so it lands
     /// before any markers hidden right after that character: just after the
     /// last letter of a bold word is inside the bold, before the closing
-    /// `**`. Offset 0 is the first visible character, after the type prefix
-    /// and any opening markers. Offsets past the end clamp to the last
+    /// `**`. Offset 0 is the first visible character, after the type prefix,
+    /// the task keyword and any opening markers. Offsets past the end clamp to the last
     /// visible character.
     pub fn to_source(&self, display: usize) -> usize {
         let Some(first) = self.chunks.first() else {
@@ -361,6 +365,26 @@ mod tests {
         assert_eq!(d.to_display(14), 5);
         // No visible text at all.
         assert_eq!(DisplayBlock::new("# ").to_source(0), 2);
+    }
+
+    #[test]
+    fn task_keyword_is_hidden_after_the_prefix() {
+        let d = DisplayBlock::new("## DONE **Big** [[P]]");
+        assert_eq!(
+            (d.kind, d.task),
+            (BlockKind::Heading2, Some(TaskState::Done))
+        );
+        assert_eq!(d.text, "Big [[P]]");
+        assert_eq!(d.to_source(0), "## DONE **".len());
+        assert_eq!(d.links[0].range, 4..9);
+        let d = DisplayBlock::new("TODO");
+        assert_eq!(
+            (d.task, d.text.as_str(), d.to_source(0)),
+            (Some(TaskState::Todo), "", 4)
+        );
+        // Not a keyword: shown as is.
+        let d = DisplayBlock::new("TODOS");
+        assert_eq!((d.task, d.text.as_str()), (None, "TODOS"));
     }
 
     #[test]

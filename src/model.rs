@@ -284,6 +284,95 @@ impl BlockKind {
     }
 }
 
+/// Task state of a block, written as a Logseq keyword at the start of the
+/// text, after any heading prefix: `TODO buy milk`, `## DOING write`,
+/// `DONE x`. Logseq's markdown format uses these keywords (not `[ ]`/`[x]`);
+/// see `frontend/util/marker.cljs` (`marker-pattern`, `cycle-marker-state`).
+/// `LATER`/`NOW` are Logseq's other workflow and are kept as written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskState {
+    Todo,
+    Doing,
+    Done,
+    Later,
+    Now,
+}
+
+impl TaskState {
+    const ALL: [TaskState; 5] = [
+        TaskState::Todo,
+        TaskState::Doing,
+        TaskState::Done,
+        TaskState::Later,
+        TaskState::Now,
+    ];
+
+    pub fn keyword(self) -> &'static str {
+        match self {
+            TaskState::Todo => "TODO",
+            TaskState::Doing => "DOING",
+            TaskState::Done => "DONE",
+            TaskState::Later => "LATER",
+            TaskState::Now => "NOW",
+        }
+    }
+
+    /// Ctrl+Enter / checkbox order, as in Logseq's `cycle-marker-state`:
+    /// none -> TODO -> DOING -> DONE -> none, and LATER -> NOW -> DONE.
+    pub fn next(state: Option<TaskState>) -> Option<TaskState> {
+        match state {
+            None => Some(TaskState::Todo),
+            Some(TaskState::Todo) => Some(TaskState::Doing),
+            Some(TaskState::Doing) | Some(TaskState::Now) => Some(TaskState::Done),
+            Some(TaskState::Later) => Some(TaskState::Now),
+            Some(TaskState::Done) => None,
+        }
+    }
+
+    /// In progress (drawn as a half-filled box).
+    pub fn is_started(self) -> bool {
+        matches!(self, TaskState::Doing | TaskState::Now)
+    }
+
+    /// Split a leading keyword off `text`. The keyword must be the whole
+    /// text or be followed by a space (`TODOS` is not a task); one space
+    /// after it belongs to the marker.
+    pub fn parse(text: &str) -> (Option<TaskState>, &str) {
+        for state in TaskState::ALL {
+            if let Some(rest) = text.strip_prefix(state.keyword()) {
+                if rest.is_empty() {
+                    return (Some(state), rest);
+                }
+                if let Some(body) = rest.strip_prefix(' ') {
+                    return (Some(state), body);
+                }
+            }
+        }
+        (None, text)
+    }
+}
+
+/// Where the parts of block `content` start: the task marker (right after the
+/// block-type prefix) and the text after the marker. Without a marker both
+/// are the same offset.
+pub fn task_split(content: &str) -> (usize, Option<TaskState>, usize) {
+    let (_, after_kind) = BlockKind::parse(content);
+    let marker = content.len() - after_kind.len();
+    let (task, body) = TaskState::parse(after_kind);
+    (marker, task, content.len() - body.len())
+}
+
+/// `content` with its task state moved to the next one (see
+/// [`TaskState::next`]), keeping the type prefix and the text.
+pub fn cycle_task(content: &str) -> String {
+    let (marker, task, body) = task_split(content);
+    let (prefix, text) = (&content[..marker], &content[body..]);
+    match TaskState::next(task) {
+        Some(next) => format!("{prefix}{} {text}", next.keyword()),
+        None => format!("{prefix}{text}"),
+    }
+}
+
 /// True for titles shaped like `YYYY-MM-DD` (daily journal pages).
 pub fn is_journal_title(title: &str) -> bool {
     chrono::NaiveDate::parse_from_str(title, "%Y-%m-%d").is_ok()
@@ -568,6 +657,45 @@ fn parse_bullet(line: &str) -> Option<(usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_states_cycle_in_logseq_order() {
+        let mut content = "buy milk".to_string();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            content = cycle_task(&content);
+            seen.push(content.clone());
+        }
+        assert_eq!(
+            seen,
+            [
+                "TODO buy milk",
+                "DOING buy milk",
+                "DONE buy milk",
+                "buy milk"
+            ]
+        );
+        // Logseq's other workflow, and an empty block.
+        assert_eq!(cycle_task("LATER x"), "NOW x");
+        assert_eq!(cycle_task("NOW x"), "DONE x");
+        assert_eq!(cycle_task(""), "TODO ");
+        assert_eq!(cycle_task("TODO"), "DOING ");
+        // The marker goes after a heading prefix, as Logseq writes it.
+        assert_eq!(cycle_task("## Plan"), "## TODO Plan");
+        assert_eq!(cycle_task("## DONE Plan"), "## Plan");
+        assert_eq!(cycle_task("> DOING q"), "> DONE q");
+    }
+
+    #[test]
+    fn task_markers_need_a_whole_keyword() {
+        assert_eq!(TaskState::parse("TODO x"), (Some(TaskState::Todo), "x"));
+        assert_eq!(TaskState::parse("DONE"), (Some(TaskState::Done), ""));
+        for text in ["TODOS x", "todo x", "xTODO x", " TODO x", "DOING:x"] {
+            assert_eq!(TaskState::parse(text), (None, text));
+        }
+        assert_eq!(task_split("# NOW a"), (2, Some(TaskState::Now), 6));
+        assert_eq!(task_split("# a"), (2, None, 2));
+    }
 
     #[test]
     fn round_trip_nested() {

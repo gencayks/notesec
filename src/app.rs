@@ -9,10 +9,12 @@ use crate::config::Config;
 use crate::display::DisplayBlock;
 use crate::editor::{EditorState, Emphasis, SlashMenu};
 use crate::graph_view::{GraphEvent, GraphView};
-use crate::model::{backlinks, parse_references, tag_counts, BlockKind, Page};
+use crate::model::{
+    backlinks, cycle_task, parse_references, tag_counts, BlockKind, Page, TaskState,
+};
 use crate::search::{search, Command, Hit, Target};
 use crate::storage::{today_title, Storage};
-use crate::ui::{block_row, Theme};
+use crate::ui::{block_row, task_checkbox, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
@@ -48,6 +50,7 @@ actions!(
         Paste,
         Bold,
         Italic,
+        CycleTask,
         ToggleSearch,
         NewPage,
         Undo,
@@ -86,6 +89,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-v", Paste, ctx),
         KeyBinding::new("ctrl-b", Bold, ctx),
         KeyBinding::new("ctrl-i", Italic, ctx),
+        KeyBinding::new("ctrl-enter", CycleTask, ctx),
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
         KeyBinding::new("ctrl-n", NewPage, None),
@@ -1079,6 +1083,37 @@ impl NoteSec {
         }
     }
 
+    /// Ctrl+Enter: next task state for the edited block (TODO -> DOING ->
+    /// DONE -> none). One undo step, saved right away like other structural
+    /// changes.
+    fn cycle_task(&mut self, _: &CycleTask, _: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() || self.editing.is_none() {
+            return;
+        }
+        self.close_slash_as_typing();
+        self.text_history_active = false;
+        let before = self.history_state();
+        self.editor.cycle_task();
+        self.sync_content();
+        self.record_state(before);
+        self.save_page();
+        cx.notify();
+    }
+
+    /// Checkbox click on block `ix` (not being edited): next task state,
+    /// without editing it. Any block being edited is committed first. One
+    /// undo step, saved right away.
+    fn cycle_block_task(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.commit();
+        self.text_history_active = false;
+        let before = self.history_state();
+        let block = &mut self.pages[self.selected].blocks[ix];
+        block.content = cycle_task(&block.content);
+        self.record_state(before);
+        self.save_page();
+        cx.notify();
+    }
+
     fn bold(&mut self, _: &Bold, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_emphasis(Emphasis::Bold, cx);
     }
@@ -1749,7 +1784,41 @@ impl Render for NoteSec {
                         text_layout = Some(text.layout().clone());
                         #[cfg(test)]
                         reading_layouts.push((ix, text.layout().clone()));
-                        div().child(text).into_any_element()
+                        // DONE text is dimmed and struck through.
+                        let text = div()
+                            .flex_1()
+                            .when(d.task == Some(TaskState::Done), |t| {
+                                t.text_color(theme.muted)
+                                    .line_through()
+                                    .debug_selector(move || format!("done-text-{ix}"))
+                            })
+                            .child(text);
+                        match d.task {
+                            None => text.into_any_element(),
+                            // The keyword is drawn as a checkbox; a press on
+                            // it cycles the state and never starts editing
+                            // (it stops the row's mouse-down handler).
+                            Some(state) => div()
+                                .flex()
+                                .flex_row()
+                                .items_start()
+                                .gap(px(6.0))
+                                .child(
+                                    task_checkbox(&theme, font_size, kind, state)
+                                        .debug_selector(move || {
+                                            format!("task-{ix}-{}", state.keyword().to_lowercase())
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                this.cycle_block_task(ix, cx);
+                                            }),
+                                        ),
+                                )
+                                .child(text)
+                                .into_any_element(),
+                        }
                     }
                 };
                 // A press on a row that isn't being edited starts editing it
@@ -2072,6 +2141,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::bold))
             .on_action(cx.listener(Self::italic))
+            .on_action(cx.listener(Self::cycle_task))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::on_new_page))
             .on_action(cx.listener(Self::on_undo))
@@ -3731,6 +3801,128 @@ mod tests {
             assert_eq!(app.pages[app.selected].blocks[0].content, "# **Big** title");
         });
         assert_eq!(file(&dir), original.replace("edit me", "edit me!"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn ctrl_enter_cycles_the_task_state_and_saves(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "task-keys", "- buy milk\n");
+        click_block(cx, 0);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            cx.simulate_keystrokes("ctrl-enter");
+            let text = view.update(cx, |app, _| app.editor.text.clone());
+            // Saved right away, not only when editing ends.
+            assert_eq!(file(&dir), format!("- {text}\n"));
+            seen.push(text);
+        }
+        assert_eq!(
+            seen,
+            [
+                "TODO buy milk",
+                "DOING buy milk",
+                "DONE buy milk",
+                "buy milk"
+            ]
+        );
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(
+                app.editor.cursor,
+                "buy milk".len(),
+                "cursor stays at the end"
+            );
+        });
+        // Each change is one undo step.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "DONE buy milk"));
+        cx.simulate_keystrokes("ctrl-z ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "TODO buy milk"));
+        // Plain Enter still splits.
+        cx.simulate_keystrokes("end enter");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks.len(), 2);
+            assert_eq!(app.editing, Some(1));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn has(cx: &mut VisualTestContext, selector: &str) -> bool {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        cx.debug_bounds(selector).is_some()
+    }
+
+    #[gpui::test]
+    fn each_task_state_renders_its_own_checkbox(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(
+            cx,
+            "task-render",
+            "- TODO a\n- DOING b\n- DONE c\n- LATER d\n- NOW e\n- ## TODO head\n- plain TODO\n",
+        );
+        for (ix, state) in ["todo", "doing", "done", "later", "now", "todo"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                has(cx, &format!("task-{ix}-{state}")),
+                "row {ix} is {state}"
+            );
+        }
+        assert!(!has(cx, "task-6-todo"), "a keyword mid-text is not a task");
+        // Only DONE text is dimmed and struck through.
+        assert!(has(cx, "done-text-2"));
+        assert!((0..7)
+            .filter(|&ix| ix != 2)
+            .all(|ix| !has(cx, &format!("done-text-{ix}"))));
+        // The keyword itself is hidden; the heading prefix comes first.
+        assert_eq!(reading_text(&view, cx, 0).as_deref(), Some("a"));
+        assert_eq!(reading_text(&view, cx, 5).as_deref(), Some("head"));
+        assert_eq!(reading_text(&view, cx, 6).as_deref(), Some("plain TODO"));
+        // Clicking the text still edits, cursor mapped past the keyword; the
+        // editor shows the raw keyword and no checkbox.
+        let at = reading_point(&view, cx, 5, 0);
+        cx.simulate_click(at, Modifiers::none());
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(5));
+            assert_eq!(app.editor.cursor, "## TODO ".len());
+        });
+        assert!(!has(cx, "task-5-todo"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn clicking_the_checkbox_cycles_without_editing(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "task-click", "- TODO a\n- b\n");
+        let click = |cx: &mut VisualTestContext, selector: &'static str| {
+            let bounds = cx.debug_bounds(selector).expect(selector);
+            cx.simulate_click(bounds.center(), Modifiers::none());
+        };
+        click(cx, "task-0-todo");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, None, "the checkbox never starts editing");
+            assert_eq!(app.pages[app.selected].blocks[0].content, "DOING a");
+        });
+        assert_eq!(file(&dir), "- DOING a\n- b\n");
+        click(cx, "task-0-doing");
+        assert_eq!(file(&dir), "- DONE a\n- b\n");
+
+        // While another block is being edited: that block is committed and
+        // stays in edit mode.
+        click_block(cx, 1);
+        cx.simulate_input("x");
+        click(cx, "task-0-done");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.pages[app.selected].blocks[0].content, "a");
+        });
+        assert_eq!(file(&dir), "- a\n- bx\n");
+        assert!(!has(cx, "task-0-todo"), "plain again: no checkbox");
+
+        // One undo step brings DONE back.
+        cx.simulate_keystrokes("escape ctrl-z");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].blocks[0].content, "DONE a");
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 }

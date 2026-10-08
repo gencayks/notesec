@@ -126,3 +126,61 @@ fn title_from_filename(stem: &str, is_journal: bool) -> String {
 pub fn today_title() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{cycle_task, task_split, TaskState};
+
+    #[test]
+    fn task_states_round_trip_through_storage() {
+        let dir =
+            std::env::temp_dir().join(format!("notesec-storage-tasks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let storage = Storage::open(dir.clone()).unwrap();
+        let original =
+            "- TODO a\n  - DOING b\n- DONE **c**\n- ## LATER d\n- NOW e\n- TODO \n- plain\n";
+        fs::write(dir.join("pages/Tasks.md"), original).unwrap();
+
+        let mut pages = storage.load_all();
+        let page = &mut pages[0];
+        let states: Vec<_> = page
+            .blocks
+            .iter()
+            .map(|b| task_split(&b.content).1)
+            .collect();
+        use TaskState::*;
+        assert_eq!(
+            states,
+            [
+                Some(Todo),
+                Some(Doing),
+                Some(Done),
+                Some(Later),
+                Some(Now),
+                Some(Todo),
+                None
+            ]
+        );
+        // Saving unchanged pages writes the same bytes.
+        storage.save(page).unwrap();
+        let path = dir.join("pages/Tasks.md");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        // A cycled state is written as Logseq's keyword and reads back.
+        page.blocks[0].content = cycle_task(&page.blocks[0].content);
+        page.blocks[6].content = cycle_task(&page.blocks[6].content);
+        storage.save(page).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            original
+                .replace("- TODO a", "- DOING a")
+                .replace("- plain", "- TODO plain")
+        );
+        let reloaded = storage.load_all();
+        assert_eq!(task_split(&reloaded[0].blocks[0].content).1, Some(Doing));
+        assert_eq!(reloaded[0].blocks[6].content, "TODO plain");
+        let _ = fs::remove_dir_all(dir);
+    }
+}
