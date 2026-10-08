@@ -178,6 +178,7 @@ It's error handling you can see — no hidden `try/catch` five layers up.
 pub struct EditorState {
     pub text: String,
     pub cursor: usize,                // byte offset (see below)
+    pub anchor: Option<usize>,        // other end of the selection, if any
     pub marked: Option<Range<usize>>, // in-progress IME composition
 }
 ```
@@ -375,6 +376,27 @@ that mutate, and data races are essentially impossible.
     rather than stored in a field, so files stay plain Logseq markdown. The
     editor shows the raw prefix; display mode hides it and styles the row.
     Typing "/" in an empty block opens a menu to switch the type.
+12. **Selection = anchor + cursor, within one block** — `EditorState.anchor`
+    is the fixed end and `cursor` the moving end (byte offsets on grapheme
+    boundaries, so mouse positions are snapped back to a whole character).
+    Mouse drag in the block being edited selects (clicking a block that is
+    not being edited still just starts editing it); a click without a drag
+    clears the selection; Shift+Left/Right/Home/End extend or shrink it.
+    Plain Left/Right collapse it to its start/end. Typing, pasting,
+    Backspace, Delete, and Enter replace or remove the selected text first.
+    Replacing a selection is always its own undo step, and undo snapshots
+    include the anchor, so undo brings back the text *and* the selection.
+    Esc clears a selection before it leaves the block (the slash menu's Esc
+    comes first). The OS input handler is told the real selection. The
+    highlight is a translucent theme colour (`Theme::selection`) painted
+    under the text, so it never alters the text's own colours.
+13. **"/" over a selection opens the slash menu without replacing it** —
+    the "/" and the filter text are inserted right after the selection, and
+    the menu keeps a snapshot from before the "/". Choosing a type rebuilds
+    the block from that snapshot (full text kept, nothing deleted); Esc (or
+    deleting the "/") restores it exactly, selection included. If the menu
+    closes any other way (no match, arrows, click), the "/query" is applied
+    as ordinary typing, i.e. it replaces the selection, as one undo step.
 
 ---
 

@@ -15,9 +15,9 @@ use crate::ui::{block_row, Theme};
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, Context, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, GlobalElementId, HighlightStyle, Hsla, KeyBinding, LayoutId, PaintQuad, Pixels,
-    ShapedLine, SharedString, Style, StyledText, Subscription, TextRun, UTF16Selection,
-    UnderlineStyle, Window,
+    FocusHandle, GlobalElementId, HighlightStyle, Hsla, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ShapedLine, SharedString,
+    Style, StyledText, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use std::ops::Range;
 
@@ -38,6 +38,10 @@ actions!(
         Home,
         End,
         Escape,
+        SelectLeft,
+        SelectRight,
+        SelectHome,
+        SelectEnd,
         Paste,
         ToggleSearch,
         NewPage,
@@ -70,6 +74,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", Home, ctx),
         KeyBinding::new("end", End, ctx),
         KeyBinding::new("escape", Escape, ctx),
+        KeyBinding::new("shift-left", SelectLeft, ctx),
+        KeyBinding::new("shift-right", SelectRight, ctx),
+        KeyBinding::new("shift-home", SelectHome, ctx),
+        KeyBinding::new("shift-end", SelectEnd, ctx),
         KeyBinding::new("ctrl-v", Paste, ctx),
         // Global (no context): works whether or not a block is being edited.
         KeyBinding::new("ctrl-k", ToggleSearch, None),
@@ -154,6 +162,9 @@ pub struct NoteSec {
     search: Option<SearchState>,
     /// `Some` while the "/" block-type menu is open on the edited block.
     slash: Option<SlashState>,
+    /// True between a mouse-down in the edited block and the mouse-up: mouse
+    /// moves in between extend the selection.
+    selecting: bool,
     undo_stack: Vec<HistoryState>,
     redo_stack: Vec<HistoryState>,
     text_history_active: bool,
@@ -242,6 +253,7 @@ impl NoteSec {
             editor: EditorState::default(),
             search: None,
             slash: None,
+            selecting: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             text_history_active: false,
@@ -394,7 +406,7 @@ impl NoteSec {
         self.slash = None;
         self.text_history_active = false;
         if let Some(ix) = self.editing {
-            self.editor.cursor = self.editor.cursor.min(self.editor.text.len());
+            self.editor.clamp();
             self.editor.marked = None;
             self.pages[self.selected].blocks[ix].content = self.editor.text.clone();
         }
@@ -407,7 +419,7 @@ impl NoteSec {
         if self.search.is_some() {
             return;
         }
-        self.close_slash_keep_text();
+        self.close_slash_as_typing();
         if let Some(state) = self.undo_stack.pop() {
             self.redo_stack.push(self.history_state());
             self.restore_history(state, window, cx);
@@ -418,7 +430,7 @@ impl NoteSec {
         if self.search.is_some() {
             return;
         }
-        self.close_slash_keep_text();
+        self.close_slash_as_typing();
         if let Some(state) = self.redo_stack.pop() {
             self.undo_stack.push(self.history_state());
             self.restore_history(state, window, cx);
@@ -534,39 +546,51 @@ impl NoteSec {
             .unwrap_or_default()
     }
 
-    /// After the editor changed while the menu is open: close it if the "/"
-    /// is gone or nothing matches any more (what was typed stays as text),
-    /// otherwise go back to the top entry.
+    /// After the editor changed while the menu is open: if the "/" itself
+    /// was deleted, cancel (as Esc would); if nothing matches any more, keep
+    /// what was typed as ordinary text; otherwise go back to the top entry.
     fn refresh_slash(&mut self) {
-        if self.slash.is_none() {
-            return;
-        }
-        if self.slash_matches().is_empty() {
-            self.close_slash_keep_text();
+        let Some(state) = &self.slash else { return };
+        if state.menu.query(&self.editor).is_none() {
+            self.slash_cancel();
+        } else if self.slash_matches().is_empty() {
+            self.close_slash_as_typing();
         } else if let Some(state) = &mut self.slash {
             state.menu.selected = 0;
         }
     }
 
-    /// Close the menu leaving the "/..." text in the block as ordinary text.
-    /// Typing while the menu was open recorded no history, so record it now
-    /// as one undo step (and let further typing join that step).
-    fn close_slash_keep_text(&mut self) {
+    /// Close the menu and treat the "/query" as ordinary typing: it goes in
+    /// where the "/" was typed, replacing the selection if there was one
+    /// (exactly what typing it with no menu would have done). Typing while
+    /// the menu was open recorded no history, so this is recorded now as one
+    /// undo step (and further typing joins that step).
+    fn close_slash_as_typing(&mut self) {
         let Some(state) = self.slash.take() else {
             return;
         };
-        if self.editor.text != state.before.editor.text {
-            self.record_state(state.before);
-            self.text_history_active = true;
-        }
+        let Some(typed) = state.menu.typed(&self.editor).map(str::to_string) else {
+            self.editor = state.before.editor;
+            return;
+        };
+        let mut editor = state.before.editor.clone();
+        editor.insert(&typed);
+        self.editor = editor;
+        self.record_state(state.before);
+        self.text_history_active = true;
     }
 
-    /// Esc: close the menu and put the block back exactly as it was before
-    /// the "/" was typed.
-    fn dismiss_slash(&mut self, cx: &mut Context<Self>) {
+    /// Put the block (text, cursor and selection) back exactly as it was
+    /// before the "/" was typed.
+    fn slash_cancel(&mut self) {
         if let Some(state) = self.slash.take() {
             self.editor = state.before.editor;
         }
+    }
+
+    /// Esc with the menu open.
+    fn dismiss_slash(&mut self, cx: &mut Context<Self>) {
+        self.slash_cancel();
         cx.notify();
     }
 
@@ -725,7 +749,7 @@ impl NoteSec {
 
     /// Write the editor text back to its block and save if anything changed.
     fn commit(&mut self) {
-        self.close_slash_keep_text();
+        self.close_slash_as_typing();
         if self.sync_content() {
             self.save_page();
         }
@@ -740,6 +764,7 @@ impl NoteSec {
         let content = self.pages[self.selected].blocks[ix].content.clone();
         self.editor = EditorState::new(&content);
         self.slash = None;
+        self.selecting = false;
         if cursor_at_start {
             self.editor.cursor = 0;
         }
@@ -809,7 +834,7 @@ impl NoteSec {
     /// save. The block keeps its index (document order never changes).
     fn restructure(&mut self, cx: &mut Context<Self>, op: impl FnOnce(&mut Page, usize) -> bool) {
         let Some(ix) = self.editing else { return };
-        self.close_slash_keep_text();
+        self.close_slash_as_typing();
         self.text_history_active = false;
         let before = self.history_state();
         self.sync_content();
@@ -859,12 +884,8 @@ impl NoteSec {
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        if self.slash.is_some() {
-            self.editor.delete();
-            self.refresh_slash();
-            cx.notify();
-            return;
-        }
+        // With the menu open, the "/query" becomes text before deleting.
+        self.close_slash_as_typing();
         if self.editing.is_some() || self.search.is_some() {
             self.text_history_active = false;
             let before = self.history_state();
@@ -877,27 +898,111 @@ impl NoteSec {
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_slash_keep_text();
+        self.close_slash_as_typing();
         self.active_editor_mut().move_left();
         cx.notify();
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_slash_keep_text();
+        self.close_slash_as_typing();
         self.active_editor_mut().move_right();
         cx.notify();
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_slash_keep_text();
+        self.close_slash_as_typing();
         self.active_editor_mut().move_home();
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_slash_keep_text();
+        self.close_slash_as_typing();
         self.active_editor_mut().move_end();
         cx.notify();
+    }
+
+    /// Shared body of the Shift+arrow actions: extend or shrink the selection.
+    fn extend_selection(&mut self, cx: &mut Context<Self>, op: impl FnOnce(&mut EditorState)) {
+        self.close_slash_as_typing();
+        op(self.active_editor_mut());
+        cx.notify();
+    }
+
+    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_selection(cx, EditorState::select_left);
+    }
+
+    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_selection(cx, EditorState::select_right);
+    }
+
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_selection(cx, EditorState::select_home);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_selection(cx, EditorState::select_end);
+    }
+
+    // --- mouse selection in the edited block -----------------------------------
+    // Same approach as gpui's `examples/input.rs`: mouse-down places the
+    // cursor (Shift extends instead), moves while the button is held select,
+    // mouse-up ends it. A click without a drag therefore clears the selection.
+
+    /// Byte offset in the edited text under `position`, from the layout
+    /// painted last frame.
+    fn index_for_mouse(&self, position: gpui::Point<Pixels>) -> usize {
+        let len = self.editor.text.len();
+        let (Some(bounds), Some(line)) = (self.last_bounds, self.last_layout.as_ref()) else {
+            return self.editor.cursor;
+        };
+        if position.y < bounds.top() {
+            0
+        } else if position.y > bounds.bottom() {
+            len
+        } else {
+            line.closest_index_for_x(position.x - bounds.left())
+                .min(len)
+        }
+    }
+
+    fn on_text_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.is_none() || self.search.is_some() {
+            return;
+        }
+        self.close_slash_as_typing();
+        // A new cursor position starts a new undo step for typing.
+        self.text_history_active = false;
+        let ix = self.index_for_mouse(event.position);
+        if event.modifiers.shift {
+            self.editor.select_to(ix);
+        } else {
+            self.editor.set_cursor(ix);
+        }
+        self.selecting = true;
+        cx.notify();
+    }
+
+    fn on_text_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selecting && self.editing.is_some() {
+            let ix = self.index_for_mouse(event.position);
+            self.editor.select_to(ix);
+            cx.notify();
+        }
+    }
+
+    fn on_text_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.selecting = false;
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
@@ -935,6 +1040,10 @@ impl NoteSec {
             self.close_search(cx);
         } else if self.slash.is_some() {
             self.dismiss_slash(cx);
+        } else if self.editor.selection().is_some() {
+            // First Esc only drops the selection; the next one stops editing.
+            self.editor.clear_selection();
+            cx.notify();
         } else {
             self.stop_edit(cx);
         }
@@ -942,7 +1051,7 @@ impl NoteSec {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.close_slash_keep_text();
+            self.close_slash_as_typing();
             if self.search.is_none() && self.editing.is_some() {
                 self.record_edit();
             }
@@ -991,11 +1100,10 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        // We have a cursor but no selection, so the range is empty.
-        let c = self.active_editor().cursor;
+        let editor = self.active_editor();
         Some(UTF16Selection {
-            range: self.active_editor().range_to_utf16(&(c..c)),
-            reversed: false,
+            range: editor.range_to_utf16(&editor.selected_range()),
+            reversed: editor.selection_reversed(),
         })
     }
 
@@ -1025,14 +1133,17 @@ impl EntityInputHandler for NoteSec {
             .as_ref()
             .map(|r| self.active_editor().range_from_utf16(r))
             .or(self.active_editor().marked.clone())
-            .unwrap_or(self.active_editor().cursor..self.active_editor().cursor);
+            .unwrap_or(self.active_editor().selected_range());
         let in_block = self.search.is_none() && self.editing.is_some();
-        // "/" typed into an empty block opens the block-type menu. Its typing
-        // records no history: the menu settles that when it closes.
+        // "/" typed into an empty block, or over a selection, opens the
+        // block-type menu. The "/" is inserted without replacing anything
+        // (after the selection), and its typing records no history: the menu
+        // settles that when it closes.
         if in_block && self.slash.is_none() {
             if let Some(menu) = SlashMenu::open_for(&self.editor, &range, new_text) {
                 let before = self.history_state();
-                self.editor.replace_range(range, new_text);
+                self.editor.clear_selection();
+                self.editor.replace_range(menu.slash..menu.slash, new_text);
                 self.slash = Some(SlashState { menu, before });
                 cx.notify();
                 return;
@@ -1044,8 +1155,11 @@ impl EntityInputHandler for NoteSec {
             cx.notify();
             return;
         }
+        // Replacing a selection always starts its own undo step, so undo
+        // brings the selected text (and the selection) back.
+        let replaces_selection = self.editor.selection().is_some();
         let before = if in_block {
-            if self.text_history_active {
+            if self.text_history_active && !replaces_selection {
                 None
             } else {
                 self.text_history_active = true;
@@ -1074,10 +1188,11 @@ impl EntityInputHandler for NoteSec {
             .as_ref()
             .map(|r| self.active_editor().range_from_utf16(r))
             .or(self.active_editor().marked.clone())
-            .unwrap_or(self.active_editor().cursor..self.active_editor().cursor);
+            .unwrap_or(self.active_editor().selected_range());
         let in_menu = self.slash.is_some();
+        let replaces_selection = self.editor.selection().is_some();
         let before = if self.search.is_none() && self.editing.is_some() && !in_menu {
-            if self.text_history_active {
+            if self.text_history_active && !replaces_selection {
                 None
             } else {
                 self.text_history_active = true;
@@ -1155,6 +1270,8 @@ struct BlockText {
 struct PrepaintState {
     line: ShapedLine,
     cursor: PaintQuad,
+    /// Highlight behind the selected text, if any.
+    selection: Option<PaintQuad>,
 }
 
 impl IntoElement for BlockText {
@@ -1202,8 +1319,10 @@ impl Element for BlockText {
         let app = self.app.read(cx);
         let text: SharedString = app.active_editor().text.clone().into();
         let cursor = app.active_editor().cursor;
+        let selected = app.active_editor().selection();
         let marked = app.active_editor().marked.clone();
         let accent: Hsla = app.theme.accent.into();
+        let selection_color: Hsla = app.theme.selection.into();
         let style = window.text_style();
 
         let run = TextRun {
@@ -1255,7 +1374,22 @@ impl Element for BlockText {
             ),
             accent,
         );
-        PrepaintState { line, cursor }
+        // The selection is a translucent quad painted *under* the text, so it
+        // never changes the text runs (colours, IME underline) on top of it.
+        let selection = selected.map(|range| {
+            fill(
+                Bounds::from_corners(
+                    point(bounds.left() + line.x_for_index(range.start), bounds.top()),
+                    point(bounds.left() + line.x_for_index(range.end), bounds.bottom()),
+                ),
+                selection_color,
+            )
+        });
+        PrepaintState {
+            line,
+            cursor,
+            selection,
+        }
     }
 
     fn paint(
@@ -1276,6 +1410,9 @@ impl Element for BlockText {
             cx,
         );
 
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection);
+        }
         prepaint
             .line
             .paint(
@@ -1527,7 +1664,10 @@ impl Render for NoteSec {
                 // the character (and so the link) under the mouse.
                 let mut text_layout = None;
                 let content: AnyElement = if is_editing {
-                    BlockText { app: cx.entity() }.into_any_element()
+                    div()
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::on_text_mouse_down))
+                        .child(BlockText { app: cx.entity() })
+                        .into_any_element()
                 } else if links.is_empty() {
                     div().child(body.to_string()).into_any_element()
                 } else {
@@ -1810,6 +1950,14 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
+            // Drag-selection keeps tracking when the mouse leaves the block,
+            // so these live on the root rather than the block.
+            .on_mouse_move(cx.listener(Self::on_text_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_text_mouse_up))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::on_new_page))
@@ -2935,6 +3083,181 @@ mod tests {
         assert_eq!(quote, plain);
         // Rendering never rewrites the stored markdown.
         assert_eq!(file(&dir), "- # Big\n- ### Small\n- plain\n- > quoted\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Window position of byte `ix` in the edited block, from the last paint.
+    fn text_point(view: &Entity<NoteSec>, cx: &mut VisualTestContext, ix: usize) -> Point<Pixels> {
+        view.update(cx, |app, _| {
+            let bounds = app.last_bounds.expect("edited block painted");
+            let x = app.last_layout.as_ref().unwrap().x_for_index(ix);
+            point(bounds.left() + x, bounds.center().y)
+        })
+    }
+
+    fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+    }
+
+    fn selection(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Option<Range<usize>> {
+        view.update(cx, |app, _| app.editor.selection())
+    }
+
+    /// Click block `ix` and select its last `n` bytes with Shift+Left.
+    fn select_tail(cx: &mut VisualTestContext, ix: usize, n: usize) {
+        click_block(cx, ix);
+        cx.simulate_keystrokes(&vec!["shift-left"; n].join(" "));
+    }
+
+    #[gpui::test]
+    fn drag_selects_and_click_clears(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "sel-drag", "- hello world\n");
+        click_block(cx, 0);
+
+        // Drag from before "h" to after "hello".
+        let (start, end) = (text_point(&view, cx, 0), text_point(&view, cx, 5));
+        drag(cx, start, end);
+        assert_eq!(selection(&view, cx), Some(0..5));
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 5));
+
+        // The OS input handler sees the real selection, in UTF-16 units.
+        let reported = cx.update(|window, cx| {
+            view.update(cx, |app, cx| app.selected_text_range(false, window, cx))
+        });
+        let reported = reported.unwrap();
+        assert_eq!((reported.range, reported.reversed), (0..5, false));
+
+        // Dragging leftwards selects the other way round.
+        let (start, end) = (text_point(&view, cx, 11), text_point(&view, cx, 6));
+        drag(cx, start, end);
+        assert_eq!(selection(&view, cx), Some(6..11));
+        view.update(cx, |app, _| assert!(app.editor.selection_reversed()));
+
+        // A click without a drag clears it and places the cursor.
+        let at = text_point(&view, cx, 2);
+        cx.simulate_click(at, Modifiers::none());
+        assert_eq!(selection(&view, cx), None);
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.cursor, 2);
+            assert_eq!(app.editing, Some(0));
+            assert_eq!(app.editor.text, "hello world");
+        });
+        assert_eq!(file(&dir), "- hello world\n", "selecting never edits");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn shift_arrows_extend_and_shrink_the_selection(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "sel-keys", "- hello world\n");
+        select_tail(cx, 0, 3);
+        assert_eq!(selection(&view, cx), Some(8..11));
+        cx.simulate_keystrokes("shift-right");
+        assert_eq!(selection(&view, cx), Some(9..11));
+        // Plain Left collapses to the start of the selection.
+        cx.simulate_keystrokes("left");
+        assert_eq!(selection(&view, cx), None);
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 9));
+        cx.simulate_keystrokes("shift-home");
+        assert_eq!(selection(&view, cx), Some(0..9));
+        // Plain Right collapses to its end.
+        cx.simulate_keystrokes("right");
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 9));
+        cx.simulate_keystrokes("shift-end");
+        assert_eq!(selection(&view, cx), Some(9..11));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn typing_replaces_the_selection_in_one_undo_step(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "sel-type", "- hello world\n");
+        select_tail(cx, 0, 5);
+        cx.simulate_input("there");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.text, "hello there");
+            assert_eq!(app.editor.selection(), None);
+        });
+
+        // One undo brings back the text and the selection; redo re-applies.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello world"));
+        assert_eq!(selection(&view, cx), Some(6..11));
+        cx.simulate_keystrokes("ctrl-y");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello there"));
+
+        // Backspace deletes a selection; paste replaces one.
+        cx.simulate_keystrokes("shift-left shift-left shift-left shift-left shift-left backspace");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello "));
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("you".into()));
+        cx.simulate_keystrokes("shift-home ctrl-v");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "you"));
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello "));
+        assert_eq!(selection(&view, cx), Some(0..6));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn escape_clears_the_selection_before_leaving_the_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "sel-esc", "- hello world\n");
+        select_tail(cx, 0, 5);
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.selection(), None);
+            assert_eq!(app.editing, Some(0), "still editing");
+            assert_eq!(app.editor.text, "hello world");
+        });
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn slash_over_a_selection_converts_and_keeps_the_text(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "sel-slash", "- hello world\n");
+        select_tail(cx, 0, 5);
+
+        // "/" does not replace the selection: it goes after it.
+        cx.simulate_input("/");
+        view.update(cx, |app, _| {
+            assert!(app.slash.is_some());
+            assert_eq!(app.editor.text, "hello world/");
+        });
+        assert!(cx.debug_bounds("slash-menu").is_some());
+
+        // Esc puts back the text and the selection exactly.
+        cx.simulate_input("he");
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| {
+            assert!(app.slash.is_none());
+            assert_eq!(app.editor.text, "hello world");
+            assert_eq!(app.editing, Some(0));
+        });
+        assert_eq!(selection(&view, cx), Some(6..11));
+
+        // Enter converts the block, keeping all of its text.
+        cx.simulate_input("/quo");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| {
+            assert!(app.slash.is_none());
+            assert_eq!(app.editor.text, "> hello world");
+        });
+        assert_eq!(file(&dir), "- > hello world\n");
+
+        // Undo goes back to before the "/", selection included.
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello world"));
+        assert_eq!(selection(&view, cx), Some(6..11));
+
+        // A query nothing matches is plain typing: it replaces the selection.
+        cx.simulate_input("/zz");
+        view.update(cx, |app, _| {
+            assert!(app.slash.is_none());
+            assert_eq!(app.editor.text, "hello /zz");
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "hello world"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

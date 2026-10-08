@@ -5,7 +5,7 @@
 
 use crate::config::ThemeKind;
 use crate::model::BlockKind;
-use gpui::{div, prelude::*, px, rgb, Div, FontWeight, Rgba};
+use gpui::{div, prelude::*, px, rgb, rgba, Div, FontWeight, Rgba};
 
 /// Colours used across the UI. Every colour comes from here, so switching
 /// theme is just swapping this struct.
@@ -18,6 +18,9 @@ pub struct Theme {
     pub accent: Rgba,
     pub selected_bg: Rgba,
     pub border: Rgba,
+    /// Translucent background behind selected text, so the text colour
+    /// (including link and tag colours) shows through.
+    pub selection: Rgba,
 }
 
 impl Theme {
@@ -38,6 +41,7 @@ impl Theme {
             accent: rgb(0x89b4fa),
             selected_bg: rgb(0x313244),
             border: rgb(0x313244),
+            selection: rgba(0x89b4fa55),
         }
     }
 }
@@ -53,6 +57,7 @@ impl Theme {
             accent: rgb(0x1e66f5),
             selected_bg: rgb(0xccd0da),
             border: rgb(0xccd0da),
+            selection: rgba(0x1e66f540),
         }
     }
 }
