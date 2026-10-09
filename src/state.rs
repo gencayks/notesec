@@ -10,6 +10,11 @@
 //! [shortcuts]                           # absent: the default keys
 //! SplitRight = "ctrl-alt-s"             # see hotkeys.rs (decision 41)
 //! Quit = ""                             # unbound
+//!
+//! [[saved_searches]]                    # sidebar smart folders (decision 46)
+//! name = "Meetings"
+//! kind = "global"                       # or "semantic"
+//! query = "meeting"
 //! ```
 //!
 //! It also holds the AI API key (`ai_api_key = "sk-…"`, decision 42) for
@@ -63,6 +68,66 @@ pub struct UiState {
         deserialize_with = "lenient_string"
     )]
     pub ai_api_key: String,
+    /// Saved searches shown in the sidebar (decision 46), in the order
+    /// they were saved. Read leniently: entries without a name or query,
+    /// or with an unknown kind, are dropped, as are repeated names.
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_saved_searches"
+    )]
+    pub saved_searches: Vec<SavedSearch>,
+}
+
+/// Which search a saved search re-runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchKind {
+    /// Global search (Ctrl+Shift+F): exact text in titles and blocks.
+    #[default]
+    Global,
+    /// Semantic search (decision 43): by meaning, with the active AI mode.
+    Semantic,
+}
+
+/// A named global or semantic search (a sidebar "smart folder").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSearch {
+    pub name: String,
+    pub kind: SearchKind,
+    pub query: String,
+}
+
+/// `[[saved_searches]]` read so one bad entry costs only itself.
+fn lenient_saved_searches<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<SavedSearch>, D::Error> {
+    let value = toml::Value::deserialize(deserializer)?;
+    let mut out: Vec<SavedSearch> = Vec::new();
+    for entry in value.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let text = |key: &str| {
+            entry
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let kind = match entry.get("kind").and_then(toml::Value::as_str) {
+            None | Some("global") => SearchKind::Global,
+            Some("semantic") => SearchKind::Semantic,
+            Some(_) => continue,
+        };
+        let (Some(name), Some(query)) = (text("name"), text("query")) else {
+            continue;
+        };
+        if out
+            .iter()
+            .any(|s| s.name.to_lowercase() == name.to_lowercase())
+        {
+            continue;
+        }
+        out.push(SavedSearch { name, kind, query });
+    }
+    Ok(out)
 }
 
 /// A string, or empty for any other value (a hand-editing slip in one key
@@ -119,6 +184,14 @@ impl UiState {
         }
     }
 
+    /// The saved search called `name` (ignoring case).
+    pub fn saved_search(&self, name: &str) -> Option<usize> {
+        let wanted = name.trim().to_lowercase();
+        self.saved_searches
+            .iter()
+            .position(|s| s.name.to_lowercase() == wanted)
+    }
+
     /// Drop empty titles and case-insensitive duplicates (keeping the first),
     /// and cap `recent`, so a hand-edited file can't confuse the sidebar.
     fn sanitized(mut self) -> Self {
@@ -134,7 +207,7 @@ impl UiState {
         let body = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let text = format!(
-            "# notesec UI state (favorites, recent pages, page order, custom keys, AI API key in plaintext)\n{body}"
+            "# notesec UI state (favorites, recent pages, page order, custom keys, AI API key in plaintext, saved searches)\n{body}"
         );
         write_atomic(&Self::path(root), &text)
     }
@@ -253,6 +326,11 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
             ai_api_key: "sk-test-123".into(),
+            saved_searches: vec![SavedSearch {
+                name: "Meetings".into(),
+                kind: SearchKind::Global,
+                query: "meeting".into(),
+            }],
         };
         state.save(&dir).unwrap();
         assert_eq!(UiState::load(&dir), state);
@@ -403,5 +481,67 @@ mod tests {
         assert!(!state.toggle_favorite("PROJECTS"));
         assert!(!state.is_favorite("Projects"));
         assert_eq!(state.favorites, titles(&["Ideas"]));
+    }
+
+    #[test]
+    fn saved_searches_round_trip_and_read_leniently() {
+        let dir = temp_dir("saved");
+        let state = UiState {
+            favorites: titles(&["A"]),
+            saved_searches: vec![
+                SavedSearch {
+                    name: "Meetings".into(),
+                    kind: SearchKind::Global,
+                    query: "meeting".into(),
+                },
+                SavedSearch {
+                    name: "Ideas".into(),
+                    kind: SearchKind::Semantic,
+                    query: "new product ideas".into(),
+                },
+            ],
+            ..UiState::default()
+        };
+        state.save(&dir).unwrap();
+        let text = fs::read_to_string(UiState::path(&dir)).unwrap();
+        assert!(text.contains("[[saved_searches]]") && text.contains("kind = \"semantic\""));
+        assert_eq!(UiState::load(&dir), state);
+        assert_eq!(state.saved_search("ideas"), Some(1));
+
+        // Bad entries cost only themselves; no entries, no key written.
+        fs::write(
+            UiState::path(&dir),
+            "recent = [\"B\"]\n\
+             [[saved_searches]]\nname = \"Ok\"\nquery = \"x\"\n\
+             [[saved_searches]]\nname = \"ok\"\nquery = \"dup\"\n\
+             [[saved_searches]]\nname = \"Bad kind\"\nkind = \"fuzzy\"\nquery = \"x\"\n\
+             [[saved_searches]]\nname = \" \"\nquery = \"x\"\n\
+             [[saved_searches]]\nname = \"No query\"\n\
+             [[saved_searches]]\nname = 5\nquery = \"x\"\n",
+        )
+        .unwrap();
+        let state = UiState::load(&dir);
+        assert_eq!(state.recent, titles(&["B"]));
+        assert_eq!(
+            state.saved_searches,
+            vec![SavedSearch {
+                name: "Ok".into(),
+                kind: SearchKind::Global,
+                query: "x".into()
+            }]
+        );
+        fs::write(
+            UiState::path(&dir),
+            "saved_searches = 3\nrecent = [\"C\"]\n",
+        )
+        .unwrap();
+        let state = UiState::load(&dir);
+        assert!(state.saved_searches.is_empty());
+        assert_eq!(state.recent, titles(&["C"]));
+        state.save(&dir).unwrap();
+        assert!(!fs::read_to_string(UiState::path(&dir))
+            .unwrap()
+            .contains("saved_searches"));
+        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -22,7 +22,7 @@ use crate::model::{
 use crate::search::{
     search, search_blocks, search_link_pages, search_templates, search_text, snippet, Hit, Target,
 };
-use crate::state::UiState;
+use crate::state::{SearchKind, UiState};
 use crate::storage::{today_title, validate_title, Storage, Template, TrashEntry};
 use crate::table::{parse_table, Align};
 use crate::tabs::{TabTarget, Tabs};
@@ -46,7 +46,7 @@ use uuid::Uuid;
 /// Settings > AI and the Ask my notes panel (decision 42).
 mod ai_ui;
 mod mentions_ui;
-use ai_ui::{AiSettings, AskState, RelatedState, SemanticState, TagSuggestState};
+use ai_ui::{AiSettings, AskState, RelatedState, SavedUi, SemanticState, TagSuggestState};
 use mentions_ui::MentionsState;
 
 // Actions are named, typed commands that key bindings map onto. The macro
@@ -120,6 +120,7 @@ actions!(
         AskMyNotes,
         SemanticSearch,
         SuggestTags,
+        SaveSearch,
     ]
 );
 
@@ -678,6 +679,8 @@ pub struct NoteSec {
     related: RelatedState,
     /// "Mentioned in" (decision 45).
     mentions: MentionsState,
+    /// Saved searches' sidebar state and name field (decision 46).
+    saved: SavedUi,
     /// The pages in the trash, newest first (`Storage::list_trash`). Read
     /// at startup, when the trash tab is focused and after every change.
     trash: Vec<TrashEntry>,
@@ -861,6 +864,7 @@ impl NoteSec {
             tag_suggest: TagSuggestState::default(),
             related: RelatedState::default(),
             mentions: MentionsState::default(),
+            saved: SavedUi::default(),
             trash,
             trash_confirm: None,
             trash_error: None,
@@ -944,6 +948,7 @@ impl NoteSec {
                 &mut self.settings,
                 &mut self.ask,
                 &mut self.semantic,
+                &mut self.saved,
                 ai_input,
             )
             .unwrap_or(&mut self.editor),
@@ -6621,6 +6626,7 @@ impl Render for NoteSec {
         };
         let drop_before = self.page_drop.as_ref().map(|d| d.before.clone());
         let preview_font = self.font_family.clone();
+        let saved_searches = self.render_saved_searches(cx);
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = self.mode == Mode::Notes && ix == self.selected;
             let is_favorite = self.state.is_favorite(&page.title);
@@ -6995,6 +7001,7 @@ impl Render for NoteSec {
             .when(!recent_rows.is_empty(), |d| {
                 d.child(section_header("RECENT")).children(recent_rows)
             })
+            .children(saved_searches)
             .child(pages_header)
             .children(sidebar_items)
             .child(drop_end)
@@ -7350,6 +7357,7 @@ impl Render for NoteSec {
                                     .child("Search all pages"),
                             )
                         })
+                        .children(self.save_search_button(SearchKind::Global, cx))
                         .child(
                             div()
                                 .debug_selector(|| "search-input".to_string())
@@ -7826,6 +7834,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_ask_my_notes))
             .on_action(cx.listener(Self::on_semantic_search))
             .on_action(cx.listener(Self::on_suggest_tags))
+            .on_action(cx.listener(Self::on_save_search))
             .child(sidebar)
             .child(content)
             .children(status_toast)

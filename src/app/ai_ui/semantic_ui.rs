@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::semantic::{self, Cache, CacheKey, Item};
+use crate::state::SearchKind;
 use gpui::{AsyncApp, WeakEntity};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,6 +72,8 @@ pub(in crate::app) enum Progress {
     Ask(usize),
     /// "Index notes" in the Related section (decision 44).
     Related,
+    /// A saved semantic search being re-run, by its run id (decision 46).
+    Saved(u64),
 }
 
 impl NoteSec {
@@ -108,6 +111,11 @@ impl NoteSec {
                 }
             }
             Progress::Related => self.related.progress = Some((done, total)),
+            Progress::Saved(id) => {
+                if let Some(run) = self.saved.runs.values_mut().find(|r| r.id == id) {
+                    run.progress = Some((done, total));
+                }
+            }
         }
         cx.notify();
     }
@@ -460,6 +468,7 @@ impl NoteSec {
                             .flex_row()
                             .justify_between()
                             .child(div().font_weight(FontWeight::BOLD).child("Semantic search"))
+                            .children(self.save_search_button(SearchKind::Semantic, cx))
                             .child(
                                 div()
                                     .text_color(if mode_warn { theme.danger } else { theme.muted })

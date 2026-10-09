@@ -25,6 +25,10 @@ mod tags_ui;
 pub(super) use related_ui::RelatedState;
 pub(super) use tags_ui::TagSuggestState;
 
+/// Saved searches: sidebar smart folders (decision 46).
+mod saved_ui;
+pub(super) use saved_ui::SavedUi;
+
 /// A text field of Settings > AI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AiField {
@@ -139,6 +143,8 @@ pub(super) struct AskState {
 pub(super) enum AiInput {
     Ask,
     Semantic,
+    /// The "Save search" name field (decision 46).
+    SaveName,
 }
 
 /// The AI editor that has the keyboard, if any, from the parts of
@@ -148,6 +154,7 @@ pub(super) fn ai_editor_mut<'a>(
     settings: &'a mut Option<SettingsState>,
     ask: &'a mut AskState,
     semantic: &'a mut SemanticState,
+    saved: &'a mut SavedUi,
     input: Option<AiInput>,
 ) -> Option<&'a mut EditorState> {
     if let Some(SettingsState {
@@ -163,6 +170,7 @@ pub(super) fn ai_editor_mut<'a>(
     match input {
         Some(AiInput::Ask) => Some(&mut ask.input),
         Some(AiInput::Semantic) => Some(&mut semantic.input),
+        Some(AiInput::SaveName) => saved.prompt.as_mut().map(|p| &mut p.input),
         None => None,
     }
 }
@@ -183,6 +191,8 @@ impl NoteSec {
             || self.trash_confirm.is_some();
         if covered {
             None
+        } else if self.saved.prompt.is_some() {
+            Some(AiInput::SaveName)
         } else if self.ask.open {
             Some(AiInput::Ask)
         } else if self.semantic.open {
@@ -199,7 +209,9 @@ impl NoteSec {
 
     /// The open AI overlay, if any (`app.rs` adds it under the palette).
     pub(super) fn render_ai_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.ask.open {
+        if let Some(prompt) = &self.saved.prompt {
+            Some(self.render_save_prompt(prompt, cx))
+        } else if self.ask.open {
             Some(self.render_ask(cx))
         } else if self.semantic.open {
             Some(self.render_semantic(cx))
@@ -221,6 +233,7 @@ impl NoteSec {
         match self.ai_overlay_input()? {
             AiInput::Ask => Some(&self.ask.input),
             AiInput::Semantic => Some(&self.semantic.input),
+            AiInput::SaveName => self.saved.prompt.as_ref().map(|p| &p.input),
         }
     }
 
@@ -234,6 +247,7 @@ impl NoteSec {
         match self.ai_overlay_input() {
             Some(AiInput::Ask) => self.ask_question(cx),
             Some(AiInput::Semantic) => self.semantic_enter(window, cx),
+            Some(AiInput::SaveName) => self.confirm_save_prompt(cx),
             None => return false,
         }
         true
@@ -261,6 +275,10 @@ impl NoteSec {
         match self.ai_overlay_input() {
             Some(AiInput::Ask) => self.close_ask(cx),
             Some(AiInput::Semantic) => self.close_semantic(cx),
+            Some(AiInput::SaveName) => {
+                self.saved.prompt = None;
+                cx.notify();
+            }
             None => return false,
         }
         true

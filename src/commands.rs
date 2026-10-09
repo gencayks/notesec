@@ -154,6 +154,7 @@ commands! {
     AskMyNotes => "Ask my notes", ["ai", "chat", "question", "llm", "assistant", "answer"], Nothing;
     SemanticSearch => "Semantic search", ["meaning", "similar", "embeddings", "ai search", "find by meaning"], Nothing;
     SuggestTags => "Suggest tags", ["auto tag", "tagging", "ai tags", "keywords", "label"], Page;
+    SaveSearch => "Save search", ["smart folder", "saved search", "keep search", "bookmark search"], Nothing;
 }
 
 /// A binding's keys as people write them: `Ctrl+Shift+T`, `Ctrl+=`,

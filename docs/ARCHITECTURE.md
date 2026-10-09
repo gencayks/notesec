@@ -1607,6 +1607,58 @@ that mutate, and data races are essentially impossible.
     `sync_page_ai` in `render`, and
     `.children(self.render_mentions(..))` right after
     `.child(backlinks_panel)`.
+46. **Saved searches: named global or semantic searches as sidebar smart
+    folders.** *Saving*: global search (Ctrl+Shift+F) and the Semantic
+    search overlay both show a "Save search" button once there is a query
+    (`global-save-search` is a one-line hook under the global heading;
+    `semantic-save-search` sits in the overlay's header). There is also
+    a palette command, "Save search" (`SaveSearch`; smart folder, saved
+    search, keep search, bookmark search; `Needs::Nothing`, no default
+    key, no key claimed). The palette replaces either overlay when it
+    opens, so the command saves the one still open or else the last
+    global or semantic query seen (`SavedUi.last`, noted each frame by
+    the sidebar hook). Without one, a status says to run a search first.
+    Saving opens a small name dialog. Its field goes through the same
+    `active_editor` routing as the AI overlays (`AiInput::SaveName`;
+    `ai_editor_mut` takes the saved-search state too). The name defaults
+    to the query; Enter saves, Esc cancels, and an empty or taken name
+    (ignoring case) is refused in place. *Storage*: `state.toml` as
+    `[[saved_searches]]` entries `{name, kind = "global" | "semantic",
+    query}` (`state::SavedSearch`). The key isn't written when the list
+    is empty. It is read leniently like `[shortcuts]`: a missing kind
+    reads as global; entries with an unknown kind, an empty or non-string
+    name or query, or a repeated name are dropped alone; anything but an
+    array reads as none. *Sidebar*: a foldable "SAVED SEARCHES" section
+    under RECENT (absent when there are none, so nothing else moves).
+    Each row shows ⌕ (global) or ≈ (semantic), and a click folds or
+    unfolds its results under it. ✎ renames through the same dialog. ×
+    deletes on a second press ("Delete?"): deleting isn't part of the
+    page undo history, so it asks instead. *Live results*: an unfolded
+    global search is run on the current pages each time the sidebar is
+    drawn (`search::search_text`, top 20), so edits show at once without
+    a cache to keep in step. Rows open like global search results
+    (`open_hit`: the page, or the block with the match selected). A
+    semantic search never runs by itself. It runs when the user unfolds
+    it for the first time in a session, or presses ↻. It uses the active
+    mode only (`semantic_ui::run_job` with `Progress::Saved(run id)`, so
+    the overlay's own results are left alone), and the embedding cache
+    means only new blocks and the query are embedded. A search saved
+    from the overlay starts with the results shown there, so there is no
+    second request. Off mode and connection errors show their usual
+    wording under the row, and a result whose block has gone since says
+    so when clicked. Results are kept for the session, keyed by
+    lowercase name, and follow a rename. *Code*: `state.rs`
+    (`SavedSearch`, `SearchKind`, lenient read) and
+    `src/app/ai_ui/saved_ui.rs`. It lives under `ai_ui` because it
+    shares the semantic pipeline and the AI input routing, although
+    global saved searches don't need AI. *Hooks in `app.rs`*:
+    - the action, its listener, and the field with its init
+    - `&mut self.saved` in `active_editor_mut`'s `ai_editor_mut` call
+    - `let saved_searches = self.render_saved_searches(cx);` before
+      `sidebar_items`, and `.children(saved_searches)` after RECENT
+    - `.children(self.save_search_button(SearchKind::Global, cx))` under
+      the global search heading
+    - `SearchKind` in the `crate::state` import
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
