@@ -1,9 +1,6 @@
 //! User settings, stored as `config.toml` in the graph folder.
 //!
 //! ```toml
-
-//! font_size = 16.0
-//! font_family = "Inter"   # optional; omit to use the system UI font
 //! git_backup = false      # commit the graph folder to local git (decision 39)
 //! # AI (decision 42). The mode is always the user's explicit choice:
 //! ai_provider = "local"    # "local" (default), "api" or "off"; never falls back
@@ -28,15 +25,15 @@
 //! `ai_api_key` (plaintext; see `state.rs`), so this hand-edited settings
 //! file can be shared or committed without leaking it.
 //!
-//! The file is read once at startup. The app rewrites it when you change the
-//! font size or font family (in the settings panel, via shortcuts, or from the
-//! Ctrl-K palette), so hand edits to other keys survive only if they are valid
-//! ones we know about.
+//! The file is read once at startup and rewritten when you change a setting
+//! that lives here (git backup, the AI and clipper options, plugins...), so
+//! hand edits to other keys survive only if they are valid ones we know about.
 //!
-//! The colour theme is **not** here: it is chosen in Settings and stored in
-//! `state.toml` (`state.rs`). An old `theme = "dark"` / `"light"` line in this
-//! file is still read once, to carry that choice over, and is dropped the next
-//! time the file is saved.
+//! The colour theme and the fonts are **not** here: they are chosen in
+//! Settings > Appearance and stored in `state.toml` (`state.rs`). Old
+//! `theme`, `font_size` and `font_family` lines in this file are still read
+//! once, to carry those choices over, and are dropped the next time the file
+//! is saved.
 
 use crate::ai::AiProvider;
 use crate::storage::write_atomic;
@@ -47,6 +44,19 @@ use std::path::{Path, PathBuf};
 pub const MIN_FONT_SIZE: f32 = 10.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
 pub const DEFAULT_FONT_SIZE: f32 = 16.0;
+/// The block editor is monospace, whose glyphs are wider than a proportional
+/// font's at the same size, so it starts a little smaller.
+pub const DEFAULT_MONO_FONT_SIZE: f32 = 14.0;
+
+/// A font size forced into the usable range. A typo like `font_size = 0` or
+/// `1e9` must not make the UI unusable, and NaN reads as the default.
+pub fn clamp_font_size(size: f32) -> f32 {
+    if size.is_finite() {
+        size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    } else {
+        DEFAULT_FONT_SIZE
+    }
+}
 
 /// The built-in colour themes. The chosen one is stored in `state.toml`
 /// (`state.rs`), by the names below.
@@ -99,10 +109,15 @@ pub struct Config {
     /// `NoteSec::new`), and is never written back.
     #[serde(rename = "theme", skip_serializing)]
     pub legacy_theme: Option<ThemeKind>,
-    pub font_size: f32,
-    /// `None` means "use the system UI font".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub font_family: Option<String>,
+    /// **Legacy, read-only**, like `legacy_theme`: the UI font size and
+    /// family used to be set here (`font_size`, `font_family`). They are now
+    /// chosen in Settings > Appearance and stored in `state.toml`; these are
+    /// read once at startup to carry an existing choice over, and never
+    /// written back.
+    #[serde(rename = "font_size", skip_serializing)]
+    pub legacy_font_size: Option<f32>,
+    #[serde(rename = "font_family", skip_serializing)]
+    pub legacy_font_family: Option<String>,
     /// Git auto-backup (`backup.rs`): commit the graph folder to a local
     /// git repository after changes. Off unless the user turns it on.
     pub git_backup: bool,
@@ -157,8 +172,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             legacy_theme: None,
-            font_size: DEFAULT_FONT_SIZE,
-            font_family: None,
+            legacy_font_size: None,
+            legacy_font_family: None,
             git_backup: false,
             ai_provider: AiProvider::default(),
             ai_endpoint: crate::ai::DEFAULT_ENDPOINT.to_string(),
@@ -211,18 +226,18 @@ impl Config {
     /// Clamp values into a usable range (a typo like `font_size = 0` or
     /// `1e9` must not make the UI unusable).
     fn sanitized(mut self) -> Self {
-        self.font_size = self.clamp_size(self.font_size);
+        self.legacy_font_size = self.legacy_font_size.map(clamp_font_size);
         if self.clipper_port < 1024 {
             self.clipper_port = crate::clipper::DEFAULT_PORT;
         }
         self.whisper_language = crate::voice::whisper::language(&self.whisper_language);
         // An empty family name means "unset".
         if self
-            .font_family
+            .legacy_font_family
             .as_deref()
             .is_some_and(|f| f.trim().is_empty())
         {
-            self.font_family = None;
+            self.legacy_font_family = None;
         }
         for field in [
             &mut self.ai_endpoint,
@@ -243,28 +258,11 @@ impl Config {
         self
     }
 
-    fn clamp_size(&self, size: f32) -> f32 {
-        if size.is_finite() {
-            size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
-        } else {
-            DEFAULT_FONT_SIZE
-        }
-    }
-
-    /// Change the font size by `delta` points, staying within limits.
-    pub fn adjust_font_size(&mut self, delta: f32) {
-        self.font_size = self.clamp_size(self.font_size + delta);
-    }
-
     /// Write settings to `<root>/config.toml` atomically.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let body = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let mut text = String::from("# notesec settings\n");
-        if self.font_family.is_none() {
-            text.push_str("# font_family = \"Inter\"   # uncomment to pick a font\n");
-        }
-        text.push_str(&body);
+        let text = format!("# notesec settings\n{body}");
         write_atomic(&Self::path(root), &text)
     }
 }
@@ -304,8 +302,8 @@ mod tests {
         let config = Config {
             // Never written, so it must not survive a round trip.
             legacy_theme: None,
-            font_size: 20.0,
-            font_family: Some("Inter".into()),
+            legacy_font_size: None,
+            legacy_font_family: None,
             git_backup: true,
             ai_provider: AiProvider::Api,
             ai_endpoint: "http://127.0.0.1:8080/v1".into(),
@@ -344,11 +342,13 @@ mod tests {
     }
 
     #[test]
-    fn default_save_keeps_a_font_hint_and_loads_back() {
+    fn default_save_loads_back_and_writes_no_font_or_theme_keys() {
         let dir = temp_dir("hint");
         Config::default().save(&dir).unwrap();
         let text = fs::read_to_string(Config::path(&dir)).unwrap();
-        assert!(text.contains("# font_family"));
+        for key in ["font", "theme"] {
+            assert!(!text.contains(key), "unexpected {key} in:\n{text}");
+        }
         assert_eq!(Config::load(&dir), Config::default());
         let _ = fs::remove_dir_all(dir);
     }
@@ -360,13 +360,15 @@ mod tests {
         fs::write(Config::path(&dir), "theme = \"dark\"\nfont_size = 18.0\n").unwrap();
         let config = Config::load(&dir);
         assert_eq!(config.legacy_theme, Some(ThemeKind::CatppuccinMocha));
-        assert_eq!(config.font_size, 18.0);
-        // Saving for any other reason drops the key (the app has copied it to
-        // state.toml by then).
+        assert_eq!(config.legacy_font_size, Some(18.0));
+        // Saving for any other reason drops the keys (the app has copied them
+        // to state.toml by then).
         config.save(&dir).unwrap();
         let text = fs::read_to_string(Config::path(&dir)).unwrap();
         assert!(!text.contains("theme"), "unexpected theme key in:\n{text}");
-        assert_eq!(Config::load(&dir).legacy_theme, None);
+        assert!(!text.contains("font"), "unexpected font key in:\n{text}");
+        let again = Config::load(&dir);
+        assert_eq!((again.legacy_theme, again.legacy_font_size), (None, None));
         // The new names work in the old place too.
         fs::write(Config::path(&dir), "theme = \"tokyo-night\"\n").unwrap();
         assert_eq!(Config::load(&dir).legacy_theme, Some(ThemeKind::TokyoNight));
@@ -379,7 +381,7 @@ mod tests {
         fs::write(Config::path(&dir), "theme = \"light\"\n").unwrap();
         let c = Config::load(&dir);
         assert_eq!(c.legacy_theme, Some(ThemeKind::Light));
-        assert_eq!(c.font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(c.legacy_font_size, None, "unset stays unset");
         assert!(!c.git_backup, "backup is off unless turned on");
         assert_eq!(c.ai_endpoint, crate::ai::DEFAULT_ENDPOINT);
         assert_eq!(c.ai_model, "");
@@ -418,15 +420,15 @@ mod tests {
     fn out_of_range_sizes_are_clamped() {
         let dir = temp_dir("clamp");
         fs::write(Config::path(&dir), "font_size = 0.5\n").unwrap();
-        assert_eq!(Config::load(&dir).font_size, MIN_FONT_SIZE);
+        assert_eq!(Config::load(&dir).legacy_font_size, Some(MIN_FONT_SIZE));
         fs::write(
             Config::path(&dir),
             "font_size = 1000.0\nfont_family = \"  \"\n",
         )
         .unwrap();
         let c = Config::load(&dir);
-        assert_eq!(c.font_size, MAX_FONT_SIZE);
-        assert_eq!(c.font_family, None);
+        assert_eq!(c.legacy_font_size, Some(MAX_FONT_SIZE));
+        assert_eq!(c.legacy_font_family, None);
         fs::write(
             Config::path(&dir),
             "ai_endpoint = \" \"\nai_model = \" m \"\n",
@@ -449,13 +451,11 @@ mod tests {
     }
 
     #[test]
-    fn adjusting_font_size_stays_in_bounds() {
-        let mut c = Config::default();
-        c.adjust_font_size(2.0);
-        assert_eq!(c.font_size, 18.0);
-        c.adjust_font_size(1000.0);
-        assert_eq!(c.font_size, MAX_FONT_SIZE);
-        c.adjust_font_size(-1000.0);
-        assert_eq!(c.font_size, MIN_FONT_SIZE);
+    fn clamping_a_font_size_keeps_it_usable() {
+        assert_eq!(clamp_font_size(18.0), 18.0);
+        assert_eq!(clamp_font_size(1000.0), MAX_FONT_SIZE);
+        assert_eq!(clamp_font_size(-5.0), MIN_FONT_SIZE);
+        assert_eq!(clamp_font_size(f32::NAN), DEFAULT_FONT_SIZE);
+        assert_eq!(clamp_font_size(f32::INFINITY), DEFAULT_FONT_SIZE);
     }
 }

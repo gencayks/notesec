@@ -102,7 +102,7 @@ impl NoteSec {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = self.theme;
-        let font_size = self.config.font_size;
+        let font_size = self.ui_size();
         let (prefix, ix) = (out.prefix, out.ix);
         let indent = |n: usize| "  ".repeat(n);
         let (title, rows) = match embed {

@@ -4,6 +4,10 @@
 //!
 //! ```toml
 //! theme = "tokyo-night"            # or "catppuccin-mocha", "light" (decision 56)
+//! ui_font = "Inter"                 # reading font; absent: the system UI font (decision 57)
+//! ui_size = 16.0
+//! mono_font = "JetBrains Mono"      # block editor font; absent: first installed mono font
+//! mono_size = 14.0
 //! favorites = ["Projects", "Reading list"]
 //! recent = ["2026-10-08", "Projects"]   # most recent first
 //! page_order = ["Projects", "Inbox"]    # absent: alphabetical
@@ -33,7 +37,7 @@
 //! a missing file gives an empty state, and an invalid file gives an empty
 //! state after being copied to `state.toml.bak`.
 
-use crate::config::ThemeKind;
+use crate::config::{clamp_font_size, ThemeKind, DEFAULT_FONT_SIZE, DEFAULT_MONO_FONT_SIZE};
 use crate::hotkeys::Overrides;
 use crate::storage::write_atomic;
 use serde::{Deserialize, Serialize};
@@ -94,6 +98,59 @@ pub struct UiState {
         deserialize_with = "lenient_theme"
     )]
     pub theme: Option<ThemeKind>,
+    /// Typography (Settings > Appearance, decision 57). `None` everywhere
+    /// means the default: the system UI font at 16 for reading, the first
+    /// installed monospace font at 14 for the block editor.
+    ///
+    /// The reading view's font family, `None`: the system UI font.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_family"
+    )]
+    pub ui_font: Option<String>,
+    /// The reading view's size in px. Out of range reads as the nearest
+    /// limit (see `clamp_font_size`).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_size"
+    )]
+    pub ui_size: Option<f32>,
+    /// The block editor's font family, `None`: the first installed font of
+    /// `app::MONO_FONTS`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_family"
+    )]
+    pub mono_font: Option<String>,
+    /// The block editor's size in px.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_size"
+    )]
+    pub mono_size: Option<f32>,
+}
+
+/// A font family name, or `None` for blank or any other kind of value.
+fn lenient_family<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
+/// A font size (a TOML float or integer), or `None` for anything else.
+fn lenient_size<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f32>, D::Error> {
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(match value {
+        toml::Value::Float(f) => Some(f as f32),
+        toml::Value::Integer(i) => Some(i as f32),
+        _ => None,
+    })
 }
 
 /// A theme name, or `None` for anything unrecognised (a typo here must not
@@ -225,6 +282,33 @@ impl UiState {
         }
     }
 
+    /// The reading view's font size in px: the saved one, else the default.
+    pub fn ui_size(&self) -> f32 {
+        clamp_font_size(self.ui_size.unwrap_or(DEFAULT_FONT_SIZE))
+    }
+
+    /// The block editor's font size in px.
+    pub fn mono_size(&self) -> f32 {
+        clamp_font_size(self.mono_size.unwrap_or(DEFAULT_MONO_FONT_SIZE))
+    }
+
+    /// Carry over the font choices `config.toml` used to hold (`font_size`,
+    /// `font_family`): they were the reading font. Each is only used when
+    /// nothing has been chosen here since, so an old value can never override
+    /// a newer choice. Returns whether anything changed (the caller saves).
+    pub fn adopt_legacy_fonts(&mut self, size: Option<f32>, family: Option<String>) -> bool {
+        let mut changed = false;
+        if let (None, Some(size)) = (self.ui_size, size) {
+            self.ui_size = Some(size);
+            changed = true;
+        }
+        if let (None, Some(family)) = (&self.ui_font, family) {
+            self.ui_font = Some(family);
+            changed = true;
+        }
+        changed
+    }
+
     /// The saved search called `name` (ignoring case).
     pub fn saved_search(&self, name: &str) -> Option<usize> {
         let wanted = name.trim().to_lowercase();
@@ -240,6 +324,8 @@ impl UiState {
         dedupe(&mut self.recent);
         dedupe(&mut self.page_order);
         self.recent.truncate(MAX_RECENT);
+        self.ui_size = self.ui_size.map(clamp_font_size);
+        self.mono_size = self.mono_size.map(clamp_font_size);
         self
     }
 
@@ -374,12 +460,128 @@ mod tests {
             }],
             clipper_token: "0a1b2c".into(),
             theme: Some(ThemeKind::CatppuccinMocha),
+            ui_font: Some("Test Sans".into()),
+            ui_size: Some(18.0),
+            mono_font: Some("Test Mono".into()),
+            mono_size: Some(15.0),
         };
         state.save(&dir).unwrap();
         assert_eq!(UiState::load(&dir), state);
         // No temp file left behind by the atomic write.
         assert!(!dir.join(".state.toml.tmp").exists());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn font_settings_round_trip_and_default_to_the_defaults() {
+        let dir = temp_dir("fonts");
+        let fresh = UiState::load(&dir);
+        assert_eq!(
+            (fresh.ui_font.clone(), fresh.mono_font.clone()),
+            (None, None)
+        );
+        assert_eq!(fresh.ui_size(), DEFAULT_FONT_SIZE);
+        assert_eq!(fresh.mono_size(), DEFAULT_MONO_FONT_SIZE);
+
+        let state = UiState {
+            ui_font: Some("Inter".into()),
+            ui_size: Some(18.0),
+            mono_font: Some("JetBrains Mono".into()),
+            mono_size: Some(13.5),
+            ..UiState::default()
+        };
+        state.save(&dir).unwrap();
+        let text = fs::read_to_string(UiState::path(&dir)).unwrap();
+        for line in [
+            "ui_font = \"Inter\"",
+            "ui_size = 18.0",
+            "mono_font = \"JetBrains Mono\"",
+            "mono_size = 13.5",
+        ] {
+            assert!(text.contains(line), "missing {line} in:\n{text}");
+        }
+        assert_eq!(UiState::load(&dir), state);
+
+        // Unset: none of the keys are written.
+        UiState::default().save(&dir).unwrap();
+        let text = fs::read_to_string(UiState::path(&dir)).unwrap();
+        assert!(!text.contains("font") && !text.contains("size"), "{text}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn font_sizes_are_clamped_and_integers_are_accepted() {
+        let dir = temp_dir("font-clamp");
+        fs::write(UiState::path(&dir), "ui_size = 0.5\nmono_size = 1000\n").unwrap();
+        let state = UiState::load(&dir);
+        assert_eq!(state.ui_size, Some(crate::config::MIN_FONT_SIZE));
+        assert_eq!(state.mono_size, Some(crate::config::MAX_FONT_SIZE));
+        fs::write(UiState::path(&dir), "ui_size = 20\n").unwrap();
+        assert_eq!(
+            UiState::load(&dir).ui_size,
+            Some(20.0),
+            "TOML integers work"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bad_font_values_cost_only_themselves() {
+        let dir = temp_dir("font-bad");
+        for (bad_family, bad_size) in [("5", "\"big\""), ("\"  \"", "[1]"), ("[\"a\"]", "true")] {
+            fs::write(
+                UiState::path(&dir),
+                format!(
+                    "favorites = [\"A\"]\nui_font = {bad_family}\nmono_font = {bad_family}\n\
+                     ui_size = {bad_size}\nmono_size = {bad_size}\n"
+                ),
+            )
+            .unwrap();
+            let state = UiState::load(&dir);
+            assert_eq!(state.ui_font, None, "ui_font = {bad_family}");
+            assert_eq!(state.mono_font, None);
+            assert_eq!(state.ui_size, None, "ui_size = {bad_size}");
+            assert_eq!(state.mono_size, None);
+            assert_eq!(
+                state.favorites,
+                titles(&["A"]),
+                "the rest of the file survives"
+            );
+            assert!(
+                !dir.join("state.toml.bak").exists(),
+                "not treated as corrupt"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_fonts_are_adopted_only_when_nothing_was_chosen() {
+        let mut state = UiState::default();
+        assert!(state.adopt_legacy_fonts(Some(19.0), Some("Inter".into())));
+        assert_eq!(
+            (state.ui_size, state.ui_font.as_deref()),
+            (Some(19.0), Some("Inter"))
+        );
+
+        // Each is independent, and a newer choice always wins.
+        let mut chosen = UiState {
+            ui_size: Some(12.0),
+            ..UiState::default()
+        };
+        assert!(chosen.adopt_legacy_fonts(Some(19.0), Some("Inter".into())));
+        assert_eq!(chosen.ui_size, Some(12.0), "newer size kept");
+        assert_eq!(
+            chosen.ui_font.as_deref(),
+            Some("Inter"),
+            "unset family adopted"
+        );
+        assert!(!chosen.adopt_legacy_fonts(Some(30.0), Some("Other".into())));
+
+        // The legacy values never touch the editor's font.
+        assert_eq!((chosen.mono_size, chosen.mono_font), (None, None));
+        let mut none = UiState::default();
+        assert!(!none.adopt_legacy_fonts(None, None));
     }
 
     #[test]

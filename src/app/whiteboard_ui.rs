@@ -652,7 +652,7 @@ impl NoteSec {
 
     pub(super) fn render_whiteboard(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
-        let font_size = self.config.font_size;
+        let font_size = self.ui_size();
         let mut board = self.board();
         let view = self.board_view();
         // A card being dragged is drawn where the drag has it.

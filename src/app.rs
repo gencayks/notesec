@@ -50,6 +50,7 @@ mod ai_ui;
 mod mentions_ui;
 use ai_ui::{AiSettings, AskState, RelatedState, SavedUi, SemanticState, TagSuggestState};
 use mentions_ui::MentionsState;
+mod appearance_ui;
 mod clipper_ui;
 mod embed_ui;
 mod import_ui;
@@ -486,8 +487,10 @@ struct SettingsState {
 /// The settings panel's sections (tab-like buttons at its top).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsSection {
-    /// Theme, fonts, git backup.
+    /// Git backup and the editor's vim mode.
     General,
+    /// Theme and fonts (decisions 56 and 57, `appearance_ui`).
+    Appearance,
     /// Every command with its key, rebindable (decision 41).
     Shortcuts,
     /// Provider, endpoint, models and API key (decision 42).
@@ -683,9 +686,9 @@ pub struct NoteSec {
     state: UiState,
     /// Colours for `config.theme`, kept in sync by `apply_theme`.
     theme: Theme,
-    /// The font family actually in use: `config.font_family` if that font is
-    /// installed, else `None` (the system UI font). Kept apart from the config
-    /// so an unknown name in the file is never overwritten by a save.
+    /// The reading font actually in use: `state.ui_font` if that font is
+    /// installed, else `None` (the system UI font). Kept apart from the
+    /// state so an unknown name in the file is never overwritten by a save.
     font_family: Option<SharedString>,
 
     /// Handle used to give this view keyboard focus while editing.
@@ -865,9 +868,13 @@ impl NoteSec {
         }
 
         let mut state = UiState::load(storage.root());
-        // A theme chosen before themes moved to `state.toml` (as `theme = ...`
-        // in `config.toml`) carries over once; config saves then drop that key.
-        if state.adopt_legacy_theme(config.legacy_theme) {
+        // A theme or fonts chosen before they moved to `state.toml` (as
+        // `theme`, `font_size`, `font_family` in `config.toml`) carry over
+        // once; config saves then drop those keys.
+        let theme_adopted = state.adopt_legacy_theme(config.legacy_theme);
+        let fonts_adopted =
+            state.adopt_legacy_fonts(config.legacy_font_size, config.legacy_font_family.clone());
+        if theme_adopted || fonts_adopted {
             if let Err(err) = state.save(storage.root()) {
                 eprintln!("notesec: failed to save state: {err}");
             }
@@ -886,12 +893,12 @@ impl NoteSec {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
-        let font_family = config
-            .font_family
+        let font_family = state
+            .ui_font
             .as_deref()
             .and_then(|family| installed_font(family, cx));
 
-        let mono_font = mono_font(cx);
+        let mono_font = resolve_mono_font(state.mono_font.as_deref(), cx);
         let trash = storage.list_trash();
         let backup_seen = storage.changes();
         // A page file written since the last notification restarts the
@@ -1129,19 +1136,100 @@ impl NoteSec {
         self.set_theme(self.theme_kind().toggled(), cx);
     }
 
-    /// Use font `family` (`None`: the system UI font), apply it right away
-    /// and save it. A family that isn't installed is still saved, but the
-    /// system font is used, as at startup.
-    fn set_font_family(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+    // --- typography (decision 57) ---------------------------------------------
+
+    /// The reading view's font size in px.
+    fn ui_size(&self) -> f32 {
+        self.state.ui_size()
+    }
+
+    /// The block editor's font size in px.
+    fn mono_size(&self) -> f32 {
+        self.state.mono_size()
+    }
+
+    /// Save a typography change and redraw. The open graph view takes the
+    /// reading font size too.
+    fn typography_changed(&mut self, cx: &mut Context<Self>) {
+        self.save_state();
+        self.sync_graph_style(cx);
+        cx.notify();
+    }
+
+    /// Use font `family` for reading (`None`: the system UI font), apply it
+    /// right away and save it. A family that isn't installed is still saved,
+    /// but the system font is used, as at startup.
+    fn set_ui_font(&mut self, family: Option<String>, cx: &mut Context<Self>) {
         let family = family.filter(|f| !f.trim().is_empty());
-        if self.config.font_family == family {
+        if self.state.ui_font == family {
             return;
         }
         self.font_family = family.as_deref().and_then(|f| installed_font(f, cx));
-        self.config.font_family = family;
-        self.save_config();
-        self.sync_graph_style(cx);
-        cx.notify();
+        self.state.ui_font = family;
+        self.typography_changed(cx);
+    }
+
+    /// Use font `family` in the block editor (`None`: the first installed
+    /// monospace font). Code blocks follow it, as they share the editor's font.
+    fn set_mono_font(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+        let family = family.filter(|f| !f.trim().is_empty());
+        if self.state.mono_font == family {
+            return;
+        }
+        self.state.mono_font = family;
+        self.mono_font = resolve_mono_font(self.state.mono_font.as_deref(), cx);
+        self.typography_changed(cx);
+    }
+
+    /// `size` px for the reading view (`None`: the default), kept in range.
+    fn set_ui_size(&mut self, size: Option<f32>, cx: &mut Context<Self>) {
+        let size = size.map(crate::config::clamp_font_size);
+        if self.state.ui_size == size {
+            return;
+        }
+        self.state.ui_size = size;
+        self.typography_changed(cx);
+    }
+
+    /// `size` px for the block editor (`None`: the default), kept in range.
+    fn set_mono_size(&mut self, size: Option<f32>, cx: &mut Context<Self>) {
+        let size = size.map(crate::config::clamp_font_size);
+        if self.state.mono_size == size {
+            return;
+        }
+        self.state.mono_size = size;
+        self.typography_changed(cx);
+    }
+
+    fn change_ui_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.set_ui_size(Some(self.ui_size() + delta), cx);
+    }
+
+    fn change_mono_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.set_mono_size(Some(self.mono_size() + delta), cx);
+    }
+
+    fn reset_ui_size(&mut self, cx: &mut Context<Self>) {
+        self.set_ui_size(None, cx);
+    }
+
+    fn reset_mono_size(&mut self, cx: &mut Context<Self>) {
+        self.set_mono_size(None, cx);
+    }
+
+    /// Ctrl+= / Ctrl+-: make everything bigger or smaller by one step. Both
+    /// sizes move together so the reading and editing views stay in
+    /// proportion; Settings > Appearance sets each on its own.
+    fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let (ui, mono) = (self.ui_size() + delta, self.mono_size() + delta);
+        self.set_ui_size(Some(ui), cx);
+        self.set_mono_size(Some(mono), cx);
+    }
+
+    /// Ctrl+0: both sizes back to their defaults.
+    fn reset_font_size(&mut self, cx: &mut Context<Self>) {
+        self.set_ui_size(None, cx);
+        self.set_mono_size(None, cx);
     }
 
     // --- git auto-backup (backup.rs, decision 39) -------------------------------
@@ -1492,20 +1580,6 @@ impl NoteSec {
         } else {
             self.open_settings(cx);
         }
-    }
-
-    fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
-        self.config.adjust_font_size(delta);
-        self.save_config();
-        self.sync_graph_style(cx);
-        cx.notify();
-    }
-
-    fn reset_font_size(&mut self, cx: &mut Context<Self>) {
-        self.config.font_size = crate::config::DEFAULT_FONT_SIZE;
-        self.save_config();
-        self.sync_graph_style(cx);
-        cx.notify();
     }
 
     // --- templates -------------------------------------------------------------
@@ -3298,8 +3372,7 @@ impl NoteSec {
         if let Some(graph) = self.graph.clone() {
             graph.update(cx, |g, cx| g.refresh(pages, current, cx));
         } else {
-            let (theme, size, reduce_motion) =
-                (self.theme, self.config.font_size, cx.reduce_motion());
+            let (theme, size, reduce_motion) = (self.theme, self.ui_size(), cx.reduce_motion());
             let graph = cx.new(|_| GraphView::new(pages, current, theme, size, reduce_motion));
             // Clicking a node asks us to open that page. From the graph tab
             // that opens or focuses a page tab (see `show_selected`).
@@ -3333,7 +3406,7 @@ impl NoteSec {
     /// Push theme and font changes into the graph view if it exists.
     fn sync_graph_style(&self, cx: &mut Context<Self>) {
         if let Some(graph) = &self.graph {
-            let (theme, size) = (self.theme, self.config.font_size);
+            let (theme, size) = (self.theme, self.ui_size());
             graph.update(cx, |g, cx| g.set_style(theme, size, cx));
         }
     }
@@ -3916,7 +3989,7 @@ impl NoteSec {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = self.theme;
-        let font_size = self.config.font_size;
+        let font_size = self.ui_size();
         let which = (block, n);
         let copied = self.copied_code == Some(which);
         let show_button = copied || self.hovered_code == Some(which);
@@ -3985,7 +4058,7 @@ impl NoteSec {
                     .child(
                         div()
                             .whitespace_nowrap()
-                            .text_size(px(font_size * 0.9))
+                            .text_size(px(self.mono_size()))
                             .when_some(self.mono_font.clone(), |d, font| d.font_family(font))
                             .child(code.code.clone()),
                     ),
@@ -4358,14 +4431,34 @@ const MONO_FONTS: [&str; 12] = [
     "Courier New",
 ];
 
-/// The first installed font of `MONO_FONTS`, if any (code then falls back
-/// to the UI font, quietly: it still reads fine).
-fn mono_font(cx: &App) -> Option<SharedString> {
-    let names = cx.text_system().all_font_names();
+/// The first installed font of `MONO_FONTS` among `names`, if any (the editor
+/// and code then fall back to the UI font, quietly: it still reads fine).
+fn auto_mono_font(names: &[String]) -> Option<SharedString> {
     MONO_FONTS
         .iter()
         .find(|font| names.iter().any(|name| name == *font))
         .map(|font| SharedString::from(*font))
+}
+
+/// The editor's font: `chosen` (from Settings) if that family is installed,
+/// else the first installed font of `MONO_FONTS`. A chosen family that is
+/// missing falls back quietly to the automatic one rather than to a
+/// proportional font, so the editor stays monospace.
+fn pick_mono_font(chosen: Option<&str>, names: &[String]) -> Option<SharedString> {
+    chosen
+        .filter(|family| names.iter().any(|name| name == family))
+        .map(|family| SharedString::from(family.to_string()))
+        .or_else(|| auto_mono_font(names))
+}
+
+fn resolve_mono_font(chosen: Option<&str>, cx: &App) -> Option<SharedString> {
+    let names = cx.text_system().all_font_names();
+    if let Some(family) = chosen {
+        if !names.iter().any(|name| name == family) {
+            eprintln!("notesec: font {family:?} is not installed; using the default editor font");
+        }
+    }
+    pick_mono_font(chosen, &names)
 }
 
 /// The tallest an image in a block is drawn, in pixels.
@@ -4966,95 +5059,6 @@ impl NoteSec {
         };
         let label = |text: &'static str| div().text_color(theme.muted).child(text);
 
-        // One button per built-in theme, each with a swatch drawn in that
-        // theme's own colours (background, accent dot, text dot).
-        let current_theme = self.theme_kind();
-        let theme_row = div()
-            .flex()
-            .flex_row()
-            // Wrap: three buttons don't fit the panel's width side by side.
-            .flex_wrap()
-            .gap_2()
-            .children(ThemeKind::ALL.map(|kind| {
-                let preview = Theme::from_kind(kind);
-                let active = current_theme == kind;
-                let id = match kind {
-                    ThemeKind::TokyoNight => "theme-tokyo-night",
-                    ThemeKind::CatppuccinMocha => "theme-catppuccin-mocha",
-                    ThemeKind::Light => "theme-light",
-                };
-                let swatch = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .w(px(30.0))
-                    .h(px(16.0))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(preview.border)
-                    .bg(preview.bg)
-                    .child(div().size(px(6.0)).rounded_full().bg(preview.accent))
-                    .child(div().size(px(6.0)).rounded_full().bg(preview.text));
-                div()
-                    .id(id)
-                    .debug_selector(move || id.to_string())
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if active { theme.accent } else { theme.border })
-                    .cursor_pointer()
-                    .text_color(if active { theme.accent } else { theme.text })
-                    .when(active, |d| d.bg(theme.selected_bg))
-                    .hover(|d| d.bg(theme.selected_bg))
-                    .child(swatch)
-                    .child(kind.label())
-                    .on_click(cx.listener(move |this, _e, _window, cx| this.set_theme(kind, cx)))
-            }));
-
-        // The − / + buttons are dimmed at the limits (clicking them then
-        // does nothing, as `adjust_font_size` clamps).
-        let size = config.font_size;
-        let at_min = size <= crate::config::MIN_FONT_SIZE;
-        let at_max = size >= crate::config::MAX_FONT_SIZE;
-        let size_row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(
-                button("font-size-dec", "−".into(), false)
-                    .when(at_min, |d| d.text_color(theme.muted))
-                    .on_click(cx.listener(|this, _e, _window, cx| this.change_font_size(-1.0, cx))),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "font-size-value".to_string())
-                    .min_w(px(40.0))
-                    .flex()
-                    .justify_center()
-                    .child(format!("{size}")),
-            )
-            .child(
-                button("font-size-inc", "+".into(), false)
-                    .when(at_max, |d| d.text_color(theme.muted))
-                    .on_click(cx.listener(|this, _e, _window, cx| this.change_font_size(1.0, cx))),
-            )
-            .child(
-                button(
-                    "font-size-reset",
-                    "Reset".into(),
-                    size == crate::config::DEFAULT_FONT_SIZE,
-                )
-                .on_click(cx.listener(|this, _e, _window, cx| this.reset_font_size(cx))),
-            );
-
         let backup_on = config.git_backup;
         let backup_row = div()
             .flex()
@@ -5069,90 +5073,10 @@ impl NoteSec {
                     .on_click(cx.listener(|this, _e, _window, cx| this.set_git_backup(true, cx))),
             );
 
-        // Font family: "System default", then every installed family.
-        let row = |id: ElementId, selector: String, text: String, active: bool| {
-            div()
-                .id(id)
-                .debug_selector(move || selector)
-                .flex_shrink_0()
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_color(if active { theme.accent } else { theme.text })
-                .when(active, |d| d.bg(theme.selected_bg))
-                .hover(|d| d.bg(theme.selected_bg))
-                .child(text)
-        };
-        let current = config.font_family.as_deref();
-        let font_rows: Vec<AnyElement> = state
-            .fonts
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let family = name.clone();
-                row(
-                    ElementId::from(("font-family", i)),
-                    format!("font-family-{i}"),
-                    name.clone(),
-                    current == Some(name.as_str()),
-                )
-                .on_click(cx.listener(move |this, _e, _window, cx| {
-                    this.set_font_family(Some(family.clone()), cx)
-                }))
-                .into_any_element()
-            })
-            .collect();
-        let no_fonts = font_rows.is_empty();
-        // A configured family that isn't installed (e.g. a typo in
-        // config.toml) is kept in the file but not used; say so.
-        let missing = current.filter(|f| !state.fonts.iter().any(|name| name == f));
-        let font_list = div()
-            .id("font-family-list")
-            .h(px(FONT_LIST_HEIGHT))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .p_1()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.bg)
-            .child(
-                row(
-                    ElementId::from("font-family-default"),
-                    "font-family-default".to_string(),
-                    "System default".to_string(),
-                    current.is_none(),
-                )
-                .on_click(cx.listener(|this, _e, _window, cx| this.set_font_family(None, cx))),
-            )
-            .children(font_rows)
-            .when(no_fonts, |d| {
-                d.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .text_color(theme.muted)
-                        .child("No installed fonts were found"),
-                )
-            });
-
         let general = div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(label("Theme"))
-            .child(theme_row)
-            .child(label("Font size"))
-            .child(size_row)
-            .child(label("Font family"))
-            .child(font_list)
-            .when_some(missing, |d, family| {
-                d.child(div().text_color(theme.muted).child(format!(
-                    "\u{201c}{family}\u{201d} is not installed; using the system font"
-                )))
-            })
             .child(label("Git auto-backup"))
             .child(backup_row)
             .child(
@@ -5180,6 +5104,16 @@ impl NoteSec {
                 )
                 .on_click(cx.listener(|this, _e, _window, cx| {
                     this.show_settings_section(SettingsSection::General, cx)
+                })),
+            )
+            .child(
+                button(
+                    "settings-tab-appearance",
+                    "Appearance".into(),
+                    section == SettingsSection::Appearance,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::Appearance, cx)
                 })),
             )
             .child(
@@ -5234,6 +5168,7 @@ impl NoteSec {
             );
         let body = match section {
             SettingsSection::General => general.into_any_element(),
+            SettingsSection::Appearance => self.render_appearance_settings(state, cx),
             SettingsSection::Shortcuts => self.render_hotkeys(state, cx),
             SettingsSection::Ai => self.render_ai_settings(state, cx),
             SettingsSection::Clipper => self.render_clipper_settings(cx),
@@ -5810,7 +5745,7 @@ impl NoteSec {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(self.config.font_size * 1.9))
+                            .text_size(px(self.ui_size() * 1.9))
                             .text_color(theme.text)
                             .child("Trash"),
                     )
@@ -6125,7 +6060,7 @@ impl NoteSec {
             .flex_col()
             .child(
                 div()
-                    .text_size(px(self.config.font_size * 1.9))
+                    .text_size(px(self.ui_size() * 1.9))
                     .text_color(theme.text)
                     .child("Agenda"),
             )
@@ -6161,7 +6096,7 @@ impl NoteSec {
         cx: &mut Context<Self>,
     ) -> PageView {
         let theme = self.theme;
-        let font_size = self.config.font_size;
+        let font_size = self.ui_size();
         // Style for `[[wikilinks]]` in display mode: accent colour + underline.
         let link_style = HighlightStyle {
             color: Some(theme.accent.into()),
@@ -6248,6 +6183,8 @@ impl NoteSec {
                 let mut text_layout = None;
                 let content: AnyElement = match &display {
                     None => div()
+                        .text_size(px(self.mono_size()))
+                        .when_some(self.mono_font.clone(), |d, font| d.font_family(font))
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::on_text_mouse_down))
                         .child(BlockText { app: cx.entity() })
                         .into_any_element(),
@@ -6908,7 +6845,7 @@ impl Render for NoteSec {
             self.page_drop = None;
         }
         let theme = self.theme;
-        let font_size = self.config.font_size;
+        let font_size = self.ui_size();
         // Shortcut hints are read from the keymap (`bind_keys`), so they
         // always show the real binding.
         let keymap = cx.key_bindings();
@@ -8930,15 +8867,21 @@ mod tests {
         let base = row_height(cx);
 
         cx.simulate_keystrokes("ctrl-= ctrl-= ctrl-=");
-        view.update(cx, |app, _| assert_eq!(app.config.font_size, 19.0));
-        assert_eq!(saved_config(&dir).font_size, 19.0);
+        view.update(cx, |app, _| {
+            assert_eq!(app.ui_size(), 19.0);
+            assert_eq!(app.mono_size(), 17.0);
+        });
+        assert_eq!(UiState::load(&dir).ui_size, Some(19.0));
         assert!(row_height(cx) > base, "bigger font gives taller rows");
 
         cx.simulate_keystrokes("ctrl--");
-        view.update(cx, |app, _| assert_eq!(app.config.font_size, 18.0));
+        view.update(cx, |app, _| assert_eq!(app.ui_size(), 18.0));
 
         cx.simulate_keystrokes("ctrl-0");
-        view.update(cx, |app, _| assert_eq!(app.config.font_size, 16.0));
+        view.update(cx, |app, _| {
+            assert_eq!(app.ui_size(), 16.0);
+            assert_eq!(app.mono_size(), 14.0);
+        });
         assert_eq!(row_height(cx), base, "reset restores the original layout");
 
         // Limits: it cannot shrink or grow without bound.
@@ -8946,7 +8889,7 @@ mod tests {
             cx.simulate_keystrokes("ctrl--");
         }
         view.update(cx, |app, _| {
-            assert_eq!(app.config.font_size, crate::config::MIN_FONT_SIZE)
+            assert_eq!(app.ui_size(), crate::config::MIN_FONT_SIZE)
         });
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -8977,7 +8920,7 @@ mod tests {
         cx.simulate_keystrokes("ctrl-k");
         cx.simulate_input("increase font");
         cx.simulate_keystrokes("enter");
-        view.update(cx, |app, _| assert_eq!(app.config.font_size, 17.0));
+        view.update(cx, |app, _| assert_eq!(app.ui_size(), 17.0));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -8986,25 +8929,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("notesec-test-badfont-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = Storage::open(dir.clone()).unwrap();
-        let config = Config {
-            font_family: Some("Definitely Not A Font 12345".into()),
-            ..Config::default()
-        };
+        // A font name that isn't installed: kept in state.toml, system font used.
+        let mut state = UiState::load(&dir);
+        state.ui_font = Some("Definitely Not A Font 12345".into());
+        state.save(&dir).unwrap();
+        let config = Config::default();
 
         cx.update(bind_keys);
         let (view, cx) = cx.add_window_view(|window, cx| NoteSec::new(storage, config, window, cx));
         view.update(cx, |app, _| {
             assert_eq!(app.font_family, None, "falls back to the system font");
-            assert!(
-                app.config.font_family.is_some(),
+            assert_eq!(
+                app.state.ui_font.as_deref(),
+                Some("Definitely Not A Font 12345"),
                 "the setting itself is kept"
             );
         });
         // Changing another setting rewrites the file; the user's font name stays.
-        // (A font-size change: themes live in state.toml and don't touch it.)
         cx.simulate_keystrokes("ctrl-=");
         assert_eq!(
-            saved_config(&dir).font_family.as_deref(),
+            UiState::load(&dir).ui_font.as_deref(),
             Some("Definitely Not A Font 12345")
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -9021,7 +8965,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| NoteSec::new(storage, config, window, cx));
         view.update(cx, |app, _| {
             assert_eq!(app.theme.bg, Theme::light().bg);
-            assert_eq!(app.config.font_size, 22.0);
+            assert_eq!(app.ui_size(), 22.0);
         });
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -10939,6 +10883,7 @@ mod tests {
     fn theme_buttons_apply_immediately_and_persist(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup(cx, "settings-theme", "- hi\n");
         click_on(cx, "settings-gear");
+        click_on(cx, "settings-tab-appearance");
 
         click_on(cx, "theme-light");
         view.update(cx, |app, _| {
@@ -10971,34 +10916,38 @@ mod tests {
     fn font_size_buttons_change_persist_and_clamp(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup(cx, "settings-size", "- hi\n");
         click_on(cx, "settings-gear");
+        click_on(cx, "settings-tab-appearance");
         let size = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
-            view.update(cx, |app, _| app.config.font_size)
+            view.update(cx, |app, _| app.ui_size())
         };
-        assert!(has(cx, "font-size-value"));
+        assert!(has(cx, "ui-size-value"));
 
-        click_on(cx, "font-size-inc");
-        click_on(cx, "font-size-inc");
+        click_on(cx, "ui-size-inc");
+        click_on(cx, "ui-size-inc");
         assert_eq!(size(&view, cx), 18.0);
-        assert_eq!(saved_config(&dir).font_size, 18.0);
-        click_on(cx, "font-size-dec");
+        assert_eq!(UiState::load(&dir).ui_size, Some(18.0));
+        click_on(cx, "ui-size-dec");
         assert_eq!(size(&view, cx), 17.0);
-        click_on(cx, "font-size-reset");
+        click_on(cx, "ui-size-reset");
         assert_eq!(size(&view, cx), crate::config::DEFAULT_FONT_SIZE);
-        assert_eq!(
-            saved_config(&dir).font_size,
-            crate::config::DEFAULT_FONT_SIZE
-        );
+        assert_eq!(UiState::load(&dir).ui_size, None);
 
         for _ in 0..10 {
-            click_on(cx, "font-size-dec");
+            click_on(cx, "ui-size-dec");
         }
         assert_eq!(size(&view, cx), crate::config::MIN_FONT_SIZE);
-        assert_eq!(saved_config(&dir).font_size, crate::config::MIN_FONT_SIZE);
+        assert_eq!(
+            UiState::load(&dir).ui_size,
+            Some(crate::config::MIN_FONT_SIZE)
+        );
         for _ in 0..30 {
-            click_on(cx, "font-size-inc");
+            click_on(cx, "ui-size-inc");
         }
         assert_eq!(size(&view, cx), crate::config::MAX_FONT_SIZE);
-        assert_eq!(saved_config(&dir).font_size, crate::config::MAX_FONT_SIZE);
+        assert_eq!(
+            UiState::load(&dir).ui_size,
+            Some(crate::config::MAX_FONT_SIZE)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -11006,39 +10955,30 @@ mod tests {
     fn font_family_choice_persists_and_system_default_removes_it(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup(cx, "settings-family", "- hi\n");
         click_on(cx, "settings-gear");
+        click_on(cx, "settings-tab-appearance");
         // The test platform's text system reports no installed fonts, so the
         // list only has "System default"...
-        assert!(has(cx, "font-family-default"));
-        assert!(!has(cx, "font-family-0"));
+        assert!(has(cx, "ui-font-default"));
+        assert!(!has(cx, "ui-font-0"));
         // ...so give the open panel a known list, as the real text system would.
         view.update(cx, |app, cx| {
             app.settings.as_mut().unwrap().fonts = vec!["Test Sans".into(), "Test Serif".into()];
             cx.notify();
         });
         cx.run_until_parked();
-        assert!(has(cx, "font-family-1") && !has(cx, "font-family-2"));
+        assert!(has(cx, "ui-font-1") && !has(cx, "ui-font-2"));
 
-        click_on(cx, "font-family-1");
+        click_on(cx, "ui-font-1");
         view.update(cx, |app, _| {
-            assert_eq!(app.config.font_family.as_deref(), Some("Test Serif"));
+            assert_eq!(app.state.ui_font.as_deref(), Some("Test Serif"));
             // Not really installed here, so rendering keeps the system font.
             assert_eq!(app.font_family, None);
         });
-        assert_eq!(
-            saved_config(&dir).font_family.as_deref(),
-            Some("Test Serif")
-        );
-        assert!(config_text(&dir).contains("font_family = \"Test Serif\""));
+        assert_eq!(UiState::load(&dir).ui_font.as_deref(), Some("Test Serif"));
 
-        click_on(cx, "font-family-default");
-        view.update(cx, |app, _| assert_eq!(app.config.font_family, None));
-        assert_eq!(saved_config(&dir).font_family, None);
-        assert!(
-            !config_text(&dir)
-                .lines()
-                .any(|l| l.starts_with("font_family")),
-            "only the commented-out hint is left"
-        );
+        click_on(cx, "ui-font-default");
+        view.update(cx, |app, _| assert_eq!(app.state.ui_font, None));
+        assert_eq!(UiState::load(&dir).ui_font, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -11046,13 +10986,12 @@ mod tests {
     fn settings_from_the_panel_load_in_a_fresh_window(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup(cx, "settings-reload", "- hi\n");
         click_on(cx, "settings-gear");
+        click_on(cx, "settings-tab-appearance");
         click_on(cx, "theme-light");
         for _ in 0..4 {
-            click_on(cx, "font-size-inc");
+            click_on(cx, "ui-size-inc");
         }
-        view.update(cx, |app, cx| {
-            app.set_font_family(Some("Test Serif".into()), cx)
-        });
+        view.update(cx, |app, cx| app.set_ui_font(Some("Test Serif".into()), cx));
 
         let storage = Storage::open(dir.clone()).unwrap();
         let config = Config::load(&dir);
@@ -11062,8 +11001,8 @@ mod tests {
         view2.update(cx2, |app, _| {
             assert_eq!(app.theme_kind(), ThemeKind::Light);
             assert_eq!(app.theme.bg, Theme::light().bg);
-            assert_eq!(app.config.font_size, 20.0);
-            assert_eq!(app.config.font_family.as_deref(), Some("Test Serif"));
+            assert_eq!(app.ui_size(), 20.0);
+            assert_eq!(app.state.ui_font.as_deref(), Some("Test Serif"));
         });
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -11859,6 +11798,7 @@ mod tests {
     fn settings_lists_the_three_themes_and_marks_the_current_one(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup(cx, "theme-picker", "- hi\n");
         click_on(cx, "settings-gear");
+        click_on(cx, "settings-tab-appearance");
         for id in ["theme-tokyo-night", "theme-catppuccin-mocha", "theme-light"] {
             assert!(has(cx, id), "Settings has a {id} button");
         }
@@ -11891,6 +11831,7 @@ mod tests {
     fn a_chosen_theme_survives_a_restart(cx: &mut TestAppContext) {
         let (_view, cx, dir) = setup(cx, "theme-restart", "- hi\n");
         click_on(cx, "settings-gear");
+        click_on(cx, "settings-tab-appearance");
         click_on(cx, "theme-catppuccin-mocha");
 
         let (view2, cx2) = restart(cx, &dir);
@@ -11938,14 +11879,10 @@ mod tests {
             "migrated"
         );
 
-        // The next config save (any setting) drops the old key; nothing is lost.
+        // The old keys stay in config.toml until a config save drops them;
+        // the values themselves carried over to state.toml and aren't lost.
         cx.simulate_keystrokes("ctrl-=");
-        assert!(
-            !config_text(&dir).contains("theme"),
-            "{}",
-            config_text(&dir)
-        );
-        assert!(config_text(&dir).contains("font_size = 19"));
+        assert_eq!(UiState::load(&dir).ui_size, Some(19.0));
         let (view2, cx2) = restart(cx, &dir);
         view2.update(cx2, |app, _| {
             assert_eq!(app.theme_kind(), ThemeKind::CatppuccinMocha)
@@ -14613,11 +14550,12 @@ mod tests {
 
     #[gpui::test]
     fn at_the_largest_font_the_settings_panel_scrolls_inside_the_window(cx: &mut TestAppContext) {
-        let config = Config {
-            font_size: crate::config::MAX_FONT_SIZE,
-            ..Config::default()
-        };
-        let (view, cx, dir) = setup_with_state(cx, "hotkey-big-font", "", config);
+        let (view, cx, dir) = setup_with_state(
+            cx,
+            "hotkey-big-font",
+            &format!("ui_size = {}\n", crate::config::MAX_FONT_SIZE),
+            Config::default(),
+        );
         cx.simulate_resize(size(px(1100.), px(700.)));
         cx.simulate_keystrokes("ctrl-,");
         let window = cx.debug_bounds("settings-backdrop").unwrap();

@@ -349,7 +349,7 @@ impl NoteSec {
                 .border_1()
                 .border_color(if accent { theme.accent } else { theme.border })
                 .bg(theme.sidebar_bg)
-                .text_size(px(self.config.font_size * 0.8))
+                .text_size(px(self.ui_size() * 0.8))
                 .text_color(if accent { theme.accent } else { theme.muted })
                 .when_some(self.mono_font.clone(), |d, font| d.font_family(font))
                 .child(label)
