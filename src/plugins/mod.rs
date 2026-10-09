@@ -4,6 +4,7 @@
 //! talk to the app in small TOML documents (`protocol.rs`) whose actions
 //! the app checks before applying. No GPUI here.
 
+pub mod marketplace;
 pub mod protocol;
 pub mod sandbox;
 #[cfg(test)]

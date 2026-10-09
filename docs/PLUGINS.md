@@ -146,6 +146,13 @@ never as HTML or markup. Results are cached per (binary, args, block text).
 Plugins never run during HTML export, publishing or vault export. A macro such
 as `{{word-count}}` stays as its text there.
 
+## Community marketplace
+
+Reviewed plugins are listed in **Settings > Plugins > Browse** and install
+with one click (download → sha256 check against the index → enable; a
+mismatch is refused). See `docs/MARKETPLACE.md` for the registry, how to
+submit a plugin, and what review checks.
+
 ## Versioning
 
 `api_version` is this ABI's version (1). NoteSec refuses plugins with another

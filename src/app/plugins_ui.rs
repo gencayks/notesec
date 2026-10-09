@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::{Mode, Nav, NoteSec, Status};
 use crate::editor::EditorState;
+use crate::plugins::marketplace::{self, RegistryEntry};
 use crate::plugins::protocol::{self, Action, Line};
 use crate::plugins::sandbox::{self, Compiled, COMMAND_FUEL, RENDER_FUEL};
 use crate::plugins::{self, Plugin, MAX_FAILURES};
@@ -38,6 +39,14 @@ pub(super) struct PluginsState {
     /// Plugins to turn off (found failing while drawing).
     pending_disable: RefCell<Vec<(String, String)>>,
     task: Option<Task<()>>,
+    /// Marketplace (Browse tab): true shows the registry, false the
+    /// installed list.
+    browse: bool,
+    registry: Vec<RegistryEntry>,
+    registry_error: Option<String>,
+    fetching: bool,
+    installing: Option<String>,
+    browse_task: Option<Task<()>>,
 }
 
 /// What a command ran against, to check before applying its actions.
@@ -47,12 +56,20 @@ struct CommandContext {
 }
 
 impl NoteSec {
-    /// (Re)read `plugins/`. Called at startup and from Settings.
+    /// (Re)read `plugins/`. Called at startup and from Settings. Keeps the
+    /// Browse tab (registry listing) across reloads.
     pub(super) fn reload_plugins(&mut self) {
         let (found, errors) = plugins::discover(self.storage.root());
+        let keep = std::mem::take(&mut self.plugins);
         self.plugins = PluginsState {
             found,
             errors,
+            browse: keep.browse,
+            registry: keep.registry,
+            registry_error: keep.registry_error,
+            fetching: keep.fetching,
+            installing: keep.installing,
+            browse_task: keep.browse_task,
             ..Default::default()
         };
     }
@@ -76,6 +93,78 @@ impl NoteSec {
         self.plugins.render_cache.borrow_mut().clear();
         self.save_config();
         cx.notify();
+    }
+
+    /// Fetch the marketplace index on the background executor (docs/MARKETPLACE.md).
+    pub(super) fn fetch_registry(&mut self, cx: &mut Context<Self>) {
+        if self.plugins.fetching {
+            return;
+        }
+        self.plugins.fetching = true;
+        self.plugins.registry_error = None;
+        cx.notify();
+        let job = cx.background_spawn(async move {
+            marketplace::fetch_index(marketplace::DEFAULT_REGISTRY_URL)
+        });
+        self.plugins.browse_task = Some(cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |this, cx| {
+                this.plugins.fetching = false;
+                this.plugins.browse_task = None;
+                match result {
+                    Ok(entries) => this.plugins.registry = entries,
+                    Err(err) => this.plugins.registry_error = Some(err),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// One-click install: download the WASM, verify its sha256 against the
+    /// index, write it, then reload and enable. A mismatch is refused loudly
+    /// and installs nothing.
+    pub(super) fn install_registry_plugin(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.plugins.fetching || self.plugins.installing.is_some() {
+            return;
+        }
+        let Some(entry) = self.plugins.registry.iter().find(|e| e.id == id).cloned() else {
+            return;
+        };
+        self.plugins.installing = Some(id);
+        self.plugins.registry_error = None;
+        cx.notify();
+        let root = self.storage.root().to_path_buf();
+        let job = cx.background_spawn(async move {
+            let bytes = marketplace::download_wasm(&entry.download_url)?;
+            marketplace::install(&root, &entry, &bytes)?;
+            Ok::<_, String>(entry.id.clone())
+        });
+        self.plugins.browse_task = Some(cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |this, cx| {
+                this.plugins.installing = None;
+                this.plugins.browse_task = None;
+                match result {
+                    Ok(installed) => {
+                        this.reload_plugins();
+                        this.set_plugin_enabled(&installed, true, cx);
+                        let text = format!("Plugin {installed} installed, verified and enabled");
+                        this.show_status(Status { text, error: false }, cx);
+                    }
+                    Err(err) => {
+                        this.plugins.registry_error = Some(err.clone());
+                        this.show_status(
+                            Status {
+                                text: err,
+                                error: true,
+                            },
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        }));
     }
 
     /// The palette's plugin entries: (plugin, command) indices and labels.
@@ -340,6 +429,46 @@ impl NoteSec {
 
     pub(super) fn render_plugin_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
+        let browse = self.plugins.browse;
+        let tab = |id: &'static str, label: &str, active: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(if active { theme.accent } else { theme.border })
+                .when(active, |d| d.bg(theme.selected_bg))
+                .cursor_pointer()
+                .child(label.to_string())
+        };
+        let tabs = div().flex().flex_row().gap_2().child(
+            tab("plugins-tab-installed", "Installed", !browse).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.plugins.browse = false;
+                    cx.notify();
+                },
+            )),
+        );
+        let tabs = tabs.child(
+            tab("plugins-tab-browse", "Browse", browse).on_click(cx.listener(|this, _, _, cx| {
+                this.plugins.browse = true;
+                if this.plugins.registry.is_empty() && this.plugins.registry_error.is_none() {
+                    this.fetch_registry(cx);
+                }
+                cx.notify();
+            })),
+        );
+        if browse {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(tabs)
+                .child(self.render_registry_browse(cx))
+                .into_any_element();
+        }
         let rows = self.plugins.found.iter().map(|p| {
             let on = self.plugin_enabled(p);
             let changed = !on && self.config.plugins.contains_key(&p.id);
@@ -394,6 +523,7 @@ impl NoteSec {
             .flex()
             .flex_col()
             .gap_2()
+            .child(tabs)
             .child(div().text_color(theme.muted).child(
                 "Plugins live in plugins/<id>/ in your notes folder and run in a sandbox: no files, \
                  network or other pages, only the block you run them on. Enabling one is still a \
@@ -421,6 +551,152 @@ impl NoteSec {
                         cx.notify();
                     })),
             )
+            .into_any_element()
+    }
+
+    /// Settings > Plugins > Browse: the community registry (docs/MARKETPLACE.md).
+    fn render_registry_browse(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let mut items: Vec<AnyElement> = Vec::new();
+        items.push(
+            div()
+                .text_color(theme.muted)
+                .child(
+                    "Community plugins from the public notesec-plugins registry. Every listing \
+                     passed review (\u{2713} Verified). Installing downloads the plugin, checks its \
+                     sha256 against the index, and enables it \u{2014} a mismatch is refused loudly \
+                     and installs nothing.",
+                )
+                .into_any_element(),
+        );
+        items.push(
+            div()
+                .text_color(theme.muted)
+                .child(marketplace::DEFAULT_REGISTRY_URL.to_string())
+                .into_any_element(),
+        );
+        let fetching = self.plugins.fetching;
+        items.push(
+            div()
+                .id("plugins-browse-refresh")
+                .debug_selector(|| "plugins-browse-refresh".to_string())
+                .px_3()
+                .py_1()
+                .w(px(140.0))
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .cursor_pointer()
+                .child(if fetching {
+                    "Fetching\u{2026}"
+                } else {
+                    "Refresh"
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.fetch_registry(cx)))
+                .into_any_element(),
+        );
+        if let Some(err) = &self.plugins.registry_error {
+            items.push(
+                div()
+                    .text_color(theme.danger)
+                    .child(err.clone())
+                    .into_any_element(),
+            );
+        }
+        if self.plugins.registry.is_empty() && !fetching {
+            items.push(
+                div()
+                    .text_color(theme.muted)
+                    .child("No plugins listed yet.")
+                    .into_any_element(),
+            );
+        }
+        for e in &self.plugins.registry {
+            let installing = self.plugins.installing.as_deref() == Some(e.id.as_str());
+            let installed = self.plugins.found.iter().find(|p| p.id == e.id);
+            let action: AnyElement = if installing {
+                div()
+                    .text_color(theme.muted)
+                    .child("Installing\u{2026}")
+                    .into_any_element()
+            } else {
+                match installed {
+                    Some(p) if p.version == e.version => div()
+                        .text_color(theme.muted)
+                        .child("Installed")
+                        .into_any_element(),
+                    _ => {
+                        let label = if installed.is_some() {
+                            "Update"
+                        } else {
+                            "Install"
+                        };
+                        let id = e.id.clone();
+                        let selector = format!("plugin-install-{}", e.id);
+                        div()
+                            .id(gpui::SharedString::from(format!("plugin-install-{}", e.id)))
+                            .debug_selector(move || selector.clone())
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme.accent)
+                            .bg(theme.selected_bg)
+                            .cursor_pointer()
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.install_registry_plugin(id.clone(), cx);
+                            }))
+                            .into_any_element()
+                    }
+                }
+            };
+            items.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .gap_3()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(format!("{} {}", e.name, e.version)),
+                                    )
+                                    .child(
+                                        div().text_color(theme.accent).child("\u{2713} Verified"),
+                                    ),
+                            )
+                            .when(!e.description.is_empty(), |d| {
+                                d.child(div().text_color(theme.muted).child(e.description.clone()))
+                            })
+                            .child(
+                                div()
+                                    .text_color(theme.muted)
+                                    .child(format!("by {}", e.author)),
+                            ),
+                    )
+                    .child(action)
+                    .into_any_element(),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(items)
             .into_any_element()
     }
 

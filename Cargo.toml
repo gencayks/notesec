@@ -27,6 +27,8 @@ ureq = { version = "3", features = ["json"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
+# SHA-256 for verifying marketplace plugin downloads against the registry index.
+sha2 = "0.10"
 wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "portable-dispatch"] }
 
 # Zed's workspace patches a few crates; patches only apply at the *root* manifest,
