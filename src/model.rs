@@ -266,6 +266,101 @@ pub fn tag_counts(pages: &[Page]) -> Vec<(String, usize)> {
     out
 }
 
+/// Kanban board columns (roadmap v0.3.0 feature 4, docs/KANBAN.md): a
+/// top-level block's column is its first `#todo`, `#doing` or `#done` tag
+/// (case-insensitive); blocks with none are Unsorted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KanbanStatus {
+    Unsorted,
+    Todo,
+    Doing,
+    Done,
+}
+
+impl KanbanStatus {
+    /// Every column, left to right.
+    pub const ALL: [KanbanStatus; 4] = [
+        KanbanStatus::Unsorted,
+        KanbanStatus::Todo,
+        KanbanStatus::Doing,
+        KanbanStatus::Done,
+    ];
+
+    /// The tag that puts a block in this column (`None`: no tag).
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            KanbanStatus::Unsorted => None,
+            KanbanStatus::Todo => Some("todo"),
+            KanbanStatus::Doing => Some("doing"),
+            KanbanStatus::Done => Some("done"),
+        }
+    }
+
+    /// The column header.
+    pub fn title(self) -> &'static str {
+        match self {
+            KanbanStatus::Unsorted => "Unsorted",
+            KanbanStatus::Todo => "To do",
+            KanbanStatus::Doing => "Doing",
+            KanbanStatus::Done => "Done",
+        }
+    }
+
+    fn from_tag(name: &str) -> Option<KanbanStatus> {
+        match name.to_ascii_lowercase().as_str() {
+            "todo" => Some(KanbanStatus::Todo),
+            "doing" => Some(KanbanStatus::Doing),
+            "done" => Some(KanbanStatus::Done),
+            _ => None,
+        }
+    }
+}
+
+/// The column of `content`: its first `#todo`/`#doing`/`#done` tag.
+pub fn kanban_status(content: &str) -> KanbanStatus {
+    parse_references(content)
+        .into_iter()
+        .filter(|r| r.is_tag)
+        .find_map(|r| KanbanStatus::from_tag(&r.target))
+        .unwrap_or(KanbanStatus::Unsorted)
+}
+
+/// `content` moved to `status`: every `#todo`/`#doing`/`#done` tag is cut
+/// out and the new one appended at the end (nothing appended for
+/// Unsorted). Lines left empty by the cut are dropped; the rest is
+/// untouched, so the markdown stays the source of truth.
+pub fn set_kanban_status(content: &str, status: KanbanStatus) -> String {
+    let tags: Vec<Reference> = parse_references(content)
+        .into_iter()
+        .filter(|r| r.is_tag && KanbanStatus::from_tag(&r.target).is_some())
+        .collect();
+    let mut out = content.to_string();
+    for tag in tags.iter().rev() {
+        let mut range = tag.range.clone();
+        // Swallow one adjacent space so no double gap is left behind.
+        if out[..range.start].ends_with(' ') {
+            range.start -= 1;
+        } else if out[range.end..].starts_with(' ') {
+            range.end += 1;
+        }
+        out.replace_range(range, "");
+    }
+    let mut lines: Vec<&str> = out.split('\n').map(str::trim_end).collect();
+    if !tags.is_empty() {
+        lines.retain(|line| !line.trim().is_empty());
+    }
+    let mut out = lines.join("\n");
+    if let Some(tag) = status.tag() {
+        if out.trim().is_empty() {
+            out = format!("#{tag}");
+        } else {
+            out = out.trim_end().to_string();
+            out.push_str(&format!(" #{tag}"));
+        }
+    }
+    out
+}
+
 /// All blocks on one page that link to the page being viewed.
 #[derive(Debug, PartialEq)]
 pub struct BacklinkGroup {
@@ -1498,6 +1593,63 @@ mod tests {
         );
         // Malformed multi-word tags are ignored.
         assert!(refs("#[[unclosed and #[[]]").is_empty());
+    }
+
+    #[test]
+    fn kanban_columns_come_from_status_tags() {
+        use super::{kanban_status, KanbanStatus::*};
+        assert_eq!(kanban_status("Write tests #todo"), Todo);
+        assert_eq!(kanban_status("Write tests #DOING"), Doing);
+        assert_eq!(kanban_status("#done at last"), Done);
+        assert_eq!(kanban_status("no status here #idea"), Unsorted);
+        assert_eq!(kanban_status(""), Unsorted);
+        // The first status tag wins; other tags are ignored.
+        assert_eq!(kanban_status("#done then #todo"), Done);
+        assert_eq!(kanban_status("#idea #todo"), Todo);
+        // Not tags, not columns: code fences, URLs, headings.
+        assert_eq!(kanban_status("```\n#todo\n```"), Unsorted);
+        assert_eq!(kanban_status("see page.html#todo"), Unsorted);
+        assert_eq!(
+            KanbanStatus::ALL.map(KanbanStatus::title),
+            ["Unsorted", "To do", "Doing", "Done"]
+        );
+    }
+
+    #[test]
+    fn moving_a_card_rewrites_only_its_status_tags() {
+        use super::{set_kanban_status, KanbanStatus::*};
+        assert_eq!(
+            set_kanban_status("Write tests #todo", Doing),
+            "Write tests #doing"
+        );
+        assert_eq!(
+            set_kanban_status("Write tests #TODO", Doing),
+            "Write tests #doing"
+        );
+        assert_eq!(
+            set_kanban_status("#todo Write tests", Done),
+            "Write tests #done"
+        );
+        assert_eq!(
+            set_kanban_status("Write tests #todo #idea", Doing),
+            "Write tests #idea #doing"
+        );
+        assert_eq!(set_kanban_status("a #todo b #doing c", Done), "a b c #done");
+        assert_eq!(set_kanban_status("Write tests", Todo), "Write tests #todo");
+        assert_eq!(set_kanban_status("", Done), "#done");
+        assert_eq!(
+            set_kanban_status("Write tests #todo", Unsorted),
+            "Write tests"
+        );
+        // Same column is a no-op; other tags and prose are untouched.
+        assert_eq!(
+            set_kanban_status("Write tests #todo", Todo),
+            "Write tests #todo"
+        );
+        assert_eq!(
+            set_kanban_status("Fix [[#todo page]] #doing", Todo),
+            "Fix [[#todo page]] #todo"
+        );
     }
 
     #[test]

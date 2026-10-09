@@ -60,6 +60,11 @@ pub struct UiState {
     /// the listed ones, alphabetically; entries without a page are ignored
     /// (see `app::sort_pages`).
     pub page_order: Vec<String>,
+    /// Titles of pages showing the kanban board (roadmap v0.3.0 feature 4,
+    /// docs/KANBAN.md) instead of the outline. Read leniently: entries
+    /// without a page are ignored, and a renamed page follows via `rename`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub kanban: Vec<String>,
     /// Custom keys: command name -> keystroke (`""`: unbound). Read
     /// leniently by `hotkeys::effective_shortcuts`: unknown names and bad
     /// keys are ignored there (and kept here, so nothing is lost).
@@ -363,7 +368,12 @@ impl UiState {
     /// Returns whether anything changed.
     pub fn rename(&mut self, old: &str, new: &str) -> bool {
         let mut changed = false;
-        for list in [&mut self.favorites, &mut self.recent, &mut self.page_order] {
+        for list in [
+            &mut self.favorites,
+            &mut self.recent,
+            &mut self.page_order,
+            &mut self.kanban,
+        ] {
             if let Some(i) = position(list, old) {
                 list[i] = new.to_string();
                 changed = true;
@@ -378,7 +388,12 @@ impl UiState {
     /// changed.
     pub fn forget(&mut self, title: &str) -> bool {
         let mut changed = false;
-        for list in [&mut self.favorites, &mut self.recent, &mut self.page_order] {
+        for list in [
+            &mut self.favorites,
+            &mut self.recent,
+            &mut self.page_order,
+            &mut self.kanban,
+        ] {
             if let Some(i) = position(list, title) {
                 list.remove(i);
                 changed = true;
@@ -444,6 +459,7 @@ mod tests {
             favorites: titles(&["Projects", "Reading list"]),
             recent: titles(&["2026-10-08", "Projects"]),
             page_order: titles(&["Reading list", "Projects"]),
+            kanban: titles(&["Projects"]),
             shortcuts: [
                 ("SplitRight", "ctrl-alt-s"),
                 ("Quit", ""),
@@ -765,6 +781,7 @@ mod tests {
             favorites: titles(&["Old", "B"]),
             recent: titles(&["B", "old", "New"]),
             page_order: titles(&["C", "Old", "B"]),
+            kanban: titles(&["Old"]),
             ..UiState::default()
         };
         assert!(state.rename("OLD", "New"));
@@ -773,11 +790,13 @@ mod tests {
         assert_eq!(state.recent, titles(&["B", "New"]));
         // Renamed in place: the page keeps its position.
         assert_eq!(state.page_order, titles(&["C", "New", "B"]));
+        assert_eq!(state.kanban, titles(&["New"]));
         assert!(!state.rename("Missing", "X"));
         assert!(state.forget("new"));
         assert_eq!(state.favorites, titles(&["B"]));
         assert_eq!(state.recent, titles(&["B"]));
         assert_eq!(state.page_order, titles(&["C", "B"]));
+        assert_eq!(state.kanban, Vec::<String>::new());
         assert!(!state.forget("new"));
     }
 

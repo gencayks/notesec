@@ -17,7 +17,7 @@ use crate::graph_view::{GraphEvent, GraphView};
 use crate::hotkeys::{self, effective_shortcuts, KeyChoice, KeyOwner, Overrides};
 use crate::model::{
     backlinks, cycle_task, find_block, parse_block_refs, parse_query, parse_references,
-    resolve_page, tag_counts, tag_query, BlockKind, Page, TaskState,
+    resolve_page, tag_counts, tag_query, BlockKind, KanbanStatus, Page, TaskState,
 };
 use crate::search::{
     search_blocks, search_link_pages, search_templates, search_text, search_with, snippet, Hit,
@@ -57,6 +57,7 @@ mod capture_ui;
 mod clipper_ui;
 mod embed_ui;
 mod import_ui;
+mod kanban_ui;
 mod plugins_ui;
 mod publish_ui;
 mod vault_ui;
@@ -105,6 +106,7 @@ actions!(
         Redo,
         ToggleTheme,
         ToggleGraph,
+        ToggleKanban,
         IncreaseFont,
         DecreaseFont,
         ResetFont,
@@ -763,6 +765,8 @@ pub struct NoteSec {
     /// While a block is being dragged by its bullet: where it would land.
     /// Only meaningful while GPUI has an active drag.
     block_drop: Option<DropGap>,
+    /// The kanban column a dragged card is over (a wash marks it).
+    kanban_over: Option<KanbanStatus>,
     undo_stack: Vec<HistoryState>,
     redo_stack: Vec<HistoryState>,
     text_history_active: bool,
@@ -973,6 +977,7 @@ impl NoteSec {
             selecting: false,
             collapsed: HashSet::new(),
             block_drop: None,
+            kanban_over: None,
             ref_selected: (0..0, 0),
             ref_dismissed: None,
             undo_stack: Vec::new(),
@@ -6924,12 +6929,25 @@ impl NoteSec {
             .child(
                 div()
                     .mb_4()
-                    .text_size(px(font_size * 1.9))
-                    .text_color(theme.text)
-                    .child(page.title.clone()),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(font_size * 1.9))
+                            .text_color(theme.text)
+                            .child(page.title.clone()),
+                    )
+                    .child(self.render_view_toggle(&page.title, prefix, cx)),
             )
             .children(self.render_tag_suggestions(page_ix, focused, cx))
-            .children(rows)
+            .when(self.is_kanban(&page.title), |d| {
+                d.child(self.render_kanban(page_ix, focused, cx))
+            })
+            .when(!self.is_kanban(&page.title), |d| d.children(rows))
             // The drop line for "after the last block".
             .when(block_drop == Some(DropGap::End), |d| {
                 d.child(
@@ -8280,6 +8298,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_toggle_theme))
             .on_action(cx.listener(Self::on_toggle_graph))
+            .on_action(cx.listener(Self::on_toggle_kanban))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))

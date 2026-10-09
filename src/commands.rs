@@ -152,6 +152,7 @@ commands! {
     ToggleGraphJournals => "Toggle journals in graph", ["daily notes", "hide journals"], Nothing;
     // View
     ToggleTheme => "Switch theme", ["toggle dark/light theme", "dark mode", "light mode"], Nothing;
+    ToggleKanban => "Kanban view", ["kanban", "board", "columns", "todo", "doing", "done"], Page;
     IncreaseFont => "Increase font size", ["zoom in", "bigger text"], Nothing;
     DecreaseFont => "Decrease font size", ["zoom out", "smaller text"], Nothing;
     ResetFont => "Reset font size", ["default font size"], Nothing;
