@@ -8,6 +8,12 @@
 //! vim_mode = false        # vim keybindings in the block editor (decision 48)
 //! web_clipper = false     # the local web clipper endpoint (decision 51)
 //! clipper_port = 27183    # its port on 127.0.0.1 (1024-65535)
+//! # Voice notes (decision 52, docs/VOICE_NOTES.md):
+//! voice_recorder = []      # e.g. ["arecord", "-D", "hw:1", "-f", "S16_LE", "-r", "16000", "-c", "1", "{file}"]
+//! whisper_binary = ""      # whisper.cpp's whisper-cli; empty: no transcription
+//! whisper_model = ""       # a ggml model file, e.g. ggml-base.bin
+//! whisper_language = "auto"
+//! voice_auto_transcribe = false
 //! ```
 //!
 //! The file is read once at startup. The app rewrites it when you change the
@@ -61,6 +67,17 @@ pub struct Config {
     pub web_clipper: bool,
     /// Its port. Out of 1024-65535 reads as the default.
     pub clipper_port: u16,
+    /// A recorder command (program, then arguments; `{file}` for the WAV
+    /// to write) instead of the detected one. Empty: detect.
+    pub voice_recorder: Vec<String>,
+    /// whisper.cpp's program, for local transcription. Empty: none.
+    pub whisper_binary: String,
+    /// Its model file.
+    pub whisper_model: String,
+    /// `auto` or a language code (`en`, `de`…).
+    pub whisper_language: String,
+    /// Transcribe each new voice note when it's recorded.
+    pub voice_auto_transcribe: bool,
 }
 
 impl Default for Config {
@@ -73,6 +90,11 @@ impl Default for Config {
             vim_mode: false,
             web_clipper: false,
             clipper_port: crate::clipper::DEFAULT_PORT,
+            voice_recorder: Vec::new(),
+            whisper_binary: String::new(),
+            whisper_model: String::new(),
+            whisper_language: "auto".into(),
+            voice_auto_transcribe: false,
         }
     }
 }
@@ -112,6 +134,7 @@ impl Config {
         if self.clipper_port < 1024 {
             self.clipper_port = crate::clipper::DEFAULT_PORT;
         }
+        self.whisper_language = crate::voice::whisper::language(&self.whisper_language);
         // An empty family name means "unset".
         if self
             .font_family
@@ -189,6 +212,11 @@ mod tests {
             vim_mode: true,
             web_clipper: true,
             clipper_port: 31337,
+            voice_recorder: vec!["rec".into(), "{file}".into()],
+            whisper_binary: "/usr/bin/whisper-cli".into(),
+            whisper_model: "/m/ggml-base.bin".into(),
+            whisper_language: "de".into(),
+            voice_auto_transcribe: true,
         };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), config);

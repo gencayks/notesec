@@ -120,6 +120,10 @@ commands! {
     ImportLogseq => "Import from Logseq\u{2026}", ["import", "logseq", "graph", "migrate"], Nothing;
     ImportNotion => "Import from Notion\u{2026}", ["import", "notion", "export", "csv", "migrate"], Nothing;
     PublishPageWithLinks => "Publish page with linked pages", ["publish", "share", "website", "static site", "links"], Page;
+    RecordVoiceNote => "Record voice note", ["voice", "audio", "microphone", "mic", "dictate", "memo"], Nothing;
+    StopRecording => "Stop recording", ["voice", "audio", "save", "finish"], Nothing;
+    CancelRecording => "Cancel recording", ["voice", "audio", "discard"], Nothing;
+    TranscribeVoiceNotes => "Transcribe voice notes on page", ["whisper", "speech", "text", "voice"], Page;
     ToggleFavorite => "Toggle favorite", ["star", "unstar", "bookmark", "favourite"], Page;
     SortPagesAz => "Sort pages A-Z", ["alphabetical", "order"], Nothing;
     // Editing

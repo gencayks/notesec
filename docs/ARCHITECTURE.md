@@ -29,6 +29,8 @@ import/        — import Obsidian, Logseq and Notion exports: walk, convert, pl
 app/import_ui.rs — the Import commands, folder picker, name-clash dialog (a submodule of app.rs)
 clipper/       — web clipper: localhost HTTP listener, request checks, HTML → outline, token (no GPUI)
 app/clipper_ui.rs — the clipper's Settings section, saving clips, the Clipped status (a submodule of app.rs)
+voice/         — voice notes: find and run a recorder, WAV check/repair, whisper.cpp transcription (no GPUI)
+app/voice_ui.rs — recording pill, note and transcript blocks, Play/Transcribe, Settings > Voice notes (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1715,6 +1717,92 @@ that mutate, and data races are essentially impossible.
     in time" 503 may follow a save that did happen; the port can only be
     typed in `config.toml` beyond the − / + buttons (Settings has no text
     field for it).
+
+52. **Voice notes: the microphone into the page, transcribed locally.**
+    "Record voice note" (palette, sidebar row; a toggle) starts a
+    recorder; a pill at the top right shows "● REC 0:12 / 30:00" with
+    Stop and Cancel ("Stop recording" / "Cancel recording" are in the
+    palette only while recording). Stopping adds
+    `![voice note](../assets/voice-2026-10-09-141503.wav)` (the image
+    syntax and relative path of pasted images; `-2`… if the name is
+    taken) below the block that was being edited (after its subtree),
+    else at the end of the page on screen, else today's journal; the
+    status says "Voice note saved (0:12) on “Page”". Setup, privacy and
+    sizes for users: `docs/VOICE_NOTES.md`. *Split:* `voice/` has no
+    GPUI: `mod.rs` (recorder detection and argument lists, WAV
+    check/repair, names), `run.rs` (spawning, SIGINT, timeouts),
+    `whisper.rs` (transcription, the Settings test);
+    `app/voice_ui.rs` is the app side. *No new crate:* audio capture is
+    a recorder program, found on `PATH` in this order: `pw-record`
+    (PipeWire), `parecord` (PulseAudio), `arecord` (ALSA), `ffmpeg`
+    (`-f pulse -i default`), all asked for 16 kHz mono 16-bit WAV (what
+    whisper.cpp wants, ~1.9 MB a minute); `voice_recorder` in
+    `config.toml` (program then arguments, `{file}` for the output)
+    replaces the search. None found: an error status naming the packages.
+    Every program runs with `Command` and an argument list, never a
+    shell, so no file name can become a command. *Recording:* outside
+    the vault, so a git backup that runs meanwhile can't commit half a
+    file, and in a private folder (`voice/private.rs`): a fresh
+    `notesec-voice-<random>` made with mode 0700 (`DirBuilderExt`; mkdir
+    fails on an existing name or planted symlink) under
+    `$XDG_RUNTIME_DIR/notesec-voice` (per user, tmpfs; checked to be a
+    real folder, ours, closed to others) or else the system temp folder.
+    The shared temp folder alone wouldn't do: the recorder's umask
+    (often 0644) would let other local users read the recording.
+    whisper's output and program logs use such folders too (a transcript
+    is as private). The folder goes, contents and all, when the
+    recording is done or cancelled. The finished file is moved into
+    `assets/` (`voice::store`): a rename on one file system, else (tmpfs
+    to home is EXDEV) a copy into `.voice-….wav.tmp` (a name backup
+    ignores), fsync, rename, then the source removed. Either way it gets
+    the mode a new file in `assets/` gets, like a pasted image (found by
+    creating a probe file: no umask call without libc), not the private
+    one.
+    *Stopping:* SIGINT through the `kill` program (`kill -INT <pid>`,
+    as Ctrl+C would: recorders then write their header's sizes), no
+    `libc`/`unsafe`; after 5 s `Child::kill`. That and checking the file
+    run off the UI thread. A 1 s timer moves the clock, stops at 30
+    minutes (`MAX_LENGTH`) and notices a recorder that quit by itself
+    (its output's last lines are shown). *Repair:* `normalize_wav`, a
+    pure function, rewrites the file as RIFF/WAVE with just `fmt ` and
+    `data`: sizes left at 0 or 0xFFFFFFFF (a recorder killed early) or
+    past the end become "to the end of the file", a half sample frame is
+    cut, metadata chunks (ffmpeg's `LIST`) are dropped; not RIFF, not
+    PCM, or no audio is an error and nothing is saved. *Cancel* kills
+    the recorder and deletes the file. Closing the app while recording
+    finishes the file into `assets/` without a block (documented).
+    *Transcription:* only with a whisper.cpp program set (Settings >
+    Voice notes, Choose… through the system file picker, or
+    `whisper_binary` / `whisper_model` / `whisper_language` in
+    `config.toml`; Settings shows each path as missing if it is, and
+    Test runs `--help` and checks the model's ggml/GGUF magic). Run as
+    `-m <model> -f <wav> -l <auto|xx> -nt -otxt -of <tmp>` off the UI
+    thread, one at a time (a queue), with a timeout of 2 minutes plus
+    6× the recording; `<tmp>.txt` is read (stdout if absent),
+    timestamps and `[BLANK_AUDIO]`-style markers removed, whitespace
+    collapsed, and the text defanged like clipped text (decision 51)
+    so speech can't make links, properties or bullets. It goes in as a
+    child of the note, `**Transcript:** …`; a note with one isn't done
+    twice. "Transcribe new voice notes automatically" (off by default)
+    does it after each recording; the chip's Transcribe button and
+    "Transcribe voice notes on page" do it on request. Errors (no
+    program, missing model, exit code with the end of stderr, timeout)
+    are statuses. Paths are config, not secrets: they're in
+    `config.toml`, not `state.toml`. NoteSec itself never touches the
+    network; what a program the user chose does is up to it. *Reading
+    view:* an audio target is a chip (🎙 name, ▶ Play, Transcribe), not
+    an image; Play opens the file with the system's player
+    (`open_with_system`, recorded in tests). *Export and publish* leave
+    audio out ("Voice note not included: name"): a page shouldn't grow
+    by megabytes, and publishing someone's voice should take a
+    deliberate step; the file is never copied. *Backup:* WAVs in
+    `assets/` are committed like images (they're notes). *Keys:* the
+    pill isn't a dialog, so typing, vim keys and shortcuts keep working
+    while recording, and Escape doesn't cancel it. *Limits:* Linux
+    recorders only (macOS/Windows need a custom command); the default
+    input device; no pause; WAV only (no compression); a program that
+    ignores SIGINT loses what it hadn't written when killed; editing the
+    page the note goes to is closed when it's inserted.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

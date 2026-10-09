@@ -518,6 +518,11 @@ fn image_html(out: &mut String, alt: &str, target: &str, ctx: &Ctx) {
             escape(shown)
         ));
     };
+    if crate::voice::is_audio_target(target) {
+        // Audio stays in the vault (decision 52): a page shouldn't carry
+        // megabytes of recording, or publish someone's voice by accident.
+        return missing(out, "Voice note not included");
+    }
     if target.contains("://") {
         // Fetching it would make the file depend on the network.
         return missing(out, "Web image not embedded");
@@ -830,6 +835,14 @@ mod tests {
         );
         assert!(!html.contains("src=\"http") && !html.contains("src=\"../"));
         assert_eq!(image_mime("A.JPG"), Some("image/jpeg"));
+        // Voice notes (decision 52) stay out, even when the file exists.
+        let page = Page::from_markdown("V", false, "- ![voice note](../assets/voice-1.wav)\n");
+        let load = |_: &str| Some(b"RIFF....WAVE".to_vec());
+        let html = page_html(&page, &no_refs, &load);
+        assert!(html.contains(
+            "<span class=\"image-missing\">Voice note not included: ../assets/voice-1.wav</span>"
+        ));
+        assert!(!html.contains("base64") && !html.contains("<audio"));
         assert_eq!(image_mime("x.svg"), None);
     }
 

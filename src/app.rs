@@ -48,6 +48,7 @@ mod embed_ui;
 mod import_ui;
 mod publish_ui;
 mod vim_ui;
+mod voice_ui;
 
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace. Palette
@@ -122,6 +123,10 @@ actions!(
         ShowShortcuts,
         CustomizeShortcuts,
         ToggleVimMode,
+        RecordVoiceNote,
+        StopRecording,
+        CancelRecording,
+        TranscribeVoiceNotes,
     ]
 );
 
@@ -457,6 +462,8 @@ enum SettingsSection {
     Shortcuts,
     /// The web clipper (decision 51, `clipper_ui`).
     Clipper,
+    /// Voice notes: recorder and transcription (decision 52, `voice_ui`).
+    Voice,
 }
 
 /// A line under the Shortcuts list.
@@ -767,6 +774,9 @@ pub struct NoteSec {
     import: import_ui::ImportState,
     /// The web clipper's listener (decision 51, `clipper_ui`).
     clipper: clipper_ui::ClipperState,
+    /// Voice notes: the recording and transcriptions (decision 52,
+    /// `voice_ui`).
+    voice: voice_ui::VoiceState,
 }
 
 impl NoteSec {
@@ -915,6 +925,7 @@ impl NoteSec {
             publish: Default::default(),
             import: Default::default(),
             clipper: Default::default(),
+            voice: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -1841,6 +1852,8 @@ impl NoteSec {
                 Command::RenamePage => page.as_deref().is_some_and(|t| self.can_rename(t)),
                 Command::DeletePage => self.can_delete(),
                 Command::ClosePane | Command::FocusOtherPane => self.split.is_some(),
+                Command::RecordVoiceNote => !self.recording(),
+                Command::StopRecording | Command::CancelRecording => self.recording(),
                 _ => true,
             })
             .collect()
@@ -4983,11 +4996,22 @@ impl NoteSec {
                 .on_click(cx.listener(|this, _e, _window, cx| {
                     this.show_settings_section(SettingsSection::Clipper, cx)
                 })),
+            )
+            .child(
+                button(
+                    "settings-tab-voice",
+                    "Voice notes".into(),
+                    section == SettingsSection::Voice,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::Voice, cx)
+                })),
             );
         let body = match section {
             SettingsSection::General => general.into_any_element(),
             SettingsSection::Shortcuts => self.render_hotkeys(state, cx),
             SettingsSection::Clipper => self.render_clipper_settings(cx),
+            SettingsSection::Voice => self.render_voice_settings(cx),
         };
 
         div()
@@ -6034,6 +6058,7 @@ impl NoteSec {
                             // Prose with images in it: each image is drawn on
                             // its own between the text around it, and the line
                             // breaks next to an image are dropped.
+                            let voice_entity = cx.entity();
                             let mut prose =
                                 |pieces: &mut Vec<AnyElement>, text: &str, first: bool| {
                                     let mut pos = 0;
@@ -6054,7 +6079,20 @@ impl NoteSec {
                                             &text[pos..image.range.start],
                                             &mut first,
                                         );
-                                        pieces.push(self.render_image(prefix, ix, images, &image));
+                                        pieces.push(
+                                            if crate::voice::is_audio_target(&image.target) {
+                                                self.render_audio(
+                                                    prefix,
+                                                    ix,
+                                                    images,
+                                                    &image,
+                                                    block.id,
+                                                    &voice_entity,
+                                                )
+                                            } else {
+                                                self.render_image(prefix, ix, images, &image)
+                                            },
+                                        );
                                         images += 1;
                                         pos = image.range.end;
                                     }
@@ -6656,6 +6694,9 @@ impl Render for NoteSec {
         };
         let drop_before = self.page_drop.as_ref().map(|d| d.before.clone());
         let preview_font = self.font_family.clone();
+        // "Record voice note" / "Stop recording" (decision 52).
+        let voice_item = self.render_voice_sidebar_item(cx);
+
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = self.mode == Mode::Notes && ix == self.selected;
             let is_favorite = self.state.is_favorite(&page.title);
@@ -7024,6 +7065,7 @@ impl Render for NoteSec {
             .child(graph_item)
             .child(agenda_item)
             .child(trash_item)
+            .child(voice_item)
             .when(!favorite_rows.is_empty(), |d| {
                 d.child(section_header("FAVORITES")).children(favorite_rows)
             })
@@ -7865,10 +7907,15 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_import_obsidian))
             .on_action(cx.listener(Self::on_import_logseq))
             .on_action(cx.listener(Self::on_import_notion))
+            .on_action(cx.listener(Self::on_record_voice_note))
+            .on_action(cx.listener(Self::on_stop_recording))
+            .on_action(cx.listener(Self::on_cancel_recording))
+            .on_action(cx.listener(Self::on_transcribe_voice_notes))
             .child(sidebar)
             .child(content)
             .children(status_toast)
             .children(self.render_vim_pill())
+            .children(self.render_voice_pill(cx))
             .children(overlay)
             .children(settings_overlay)
             .children(page_menu_overlay)
@@ -12427,12 +12474,18 @@ mod tests {
                 })
                 .collect()
         });
-        assert_eq!(commands, Command::ALL);
+        // All but the ones for a recording in progress (decision 52).
+        let all: Vec<Command> = Command::ALL
+            .iter()
+            .copied()
+            .filter(|c| !matches!(c, Command::StopRecording | Command::CancelRecording))
+            .collect();
+        assert_eq!(commands, all);
         // Every row is rendered (the list scrolls; arrows reach the last).
-        for c in Command::ALL {
+        for c in &all {
             assert!(has(cx, &format!("command-{}", c.name())), "{c:?}");
         }
-        for _ in 0..Command::ALL.len() + 12 {
+        for _ in 0..all.len() + 12 {
             cx.simulate_keystrokes("down");
         }
         let last = view.update(cx, |app, _| {
@@ -12450,7 +12503,7 @@ mod tests {
         assert!(offered.contains(&Command::CollapseAll));
         cx.simulate_keystrokes("escape ctrl-g ctrl-k");
         let offered = view.update(cx, |app, _| app.available_commands());
-        for c in Command::ALL {
+        for c in &all {
             assert_eq!(
                 offered.contains(c),
                 c.needs() == Needs::Nothing,
@@ -15706,6 +15759,403 @@ mod tests {
         assert!(has(cx, "clipper-status"));
         assert_eq!(view.update(cx, |app, _| app.clipper_listening()), None);
         drop(holder);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Stub programs for voice notes (decision 52) in `dir/bin`: a
+    /// recorder that writes a WAV with unset sizes (as a recorder that's
+    /// interrupted early leaves it) and waits for SIGINT, a whisper that
+    /// writes `<-of>.txt` (or fails), and a model file. Real processes,
+    /// run with argument lists like the real ones.
+    fn voice_stubs(dir: &std::path::Path, whisper_body: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut wav = crate::voice::wav_bytes(&[100; 1600]);
+        wav[4..8].copy_from_slice(&0u32.to_le_bytes());
+        wav[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        let fixture = bin.join("fixture.wav");
+        std::fs::write(&fixture, wav).unwrap();
+        let script = |name: &str, body: String| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let recorder = script(
+            "stub-recorder",
+            format!(
+                "trap 'exit 0' INT\ncp '{}' \"$2\"\nwhile true; do sleep 0.05; done",
+                fixture.display()
+            ),
+        );
+        let whisper = script("stub-whisper", whisper_body.to_string());
+        let model = bin.join("ggml-test.bin");
+        std::fs::write(&model, b"lmgg-model").unwrap();
+        (recorder, whisper, model)
+    }
+
+    const WHISPER_OK: &str = r#"for a in "$@"; do [ "$prev" = "-of" ] && base="$a"; [ "$prev" = "-f" ] && wav="$a"; prev="$a"; done
+[ -f "$wav" ] || exit 3
+printf '[00:00:00.000 --> 00:00:01.000]   Buy milk [[and]] eggs.\n[00:00:01.000 --> 00:00:02.000]  [BLANK_AUDIO]\n' > "$base.txt""#;
+
+    fn use_voice_stubs(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        dir: &std::path::Path,
+        whisper_body: &str,
+    ) {
+        let (recorder, whisper, model) = voice_stubs(dir, whisper_body);
+        view.update(cx, |app, _| {
+            app.config.voice_recorder =
+                vec![recorder.display().to_string(), "-o".into(), "{file}".into()];
+            app.config.whisper_binary = whisper.display().to_string();
+            app.config.whisper_model = model.display().to_string();
+        });
+    }
+
+    fn voice_files(dir: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(dir.join("assets"))
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("voice-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        files
+    }
+
+    /// Let the stub recorder start and write its file (real time).
+    fn let_it_record(cx: &mut VisualTestContext) {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_voice_note_is_recorded_repaired_and_transcribed(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "voice-e2e",
+            &[("Test", "- first\n  - child\n- last\n")],
+            "Test",
+        );
+        use_voice_stubs(&view, cx, &dir, WHISPER_OK);
+        view.update(cx, |app, _| app.config.voice_auto_transcribe = true);
+        // Editing "first": the note goes below its subtree.
+        click_block(cx, 0);
+        assert!(!has(cx, "voice-pill"));
+        cx.dispatch_action(RecordVoiceNote);
+        assert!(view.update(cx, |app, _| app.recording()));
+        assert!(has(cx, "voice-pill") && has(cx, "voice-stop") && has(cx, "voice-cancel"));
+        let offered = view.update(cx, |app, _| app.available_commands());
+        assert!(offered.contains(&Command::StopRecording));
+        assert!(offered.contains(&Command::CancelRecording));
+        assert!(!offered.contains(&Command::RecordVoiceNote));
+        // Typing goes on while recording.
+        cx.simulate_input("!");
+        let_it_record(cx);
+        let elapsed = view.update(cx, |app, _| app.voice.elapsed);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "{elapsed:?}"
+        );
+
+        click_on(cx, "voice-stop");
+        cx.run_until_parked();
+        assert!(!view.update(cx, |app, _| app.recording()));
+        let files = voice_files(&dir);
+        assert_eq!(files.len(), 1, "{files:?}");
+        let name = &files[0];
+        assert!(name.starts_with("voice-") && name.ends_with(".wav"));
+        // The header was repaired (sizes were 0 / 0xFFFFFFFF).
+        assert_eq!(
+            std::fs::read(dir.join("assets").join(name)).unwrap(),
+            crate::voice::wav_bytes(&[100; 1600])
+        );
+        let note = format!("![voice note](../assets/{name})");
+        let transcript = "**Transcript:** Buy milk [\u{200b}[and]] eggs.";
+        assert_eq!(
+            block_texts(&view, cx),
+            ["first!", "child", note.as_str(), transcript, "last"]
+        );
+        view.update(cx, |app, _| {
+            let blocks = &app.pages[app.selected].blocks;
+            assert_eq!(blocks[2].parent_id, None, "a sibling of `first`");
+            assert_eq!(blocks[3].parent_id, Some(blocks[2].id), "under the note");
+            assert_eq!(app.editing, None);
+        });
+        assert_eq!(
+            file(&dir),
+            format!("- first!\n  - child\n- {note}\n  - {transcript}\n- last\n")
+        );
+        assert!(!has(cx, "voice-pill"));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.text.starts_with("Transcribed"), "{}", status.text);
+
+        // Reading view: a voice chip with Play (the system player).
+        assert!(has(cx, "voice-2-0") && !has(cx, "image-2-0-missing"));
+        click_on(cx, "voice-2-0-play");
+        view.update(cx, |app, _| {
+            assert_eq!(app.voice.opened, [dir.join("pages/../assets").join(name)]);
+            assert_eq!(app.editing, None, "Play doesn't start editing");
+        });
+        // Transcribe again: one transcript only.
+        click_on(cx, "voice-2-0-transcribe");
+        cx.run_until_parked();
+        assert_eq!(block_texts(&view, cx).len(), 5);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.text.contains("already has a transcript"),
+            "{}",
+            status.text
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn cancel_deletes_the_recording_and_keys_still_work(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "voice-cancel",
+            &[("Test", "- one\n- two\n- three\n")],
+            "Test",
+        );
+        use_voice_stubs(&view, cx, &dir, WHISPER_OK);
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("Record voice");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(view.update(cx, |app, _| app.recording()));
+        let_it_record(cx);
+        // Recorded outside the vault until finished.
+        let temp = view.update(cx, |app, _| app.recording_file()).unwrap();
+        assert!(temp.is_file() && !temp.starts_with(&dir));
+        // In a folder only we can enter (decision 52).
+        let private = temp.parent().unwrap().to_path_buf();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&private).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        assert!(voice_files(&dir).is_empty());
+        // The pill is not modal: vim keys edit as usual, and Escape
+        // (vim's) doesn't stop the recording.
+        click_block(cx, 0);
+        view.update(cx, |app, _| {
+            assert!(!app.overlay_open());
+            assert!(app.vim_applies(), "vim still owns the keys");
+        });
+        cx.simulate_keystrokes("d d");
+        assert_eq!(block_texts(&view, cx), ["two", "three"]);
+        cx.simulate_keystrokes("escape");
+        assert!(view.update(cx, |app, _| app.recording()));
+        assert!(has(cx, "voice-pill"));
+
+        click_on(cx, "voice-cancel");
+        cx.run_until_parked();
+        assert!(!view.update(cx, |app, _| app.recording()));
+        assert!(!temp.exists(), "the recording is deleted");
+        assert!(!private.exists(), "with its folder");
+        assert!(voice_files(&dir).is_empty());
+        assert_eq!(block_texts(&view, cx), ["two", "three"]);
+        assert!(!has(cx, "voice-pill"));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert_eq!(status.text, "Recording cancelled");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn recording_from_the_sidebar_without_an_open_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "voice-sidebar", &[("Test", "- a\n")], "Test");
+        use_voice_stubs(&view, cx, &dir, WHISPER_OK);
+        click_on(cx, "sidebar-voice");
+        assert!(view.update(cx, |app, _| app.recording()));
+        let_it_record(cx);
+        // The toggle stops it; no auto-transcription unless asked for.
+        cx.dispatch_action(RecordVoiceNote);
+        cx.run_until_parked();
+        let name = voice_files(&dir).pop().unwrap();
+        let note = format!("![voice note](../assets/{name})");
+        assert_eq!(block_texts(&view, cx), ["a", note.as_str()]);
+        // Transcribing the page's notes on request.
+        cx.dispatch_action(TranscribeVoiceNotes);
+        cx.run_until_parked();
+        assert_eq!(
+            block_texts(&view, cx)[2],
+            "**Transcript:** Buy milk [\u{200b}[and]] eggs."
+        );
+        cx.dispatch_action(TranscribeVoiceNotes);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.text.starts_with("No voice notes without"),
+            "{}",
+            status.text
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn recording_stops_at_the_length_limit(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "voice-limit", &[("Test", "- a\n")], "Test");
+        use_voice_stubs(&view, cx, &dir, WHISPER_OK);
+        view.update(cx, |app, _| {
+            app.voice.max_length = std::time::Duration::from_millis(200)
+        });
+        cx.dispatch_action(RecordVoiceNote);
+        let_it_record(cx);
+        cx.run_until_parked();
+        assert!(!view.update(cx, |app, _| app.recording()));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status
+                .text
+                .starts_with("Recording stopped at the 0:00 limit. Voice note saved"),
+            "{}",
+            status.text
+        );
+        assert_eq!(block_texts(&view, cx).len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn voice_errors_are_shown(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "voice-errors", &[("Test", "- a\n")], "Test");
+        // No recorder anywhere: the packages to install.
+        let empty = dir.join("empty-bin");
+        std::fs::create_dir_all(&empty).unwrap();
+        view.update(cx, |app, _| {
+            app.voice.path_var = Some(empty.clone().into_os_string())
+        });
+        cx.dispatch_action(RecordVoiceNote);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error && status.text.contains("pipewire") && status.text.contains("alsa-utils")
+        );
+        assert!(!view.update(cx, |app, _| app.recording()));
+
+        // A recorder that quits at once without audio: the file goes.
+        use std::os::unix::fs::PermissionsExt;
+        let quitter = empty.join("arecord");
+        std::fs::write(
+            &quitter,
+            "#!/bin/sh\necho 'arecord: no such device' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&quitter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cx.dispatch_action(RecordVoiceNote);
+        assert!(view.update(cx, |app, _| app.recording()));
+        let_it_record(cx);
+        cx.run_until_parked();
+        assert!(!view.update(cx, |app, _| app.recording()));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.error, "{}", status.text);
+        assert!(
+            status.text.contains("stopped by itself") && status.text.contains("no such device"),
+            "{}",
+            status.text
+        );
+        assert!(voice_files(&dir).is_empty());
+        assert_eq!(block_texts(&view, cx), ["a"]);
+
+        // Whisper failing: its exit code and stderr; no transcript.
+        use_voice_stubs(
+            &view,
+            cx,
+            &dir,
+            "echo 'error: failed to load model' >&2\nexit 2",
+        );
+        cx.dispatch_action(RecordVoiceNote);
+        let_it_record(cx);
+        cx.dispatch_action(StopRecording);
+        cx.run_until_parked();
+        cx.dispatch_action(TranscribeVoiceNotes);
+        cx.run_until_parked();
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error
+                && status.text.contains("exit 2")
+                && status.text.contains("failed to load model"),
+            "{}",
+            status.text
+        );
+        assert_eq!(block_texts(&view, cx).len(), 2);
+        // A missing model.
+        view.update(cx, |app, _| {
+            app.config.whisper_model = "/nonexistent/m.bin".into()
+        });
+        cx.dispatch_action(TranscribeVoiceNotes);
+        cx.run_until_parked();
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error && status.text.contains("model not found"),
+            "{}",
+            status.text
+        );
+        // No whisper program at all.
+        view.update(cx, |app, _| app.config.whisper_binary.clear());
+        cx.dispatch_action(TranscribeVoiceNotes);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error && status.text.contains("Settings > Voice notes"),
+            "{}",
+            status.text
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn voice_settings_pick_and_test_whisper(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "voice-settings", &[("Test", "- a\n")], "Test");
+        let help =
+            "case \"$1\" in --help) echo 'usage: whisper-cli [options] file0.wav'; exit 0;; esac";
+        let (recorder, whisper, model) = voice_stubs(&dir, help);
+        view.update(cx, |app, _| {
+            app.config.voice_recorder = vec![recorder.display().to_string()]
+        });
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-voice");
+        assert!(has(cx, "settings-voice") && has(cx, "voice-recorder"));
+        let choose = |cx: &mut VisualTestContext, button: &str, path: PathBuf| {
+            click_on(cx, button);
+            assert!(cx.did_prompt_for_paths());
+            cx.simulate_path_prompt_response(move |options| {
+                assert!(options.files && !options.directories && !options.multiple);
+                Some(vec![path])
+            });
+            cx.run_until_parked();
+        };
+        choose(cx, "voice-whisper-choose", whisper.clone());
+        choose(cx, "voice-model-choose", model.clone());
+        assert_eq!(
+            saved_config(&dir).whisper_binary,
+            whisper.display().to_string()
+        );
+        assert_eq!(
+            saved_config(&dir).whisper_model,
+            model.display().to_string()
+        );
+        click_on(cx, "voice-test");
+        cx.run_until_parked();
+        let check = view.update(cx, |app, _| app.voice.check.clone()).unwrap();
+        assert_eq!(
+            check,
+            Ok("Ready: stub-whisper with ggml-test.bin (0 MB)".to_string())
+        );
+        assert!(has(cx, "voice-check"));
+        click_on(cx, "voice-auto-on");
+        assert!(saved_config(&dir).voice_auto_transcribe);
+        click_on(cx, "voice-model-clear");
+        assert_eq!(saved_config(&dir).whisper_model, "");
+        click_on(cx, "voice-test");
+        cx.run_until_parked();
+        let check = view.update(cx, |app, _| app.voice.check.clone()).unwrap();
+        assert!(check.unwrap_err().contains("no model"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

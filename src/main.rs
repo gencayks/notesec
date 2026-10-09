@@ -23,6 +23,7 @@ mod table;
 mod tabs;
 mod ui;
 mod vim;
+mod voice;
 
 use app::NoteSec;
 use gpui::{px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};

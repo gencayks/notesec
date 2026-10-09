@@ -1181,6 +1181,22 @@ mod tests {
     }
 
     #[test]
+    fn voice_notes_are_not_published() {
+        let root = graph("voice");
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(root.join("assets/voice-1.wav"), b"RIFF....WAVE").unwrap();
+        let text = "- said ![voice note](../assets/voice-1.wav)\n";
+        let dir = publish(&root, &[page("Main", text)], 0, false).unwrap().dir;
+        assert!(!dir.join("assets").exists());
+        let html = read(&dir, "index.html");
+        assert!(
+            html.contains("Voice note not included: voice-1.wav"),
+            "{html}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn only_images_inside_the_graph_are_copied() {
         let root = graph("images");
         let outside = std::env::temp_dir().join(format!(
