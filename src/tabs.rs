@@ -1,7 +1,7 @@
 //! The open tabs: an ordered list of what each tab shows plus which one is
 //! active. Pure data (no GPUI), so the open/close/cycle rules are unit-tested
-//! here; `app.rs` turns the active tab into the page, graph, agenda or
-//! trash on screen.
+//! here; `app.rs` turns the active tab into the page, graph, agenda,
+//! calendar or trash on screen.
 //!
 //! Tabs refer to pages by title, not by index: `pages` is re-sorted whenever
 //! a page is added, which shifts indices but never titles.
@@ -15,6 +15,8 @@ pub enum TabTarget {
     Graph,
     /// The agenda (open tasks by date).
     Agenda,
+    /// The month calendar (journals by day).
+    Calendar,
     /// The trash (deleted pages, with Restore and Delete forever).
     Trash,
 }

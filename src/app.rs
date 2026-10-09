@@ -51,8 +51,10 @@ mod mentions_ui;
 use ai_ui::{
     AiSettings, AskState, ChatState, RelatedState, SavedUi, SemanticState, TagSuggestState,
 };
+use calendar_ui::CalendarMonth;
 use mentions_ui::MentionsState;
 mod appearance_ui;
+mod calendar_ui;
 mod capture_ui;
 mod clipper_ui;
 mod embed_ui;
@@ -115,6 +117,7 @@ actions!(
         // Palette commands without a key of their own (except
         // ShowShortcuts, Ctrl+/).
         OpenAgenda,
+        OpenCalendar,
         OpenTrash,
         ExportHtml,
         ExportPdf,
@@ -394,6 +397,8 @@ enum Mode {
     Graph,
     /// The agenda: open tasks by date.
     Agenda,
+    /// The month calendar: journals by day.
+    Calendar,
     /// The trash: deleted pages.
     Trash,
     /// No tab is open: an empty state with hints.
@@ -732,6 +737,8 @@ pub struct NoteSec {
     ask: AskState,
     /// The AI sidebar chat and its session history (roadmap v0.3.0 feature 3).
     chat: ChatState,
+    /// The month on screen in the calendar tab (roadmap v0.3.0 feature 5).
+    calendar: CalendarMonth,
     /// The Semantic search overlay and the embedding cache (decision 43).
     semantic: SemanticState,
     /// Tag suggestions and Related pages (decision 44).
@@ -963,6 +970,7 @@ impl NoteSec {
             shortcuts_open: false,
             ask: AskState::default(),
             chat: ChatState::default(),
+            calendar: CalendarMonth::current(),
             semantic: SemanticState::default(),
             tag_suggest: TagSuggestState::default(),
             related: RelatedState::default(),
@@ -1828,7 +1836,7 @@ impl NoteSec {
         let pages = &self.pages;
         self.tabs.retain(|t| match t {
             TabTarget::Page(title) => pages.iter().any(|p| p.title == *title),
-            TabTarget::Graph | TabTarget::Agenda | TabTarget::Trash => true,
+            TabTarget::Graph | TabTarget::Agenda | TabTarget::Calendar | TabTarget::Trash => true,
         });
         self.prune_split();
         if let Some(split) = self.split.as_mut().filter(|s| s.right_focused) {
@@ -2684,6 +2692,11 @@ impl NoteSec {
             Some(TabTarget::Agenda) => {
                 self.trash_confirm = None;
                 self.mode = Mode::Agenda;
+                cx.notify();
+            }
+            Some(TabTarget::Calendar) => {
+                self.trash_confirm = None;
+                self.mode = Mode::Calendar;
                 cx.notify();
             }
             // Read from disk again, in case files changed meanwhile.
@@ -7337,6 +7350,25 @@ impl Render for NoteSec {
             .on_click(cx.listener(|this, _e, _window, cx| this.show_agenda(cx)))
             .child("Agenda");
 
+        // "Calendar" entry: the month grid; highlighted while open.
+        let in_calendar = self.mode == Mode::Calendar;
+        let calendar_item = div()
+            .id("sidebar-calendar")
+            .debug_selector(|| "sidebar-calendar".to_string())
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(if in_calendar {
+                theme.accent
+            } else {
+                theme.text
+            })
+            .when(in_calendar, |d| d.bg(theme.selected_bg))
+            .hover(|d| d.bg(theme.selected_bg))
+            .on_click(cx.listener(|this, _e, _window, cx| this.show_calendar(cx)))
+            .child("Calendar");
+
         // "Trash" entry: deleted pages, with how many; highlighted while open.
         let in_trash = self.mode == Mode::Trash;
         let trash_count = self.trash.len();
@@ -7438,6 +7470,7 @@ impl Render for NoteSec {
             .child(today_item)
             .child(graph_item)
             .child(agenda_item)
+            .child(calendar_item)
             .child(trash_item)
             .child(voice_item)
             .when(!favorite_rows.is_empty(), |d| {
@@ -7871,6 +7904,7 @@ impl Render for NoteSec {
                     TabTarget::Page(title) => title.clone(),
                     TabTarget::Graph => "Graph".to_string(),
                     TabTarget::Agenda => "Agenda".to_string(),
+                    TabTarget::Calendar => "Calendar".to_string(),
                     TabTarget::Trash => "Trash".to_string(),
                 };
                 div()
@@ -7991,6 +8025,7 @@ impl Render for NoteSec {
         let view: AnyElement = match (&self.mode, &self.graph) {
             (Mode::Graph, Some(graph)) => graph.clone().into_any_element(),
             (Mode::Agenda, _) => self.render_agenda(cx),
+            (Mode::Calendar, _) => self.render_calendar(cx),
             (Mode::Trash, _) => self.render_trash(cx),
             (Mode::Empty, _) => empty_state(cx).into_any_element(),
             _ if whiteboard_shown => self.render_whiteboard(cx),
@@ -8019,6 +8054,7 @@ impl Render for NoteSec {
                     None => div().into_any_element(),
                 },
                 Some(TabTarget::Agenda) => self.render_agenda(cx),
+                Some(TabTarget::Calendar) => self.render_calendar(cx),
                 Some(TabTarget::Trash) => self.render_trash(cx),
                 None => empty_state(cx).into_any_element(),
             }),
@@ -8312,6 +8348,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_focus_other_pane))
             .on_action(cx.listener(Self::on_open_agenda))
+            .on_action(cx.listener(Self::on_open_calendar))
             .on_action(cx.listener(Self::on_open_trash))
             .on_action(cx.listener(Self::on_export_html))
             .on_action(cx.listener(Self::on_export_pdf))
@@ -10627,6 +10664,7 @@ mod tests {
                     TabTarget::Page(title) => title.clone(),
                     TabTarget::Graph => "Graph".to_string(),
                     TabTarget::Agenda => "Agenda".to_string(),
+                    TabTarget::Calendar => "Calendar".to_string(),
                     TabTarget::Trash => "Trash".to_string(),
                 })
                 .collect();
@@ -10653,6 +10691,7 @@ mod tests {
         view.update(cx, |app, _| match labels[active] {
             "Graph" => assert_eq!(app.mode, Mode::Graph),
             "Agenda" => assert_eq!(app.mode, Mode::Agenda),
+            "Calendar" => assert_eq!(app.mode, Mode::Calendar),
             "Trash" => assert_eq!(app.mode, Mode::Trash),
             title => {
                 assert_eq!(app.mode, Mode::Notes);

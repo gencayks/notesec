@@ -110,6 +110,7 @@ commands! {
     OpenToday => "Open today's journal", ["today", "daily", "journal"], Nothing;
     QuickCapture => "Quick capture", ["capture", "quick", "inbox", "journal"], Nothing;
     OpenAgenda => "Open agenda", ["tasks", "todo", "scheduled", "deadline"], Nothing;
+    OpenCalendar => "Calendar", ["calendar", "month", "journal", "date", "daily"], Nothing;
     OpenTrash => "Open trash", ["deleted", "restore", "bin", "recycle", "undelete"], Nothing;
     SearchAllPages => "Search all pages", ["global search", "full text", "find in pages"], Nothing;
     RenamePage => "Rename current page", ["title", "name"], Page;
