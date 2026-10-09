@@ -43,6 +43,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use uuid::Uuid;
 
+mod embed_ui;
+
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace. Palette
 // commands (`commands.rs`) dispatch these too.
@@ -507,6 +509,9 @@ struct PageView {
     /// The "Linked from" rows' reading text, for tests.
     #[cfg(test)]
     backlink_texts: Vec<String>,
+    /// The embeds' text lines (`embed_ui::Embeds::lines`), for tests.
+    #[cfg(test)]
+    embed_lines: Vec<String>,
 }
 
 /// Debug selector prefix for the unfocused pane's page (`other-block-0`).
@@ -709,6 +714,12 @@ pub struct NoteSec {
     /// for tests.
     #[cfg(test)]
     backlink_texts: Vec<String>,
+    /// Each pane's embeds' text lines from the last render (decision 47),
+    /// for tests.
+    #[cfg(test)]
+    embed_lines: Vec<String>,
+    #[cfg(test)]
+    other_embed_lines: Vec<String>,
     /// Monospace font for code blocks: the first of `MONO_FONTS` installed.
     mono_font: Option<SharedString>,
     /// The code block (block id, its number in the block) under the mouse;
@@ -860,6 +871,10 @@ impl NoteSec {
             other_layouts: Vec::new(),
             #[cfg(test)]
             backlink_texts: Vec::new(),
+            #[cfg(test)]
+            embed_lines: Vec::new(),
+            #[cfg(test)]
+            other_embed_lines: Vec::new(),
             mono_font,
             hovered_code: None,
             copied_code: None,
@@ -3032,7 +3047,7 @@ impl NoteSec {
     // --- export, status message ------------------------------------------------
 
     /// "Export page to HTML": write the page on screen as one
-    /// self-contained HTML file (`export::page_html`) to
+    /// self-contained HTML file (`export::page_html_with_embeds`) to
     /// `<graph>/exports/<page file>.html`, replacing an earlier export, and
     /// say where. The block being edited is saved first. Folded blocks are
     /// exported unfolded; images are embedded.
@@ -3048,7 +3063,11 @@ impl NoteSec {
                 .filter(|path| is_image_path(path))
                 .and_then(|path| std::fs::read(path).ok())
         };
-        let html = crate::export::page_html(page, &resolve_ref, &load_image);
+        let resolver = crate::embed::Resolver::new(pages, None);
+        let host = Some(self.selected);
+        let resolve_embeds = |content: &str| resolver.resolve(content, host);
+        let html =
+            crate::export::page_html_with_embeds(page, &resolve_ref, &resolve_embeds, &load_image);
         let status = match self.storage.write_export(page, &html) {
             Ok(path) => Status {
                 text: format!("Exported to {}", path.display()),
@@ -5813,6 +5832,7 @@ impl NoteSec {
         #[cfg(test)]
         {
             self.other_layouts = view.layouts;
+            self.other_embed_lines = view.embed_lines;
         }
         view.element
     }
@@ -5868,6 +5888,8 @@ impl NoteSec {
         let page = &self.pages[page_ix];
         #[cfg(test)]
         let mut reading_layouts = Vec::new();
+        #[cfg(test)]
+        let mut embed_lines = Vec::new();
         let visible = page.visible_blocks(&self.collapsed);
         // The drop gap below each row's lower half: just before the next
         // visible row, or the end of the page after the last one.
@@ -6155,15 +6177,29 @@ impl NoteSec {
                             .child(div().px_2().pb_1().text_color(theme.muted).child(header))
                             .children(items)
                     });
-                let content = match query_list {
-                    Some(list) => div()
+                // Embedded pages and blocks, live (decision 47).
+                let embeds = display
+                    .as_ref()
+                    .and_then(|_| self.render_embeds(prefix, page_ix, ix, source, cx));
+                #[cfg(test)]
+                if let Some(embeds) = &embeds {
+                    embed_lines.extend(embeds.lines.iter().cloned());
+                }
+                let extras: Vec<AnyElement> = query_list
+                    .map(IntoElement::into_any_element)
+                    .into_iter()
+                    .chain(embeds.map(|e| e.element))
+                    .collect();
+                let content = if extras.is_empty() {
+                    content
+                } else {
+                    div()
                         .flex_1()
                         .flex()
                         .flex_col()
                         .child(content)
-                        .child(list)
-                        .into_any_element(),
-                    None => content,
+                        .children(extras)
+                        .into_any_element()
                 };
                 // A press on a row that isn't being edited starts editing it
                 // with the cursor under the mouse, and a drag from there
@@ -6525,6 +6561,8 @@ impl NoteSec {
             layouts: reading_layouts,
             #[cfg(test)]
             backlink_texts,
+            #[cfg(test)]
+            embed_lines,
         }
     }
 }
@@ -7103,6 +7141,7 @@ impl Render for NoteSec {
         #[cfg(test)]
         {
             self.backlink_texts = page_view.backlink_texts;
+            self.embed_lines = page_view.embed_lines;
         }
         let main = page_view.element;
 
@@ -7461,7 +7500,10 @@ impl Render for NoteSec {
         // focuses it first (capture phase), so the click then acts there.
         let split = self.split.clone();
         #[cfg(test)]
-        self.other_layouts.clear();
+        {
+            self.other_layouts.clear();
+            self.other_embed_lines.clear();
+        }
         let other: Option<AnyElement> = match &split {
             None => None,
             // The left pane: its active tab.
@@ -14516,6 +14558,217 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.pages[app.selected].title, "JavaScript")
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- live embeds (decision 47) -------------------------------------------
+
+    const EMBED_ID: &str = "6f9b2c1e-0000-4000-8000-0000000000e1";
+
+    fn embed_lines(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        view.update(cx, |app, _| app.embed_lines.clone())
+    }
+
+    fn lines(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Start editing row `row` by clicking its own text (the middle of a
+    /// row with an embed is the embed), with the cursor at the end.
+    fn click_host_text(view: &Entity<NoteSec>, cx: &mut VisualTestContext, row: usize) {
+        let at = view.update(cx, |app, _| {
+            let (_, layout) = app.reading_layouts.iter().find(|(r, _)| *r == row).unwrap();
+            let p = layout.position_for_index(0).unwrap();
+            point(p.x + px(1.), p.y + layout.line_height() / 2.)
+        });
+        cx.simulate_click(at, Modifiers::none());
+        cx.simulate_keystrokes("end");
+    }
+
+    #[gpui::test]
+    fn embeds_show_the_source_live_and_open_it_on_click(cx: &mut TestAppContext) {
+        let test = format!("- intro ![[Beta]]\n- ![[(({EMBED_ID}))]]\n");
+        let beta = format!("- one\n  id:: {EMBED_ID}\n  - child\n- two\n");
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "embed-live",
+            &[("Test", &test), ("Beta", &beta)],
+            "Test",
+        );
+        let pages_before = view.update(cx, |app, _| app.pages.len());
+        assert_eq!(
+            embed_lines(&view, cx),
+            lines(&[
+                "[Beta]",
+                "  one",
+                "    child",
+                "  two",
+                "[Beta]",
+                "  one",
+                "    child"
+            ])
+        );
+        assert!(has(cx, "embed-0-title-0") && has(cx, "embed-0-block-3"));
+        assert!(has(cx, "embed-1-title-0") && has(cx, "embed-1-block-2"));
+        assert!(!has(cx, "embed-1-block-3"));
+        // The embedding block's own text stays (and stays editable).
+        assert_eq!(
+            reading_text(&view, cx, 0).as_deref(),
+            Some("intro ![[Beta]]")
+        );
+
+        // Edit the source; the embeds show it when we come back.
+        click_sidebar_page(&view, cx, "Beta");
+        edit_and_leave(cx, 1, " edited");
+        click_sidebar_page(&view, cx, "Test");
+        assert_eq!(
+            embed_lines(&view, cx),
+            lines(&[
+                "[Beta]",
+                "  one",
+                "    child edited",
+                "  two",
+                "[Beta]",
+                "  one",
+                "    child edited"
+            ])
+        );
+
+        // Editing and saving the host: the block embed is no page link, so
+        // no "((id))" page appears, and the file keeps the syntax.
+        click_host_text(&view, cx, 1);
+        cx.simulate_input(" here");
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert_eq!(app.pages.len(), pages_before));
+        assert_eq!(
+            file(&dir),
+            format!("- intro ![[Beta]]\n- ![[(({EMBED_ID}))]] here\n")
+        );
+
+        // A click on an embedded block edits it on its own page.
+        click_on(cx, "embed-1-block-2");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Beta");
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.text, "child edited");
+        });
+        cx.simulate_keystrokes("escape");
+        click_sidebar_page(&view, cx, "Test");
+        // The title opens the source page, without editing anything.
+        click_on(cx, "embed-0-title-0");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Beta");
+            assert_eq!(app.editing, None);
+            // Both embeds count in Beta's "Linked from".
+            assert_eq!(app.backlink_texts.len(), 2);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn embed_notes_for_cycles_missing_trashed_and_deep_targets(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "embed-notes",
+            &[
+                ("Test", "- ![[Test]]\n- ![[Gone]] ![[Beta]]\n- ![[P1]]\n"),
+                ("Beta", "- beta ![[test]]\n"),
+                ("P1", "- 1 ![[P2]]\n"),
+                ("P2", "- 2 ![[P3]]\n"),
+                ("P3", "- 3 ![[P4]]\n"),
+                ("P4", "- 4 ![[P5]]\n"),
+                ("P5", "- 5\n"),
+            ],
+            "Test",
+        );
+        assert_eq!(
+            embed_lines(&view, cx),
+            lines(&[
+                "Circular embed of \u{201c}Test\u{201d}",
+                "Page \u{201c}Gone\u{201d} not found",
+                "[Beta]",
+                "  beta ![[test]]",
+                "    Circular embed of \u{201c}Test\u{201d}",
+                "[P1]",
+                "  1 ![[P2]]",
+                "    [P2]",
+                "      2 ![[P3]]",
+                "        [P3]",
+                "          3 ![[P4]]",
+                "            [P4]",
+                "              4 ![[P5]]",
+                "                Embeds nested more than 4 deep are not shown",
+            ])
+        );
+        assert!(has(cx, "embed-0-note-0") && has(cx, "embed-1-note-0"));
+
+        // A trashed page is a missing one.
+        view.update(cx, |app, cx| app.delete_page("Beta", cx).unwrap());
+        click_sidebar_page(&view, cx, "Test");
+        let shown = embed_lines(&view, cx);
+        assert_eq!(
+            shown[1..3],
+            lines(&[
+                "Page \u{201c}Gone\u{201d} not found",
+                "Page \u{201c}Beta\u{201d} not found"
+            ])
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn an_embed_in_one_pane_follows_typing_in_the_other(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "embed-split",
+            &[("Test", "- ![[Beta]]\n"), ("Beta", "- one\n- two\n")],
+            "Test",
+        );
+        // Test on the left, Beta on the right (focused), being edited.
+        cx.simulate_keystrokes("ctrl-\\");
+        click_sidebar_page(&view, cx, "Beta");
+        assert_eq!(split_of(&view, cx), split_is("Beta", true));
+        assert!(in_pane(cx, "other-embed-0-title-0", "left"));
+        click_block(cx, 1);
+        cx.simulate_input(" typing");
+        let other = view.update(cx, |app, _| app.other_embed_lines.clone());
+        assert_eq!(other, lines(&["[Beta]", "  one", "  two typing"]));
+        // Nothing saved yet: it is the editor's text.
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Beta")).unwrap(),
+            "- one\n- two\n"
+        );
+        cx.simulate_keystrokes("escape");
+        let other = view.update(cx, |app, _| app.other_embed_lines.clone());
+        assert_eq!(other, lines(&["[Beta]", "  one", "  two typing"]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn bang_double_bracket_picks_a_page_by_alias_and_embeds_its_title(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "embed-picker",
+            &[
+                ("Test", "- \n- {{embed [[js]]}}\n"),
+                ("JavaScript", "alias:: JS\n\n- the language\n"),
+            ],
+            "Test",
+        );
+        let pages_before = view.update(cx, |app, _| app.pages.len());
+        // Logseq's form, by alias, resolves like a link. The page's
+        // properties block shows as it does on the page.
+        let js = ["[JavaScript]", "  alias:: JS", "  the language"];
+        assert_eq!(embed_lines(&view, cx), lines(&js));
+        click_block(cx, 0);
+        cx.simulate_input("![[js");
+        assert!(has(cx, "ref-menu"));
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "![[JavaScript]]"));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(file(&dir), "- ![[JavaScript]]\n- {{embed [[js]]}}\n");
+        assert_eq!(embed_lines(&view, cx), lines(&[js, js].concat()));
+        view.update(cx, |app, _| assert_eq!(app.pages.len(), pages_before));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

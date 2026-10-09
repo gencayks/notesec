@@ -7,6 +7,7 @@ mod commands;
 mod config;
 mod display;
 mod editor;
+mod embed;
 mod export;
 mod graph;
 mod graph_view;

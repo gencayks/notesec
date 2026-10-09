@@ -1,6 +1,6 @@
 //! Export a page as one self-contained HTML file.
 //!
-//! Pure code (no GPUI, no files): [`page_html`] turns a page into the whole
+//! Pure code (no GPUI, no files): [`page_html_with_embeds`] turns a page into the whole
 //! document as a string, and the caller says how block references resolve
 //! and where image bytes come from. `app.rs` writes the result to
 //! `<graph>/exports/` (see `Storage::write_export`).
@@ -18,12 +18,18 @@
 //! a note instead. Links and tags become styled spans (with the page name in
 //! `data-page`), since the pages they point at aren't exported. A
 //! Content-Security-Policy meta tag makes a browser refuse anything else.
+//!
+//! Embeds (`![[Page]]`, `![[((id))]]`, decision 47) are drawn inline, in a
+//! bordered box headed by the source page's title, with the same guards as
+//! the app (`embed::Resolver`): a circular, too deep or missing embed is a
+//! note instead of content.
 
 use uuid::Uuid;
 
 use crate::agenda::parse_dates;
 use crate::code::{split_code, Part};
 use crate::display::DisplayBlock;
+use crate::embed::Resolved;
 use crate::model::{BlockKind, Page, TaskState};
 use crate::table::{parse_table, Align, Table};
 
@@ -71,6 +77,10 @@ th { background: var(--code-bg); }
 img { max-width: 100%; max-height: 480px; display: block; margin: 4px 0; border-radius: 4px; }
 .image-missing { display: inline-block; color: var(--muted); border: 1px dashed var(--border);
   border-radius: 4px; padding: 2px 8px; font-size: 0.9em; }
+.embed { border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 6px; padding: 4px 12px 6px; margin: 6px 0; }
+.embed-title { color: var(--muted); font-size: 0.85em; }
+.embed-note { color: var(--muted); font-style: italic; font-size: 0.9em; }
 @media print { body { background: none; } main { max-width: none; padding: 0; } }
 "#;
 
@@ -81,9 +91,25 @@ pub type ResolveRef<'a> = &'a dyn Fn(Uuid) -> Option<String>;
 /// The bytes of the image an `![alt](target)` points at (`None`: missing).
 pub type LoadImage<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
 
+/// The embeds in one of the exported page's blocks, resolved (see
+/// `embed::Resolver::resolve`; nested embeds come resolved inside).
+pub type ResolveEmbeds<'a> = &'a dyn Fn(&str) -> Vec<Resolved>;
+
 /// The whole HTML document for `page`: title, then every block as nested
-/// lists (all of them: folding is a view setting, not content).
+/// lists (all of them: folding is a view setting, not content). Embeds show
+/// as written; [`page_html_with_embeds`] draws them.
+#[cfg(test)]
 pub fn page_html(page: &Page, resolve_ref: ResolveRef, load_image: LoadImage) -> String {
+    page_html_with_embeds(page, resolve_ref, &|_| Vec::new(), load_image)
+}
+
+/// [`page_html`], with each block's embeds drawn inline under it.
+pub fn page_html_with_embeds(
+    page: &Page,
+    resolve_ref: ResolveRef,
+    resolve_embeds: ResolveEmbeds,
+    load_image: LoadImage,
+) -> String {
     let ctx = Ctx {
         resolve_ref,
         load_image,
@@ -107,7 +133,19 @@ pub fn page_html(page: &Page, resolve_ref: ResolveRef, load_image: LoadImage) ->
     out.push_str(&format!(
         "<main class=\"{class}\">\n<h1 class=\"page-title\">{title}</h1>\n"
     ));
-    outline_html(&mut out, page, &ctx);
+    let rows = page
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(ix, b)| {
+            (
+                page.depth_of(ix),
+                b.content.as_str(),
+                resolve_embeds(&b.content),
+            )
+        })
+        .collect();
+    outline_html(&mut out, "<ul class=\"outline\">", rows, &ctx);
     out.push_str("</main>\n</body>\n</html>\n");
     out
 }
@@ -117,15 +155,17 @@ struct Ctx<'a> {
     load_image: LoadImage<'a>,
 }
 
-/// The blocks as nested `<ul>`s, one `<li>` per block, children in a `<ul>`
-/// inside their parent's `<li>`.
-fn outline_html(out: &mut String, page: &Page, ctx: &Ctx) {
-    out.push_str("<ul class=\"outline\">\n");
+/// Blocks (depth, content, resolved embeds) as nested `<ul>`s, one `<li>`
+/// per block, children in a `<ul>` inside their parent's `<li>`. `open` is
+/// the outermost `<ul ...>` tag.
+fn outline_html(out: &mut String, open: &str, rows: Vec<(usize, &str, Vec<Resolved>)>, ctx: &Ctx) {
+    out.push_str(open);
+    out.push('\n');
     let mut prev: Option<usize> = None;
-    for (ix, block) in page.blocks.iter().enumerate() {
+    for (depth, content, embeds) in rows {
         // Blocks are stored in outline order, so a block is at most one
         // level below the one before it.
-        let depth = page.depth_of(ix).min(prev.map_or(0, |p| p + 1));
+        let depth = depth.min(prev.map_or(0, |p| p + 1));
         match prev {
             None => {}
             Some(p) if depth > p => out.push_str("\n<ul>\n"),
@@ -137,7 +177,10 @@ fn outline_html(out: &mut String, page: &Page, ctx: &Ctx) {
             }
         }
         out.push_str("<li>");
-        block_html(out, &block.content, ctx);
+        block_html(out, content, ctx);
+        for embed in &embeds {
+            embed_html(out, embed, ctx);
+        }
         prev = Some(depth);
     }
     if let Some(p) = prev {
@@ -147,6 +190,31 @@ fn outline_html(out: &mut String, page: &Page, ctx: &Ctx) {
         }
     }
     out.push_str("</ul>\n");
+}
+
+/// One embed: its source's content in a box, or a note.
+fn embed_html(out: &mut String, embed: &Resolved, ctx: &Ctx) {
+    let (title, rows) = match embed {
+        Resolved::Page { title, rows } | Resolved::Block { title, rows } => (title, rows),
+        _ => {
+            let note = embed.note().unwrap_or_default();
+            out.push_str(&format!(
+                "<div class=\"embed-note\">{}</div>",
+                escape(&note)
+            ));
+            return;
+        }
+    };
+    out.push_str(&format!(
+        "<div class=\"embed\"><div class=\"embed-title\" data-page=\"{t}\">{t}</div>",
+        t = escape(title)
+    ));
+    let rows = rows
+        .iter()
+        .map(|r| (r.depth, r.content.as_str(), r.embeds.clone()))
+        .collect();
+    outline_html(out, "<ul class=\"embed-outline\">", rows, ctx);
+    out.push_str("</div>");
 }
 
 /// One block: `<div class="block ...">` with its task badge, then its
@@ -697,5 +765,47 @@ mod tests {
             assert_eq!(base64(input.as_bytes()), expected, "{input}");
         }
         assert_eq!(base64(&[0xff, 0xfe, 0x00]), "//4A");
+    }
+
+    #[test]
+    fn embeds_are_drawn_inline_with_the_same_guards() {
+        let id = "6f9b2c1e-0000-4000-8000-0000000000e1";
+        let pages = vec![
+            Page::from_markdown(
+                "Host",
+                false,
+                &format!("- intro\n  - ![[Beta]]\n- ![[(({id}))]]\n- ![[Host]] ![[Gone]]\n"),
+            ),
+            Page::from_markdown(
+                "Beta",
+                false,
+                &format!("- b <one>\n  id:: {id}\n  - b child\n- **two**\n"),
+            ),
+        ];
+        let resolver = crate::embed::Resolver::new(&pages, None);
+        let embeds = |c: &str| resolver.resolve(c, Some(0));
+        let html = page_html_with_embeds(&pages[0], &no_refs, &embeds, &no_images);
+        let doc = outline(&html);
+        let beta = format!(
+            "<div class=\"embed\"><div class=\"embed-title\" data-page=\"Beta\">Beta</div>\
+             <ul class=\"embed-outline\">\n<li>{}\n<ul>\n<li>{}</li>\n</ul>\n</li>\n<li>{}</li>\n</ul>\n</div>",
+            text("b &lt;one&gt;"),
+            text("b child"),
+            text("<strong>two</strong>"),
+        );
+        assert!(doc.contains(&beta), "{doc}");
+        // The block embed: the block and its child only.
+        assert!(doc.contains(&format!(
+            "<ul class=\"embed-outline\">\n<li>{}\n<ul>\n<li>{}</li>\n</ul>\n</li>\n</ul>\n</div>",
+            text("b &lt;one&gt;"),
+            text("b child")
+        )));
+        assert!(
+            doc.contains("<div class=\"embed-note\">Circular embed of \u{201c}Host\u{201d}</div>")
+        );
+        assert!(doc.contains("<div class=\"embed-note\">Page \u{201c}Gone\u{201d} not found</div>"));
+        assert!(html.contains(".embed {"));
+        // Without a resolver, embeds stay as written.
+        assert!(!page_html(&pages[0], &no_refs, &no_images).contains("class=\"embed"));
     }
 }

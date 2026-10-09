@@ -15,6 +15,7 @@
 //!   (`alpha`) cools each tick so the layout settles, and a hard tick cap
 //!   guarantees it can never run forever.
 
+use crate::embed::embedded_blocks;
 use crate::model::{page_aliases, parse_references, Page};
 use std::collections::{HashMap, HashSet};
 
@@ -182,6 +183,14 @@ impl Graph {
             }
         }
 
+        // A block embed (`![[((id))]]`, decision 47) is an edge to the page
+        // the block lives on; page embeds are links already.
+        let block_page: HashMap<uuid::Uuid, usize> = kept
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| p.blocks.iter().map(move |b| (b.id, i)))
+            .collect();
+
         let mut undirected: HashSet<(usize, usize)> = HashSet::new();
         // Distinct (source, target) pairs, so one page linking to another ten
         // times counts as a single backlink.
@@ -189,10 +198,13 @@ impl Graph {
         for (src, page) in kept.iter().enumerate() {
             for block in &page.blocks {
                 // `[[links]]` and `#tags` alike.
-                for link in parse_references(&block.content) {
-                    let Some(&dst) = index.get(&link.target.to_lowercase()) else {
-                        continue;
-                    };
+                let links = parse_references(&block.content)
+                    .into_iter()
+                    .filter_map(|link| index.get(&link.target.to_lowercase()).copied());
+                let embeds = embedded_blocks(&block.content)
+                    .into_iter()
+                    .filter_map(|id| block_page.get(&id).copied());
+                for dst in links.chain(embeds) {
                     if dst != src {
                         directed.insert((src, dst));
                         undirected.insert((src.min(dst), src.max(dst)));

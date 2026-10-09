@@ -113,7 +113,8 @@ pub struct Reference {
 /// Find every well-formed `[[name]]` in `text`, in order.
 ///
 /// A link needs a non-empty name that contains no `[`, `]` or newline. In
-/// `[[a [[b]]` only the inner `[[b]]` counts.
+/// `[[a [[b]]` only the inner `[[b]]` counts. `[[((uuid))]]` (the inside of
+/// a block embed, `![[((uuid))]]`, decision 47) names a block, not a page.
 pub fn parse_wikilinks(text: &str) -> Vec<Reference> {
     let mut links = Vec::new();
     let mut pos = 0;
@@ -129,6 +130,11 @@ pub fn parse_wikilinks(text: &str) -> Vec<Reference> {
         if inner.contains(['[', ']', '\n']) || inner.trim().is_empty() {
             // Not a valid link; resume scanning just after this `[`.
             pos = start + 1;
+            continue;
+        }
+        let name = inner.trim();
+        if name.starts_with("((") && name.ends_with("))") {
+            pos = end + 2;
             continue;
         }
         links.push(Reference {
