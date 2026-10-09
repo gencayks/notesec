@@ -48,7 +48,9 @@ use uuid::Uuid;
 /// Settings > AI and the Ask my notes panel (decision 42).
 mod ai_ui;
 mod mentions_ui;
-use ai_ui::{AiSettings, AskState, RelatedState, SavedUi, SemanticState, TagSuggestState};
+use ai_ui::{
+    AiSettings, AskState, ChatState, RelatedState, SavedUi, SemanticState, TagSuggestState,
+};
 use mentions_ui::MentionsState;
 mod appearance_ui;
 mod capture_ui;
@@ -138,6 +140,7 @@ actions!(
         CustomizeShortcuts,
         // AI (decisions 42-46), no default keys.
         AskMyNotes,
+        ToggleChat,
         SemanticSearch,
         SuggestTags,
         SaveSearch,
@@ -264,6 +267,7 @@ pub fn shortcuts() -> Vec<Shortcut> {
         s("ctrl-shift-z",   Redo,          None, Editing,    "Redo"),
         s("ctrl-y",         Redo,          None, Editing,    "Redo"),
         s("ctrl-g",         ToggleGraph,   None, View,       "Toggle graph view"),
+        s("ctrl-shift-a",   ToggleChat,    None, View,       "AI chat in the sidebar"),
         s("ctrl-shift-t",   ToggleTheme,   None, View,       "Switch theme"),
         // `=` and `+` share a key on US layouts; bind both so Ctrl-+ works
         // with or without Shift.
@@ -724,6 +728,8 @@ pub struct NoteSec {
     shortcuts_open: bool,
     /// The Ask my notes panel and its session history (decision 42).
     ask: AskState,
+    /// The AI sidebar chat and its session history (roadmap v0.3.0 feature 3).
+    chat: ChatState,
     /// The Semantic search overlay and the embedding cache (decision 43).
     semantic: SemanticState,
     /// Tag suggestions and Related pages (decision 44).
@@ -952,6 +958,7 @@ impl NoteSec {
             page_menu: None,
             shortcuts_open: false,
             ask: AskState::default(),
+            chat: ChatState::default(),
             semantic: SemanticState::default(),
             tag_suggest: TagSuggestState::default(),
             related: RelatedState::default(),
@@ -1069,6 +1076,7 @@ impl NoteSec {
                 &mut self.ask,
                 &mut self.semantic,
                 &mut self.saved,
+                &mut self.chat,
                 ai_input,
             )
             .unwrap_or(&mut self.editor),
@@ -4518,6 +4526,42 @@ fn table_grid(
         )
 }
 
+/// Link/tag/reference highlight styles for markdown text. The reading
+/// view's page renderer and the AI chat panel share them.
+fn markdown_styles(theme: Theme) -> (HighlightStyle, HighlightStyle, HighlightStyle) {
+    // Style for `[[wikilinks]]` in display mode: accent colour + underline.
+    let link_style = HighlightStyle {
+        color: Some(theme.accent.into()),
+        underline: Some(UnderlineStyle {
+            color: Some(theme.accent.into()),
+            thickness: px(1.0),
+            wavy: false,
+        }),
+        ..Default::default()
+    };
+
+    // Tags look like small chips: accent text on a subtle background.
+    let tag_style = HighlightStyle {
+        color: Some(theme.accent.into()),
+        background_color: Some(theme.selected_bg.into()),
+        ..Default::default()
+    };
+
+    // Block references show the referenced text on a faint accent wash
+    // with a wavy muted underline, so they read as quoted, not as your
+    // own words.
+    let ref_style = HighlightStyle {
+        background_color: Some(Hsla::from(theme.accent).opacity(0.10)),
+        underline: Some(UnderlineStyle {
+            color: Some(theme.muted.into()),
+            thickness: px(1.0),
+            wavy: true,
+        }),
+        ..Default::default()
+    };
+    (link_style, tag_style, ref_style)
+}
+
 /// Highlights for a block in reading view: link/tag styling with bold and
 /// italic on top. Heading and quote styling come from the row and still apply
 /// underneath (`StyledText::with_highlights` resolves against it).
@@ -6264,36 +6308,7 @@ impl NoteSec {
     ) -> PageView {
         let theme = self.theme;
         let font_size = self.ui_size();
-        // Style for `[[wikilinks]]` in display mode: accent colour + underline.
-        let link_style = HighlightStyle {
-            color: Some(theme.accent.into()),
-            underline: Some(UnderlineStyle {
-                color: Some(theme.accent.into()),
-                thickness: px(1.0),
-                wavy: false,
-            }),
-            ..Default::default()
-        };
-
-        // Tags look like small chips: accent text on a subtle background.
-        let tag_style = HighlightStyle {
-            color: Some(theme.accent.into()),
-            background_color: Some(theme.selected_bg.into()),
-            ..Default::default()
-        };
-
-        // Block references show the referenced text on a faint accent wash
-        // with a wavy muted underline, so they read as quoted, not as your
-        // own words.
-        let ref_style = HighlightStyle {
-            background_color: Some(Hsla::from(theme.accent).opacity(0.10)),
-            underline: Some(UnderlineStyle {
-                color: Some(theme.muted.into()),
-                thickness: px(1.0),
-                wavy: true,
-            }),
-            ..Default::default()
-        };
+        let (link_style, tag_style, ref_style) = markdown_styles(theme);
 
         let prefix = if focused { "" } else { OTHER_PANE };
         let page = &self.pages[page_ix];
@@ -8294,6 +8309,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_toggle_graph_journals))
             .on_action(cx.listener(Self::on_show_shortcuts))
             .on_action(cx.listener(Self::on_ask_my_notes))
+            .on_action(cx.listener(Self::on_toggle_chat))
             .on_action(cx.listener(Self::on_semantic_search))
             .on_action(cx.listener(Self::on_suggest_tags))
             .on_action(cx.listener(Self::on_save_search))
@@ -8317,6 +8333,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_whiteboard_delete))
             .child(sidebar)
             .child(content)
+            .children(self.render_chat_panel(cx))
             .children(status_toast)
             .children(self.render_vim_pill())
             .children(self.render_voice_pill(cx))

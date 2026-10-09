@@ -598,6 +598,41 @@ pub fn complete(endpoint: &Endpoint, model: &str, messages: Value) -> Result<Str
     Ok(answer)
 }
 
+/// Longest current-page markdown put into a chat prompt.
+pub const CHAT_PAGE_CHARS: usize = 12_000;
+
+/// A sidebar chat's messages (roadmap v0.3.0 feature 3): a short system
+/// prompt, the finished turns so far, the current page (if included) as
+/// context, then the new question.
+pub fn chat_messages(
+    history: &[(String, String)],
+    page: Option<(&str, &str)>,
+    question: &str,
+) -> Value {
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": "You are a helpful assistant inside the user's notes app. Answer concisely in markdown. \
+                    A page they are looking at may follow as context; use it when the question is about it.",
+    })];
+    for (q, a) in history {
+        messages.push(json!({"role": "user", "content": q}));
+        messages.push(json!({"role": "assistant", "content": a}));
+    }
+    if let Some((title, markdown)) = page {
+        let cut = markdown.chars().count() > CHAT_PAGE_CHARS;
+        let text: String = markdown.chars().take(CHAT_PAGE_CHARS).collect();
+        messages.push(json!({
+            "role": "system",
+            "content": format!(
+                "Current page \"{title}\":\n{text}{}",
+                if cut { "\n(truncated)" } else { "" },
+            ),
+        }));
+    }
+    messages.push(json!({"role": "user", "content": question}));
+    Value::Array(messages)
+}
+
 // --- Ask my notes -----------------------------------------------------------------
 
 /// How many blocks an answer gets as context.
@@ -1134,5 +1169,30 @@ mod tests {
             vec![2, 1]
         );
         assert_eq!(cited("no citations", 3), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn chat_messages_carry_history_page_and_question_in_order() {
+        let history = vec![("Hi".to_string(), "Hello.".to_string())];
+        let messages = chat_messages(&history, Some(("Test", "- hello")), "And?");
+        let roles: Vec<&str> = messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["system", "user", "assistant", "system", "user"]);
+        let page = messages[3]["content"].as_str().unwrap();
+        assert!(page.contains("Current page \"Test\"") && page.contains("- hello"));
+        assert_eq!(messages[4]["content"], json!("And?"));
+        // Without a page there is no context message.
+        let plain = chat_messages(&history, None, "And?");
+        assert_eq!(plain.as_array().unwrap().len(), 4);
+        // A long page is truncated, and says so.
+        let long = "x".repeat(CHAT_PAGE_CHARS + 10);
+        let cut = chat_messages(&[], Some(("Big", &long)), "Q?");
+        let context = cut[1]["content"].as_str().unwrap();
+        assert!(context.ends_with("\n(truncated)"));
+        assert!(context.len() < long.len() + 100);
     }
 }

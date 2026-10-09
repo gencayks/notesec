@@ -171,6 +171,7 @@ commands! {
     Quit => "Quit", ["exit", "close app"], Nothing;
     // AI (decisions 42-46)
     AskMyNotes => "Ask my notes", ["ai", "chat", "question", "llm", "assistant", "answer"], Nothing;
+    ToggleChat => "AI chat", ["ai", "chat", "sidebar", "assistant", "copilot", "conversation"], Nothing;
     SemanticSearch => "Semantic search", ["meaning", "similar", "embeddings", "ai search", "find by meaning"], Nothing;
     SuggestTags => "Suggest tags", ["auto tag", "tagging", "ai tags", "keywords", "label"], Page;
     SaveSearch => "Save search", ["smart folder", "saved search", "keep search", "bookmark search"], Nothing;

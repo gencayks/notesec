@@ -25,6 +25,10 @@ mod tags_ui;
 pub(super) use related_ui::RelatedState;
 pub(super) use tags_ui::TagSuggestState;
 
+/// AI sidebar chat (roadmap v0.3.0 feature 3): a persistent panel.
+mod chat_ui;
+pub(super) use chat_ui::ChatState;
+
 /// Saved searches: sidebar smart folders (decision 46).
 mod saved_ui;
 pub(super) use saved_ui::SavedUi;
@@ -145,6 +149,8 @@ pub(super) enum AiInput {
     Semantic,
     /// The "Save search" name field (decision 46).
     SaveName,
+    /// The sidebar chat's input (roadmap v0.3.0 feature 3).
+    Chat,
 }
 
 /// The AI editor that has the keyboard, if any, from the parts of
@@ -155,6 +161,7 @@ pub(super) fn ai_editor_mut<'a>(
     ask: &'a mut AskState,
     semantic: &'a mut SemanticState,
     saved: &'a mut SavedUi,
+    chat: &'a mut ChatState,
     input: Option<AiInput>,
 ) -> Option<&'a mut EditorState> {
     if let Some(SettingsState {
@@ -171,6 +178,7 @@ pub(super) fn ai_editor_mut<'a>(
         Some(AiInput::Ask) => Some(&mut ask.input),
         Some(AiInput::Semantic) => Some(&mut semantic.input),
         Some(AiInput::SaveName) => saved.prompt.as_mut().map(|p| &mut p.input),
+        Some(AiInput::Chat) => Some(&mut chat.input),
         None => None,
     }
 }
@@ -197,6 +205,11 @@ impl NoteSec {
             Some(AiInput::Ask)
         } else if self.semantic.open {
             Some(AiInput::Semantic)
+        } else if self.chat.open && self.editing.is_none() {
+            // A block being edited keeps the keyboard: the chat panel
+            // stays open beside it (unlike the modal Ask overlay, opening
+            // the chat doesn't stop editing).
+            Some(AiInput::Chat)
         } else {
             None
         }
@@ -220,6 +233,12 @@ impl NoteSec {
         }
     }
 
+    /// The sidebar chat panel, if open (`app.rs` docks it right of the
+    /// content, beside the page rather than over it).
+    pub(super) fn render_chat_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.chat.open.then(|| self.render_chat(cx))
+    }
+
     /// A Settings > AI field is being edited.
     pub(super) fn ai_settings_editing(&self) -> bool {
         self.settings.as_ref().is_some_and(|s| s.ai.field.is_some())
@@ -234,6 +253,7 @@ impl NoteSec {
             AiInput::Ask => Some(&self.ask.input),
             AiInput::Semantic => Some(&self.semantic.input),
             AiInput::SaveName => self.saved.prompt.as_ref().map(|p| &p.input),
+            AiInput::Chat => Some(&self.chat.input),
         }
     }
 
@@ -248,6 +268,7 @@ impl NoteSec {
             Some(AiInput::Ask) => self.ask_question(cx),
             Some(AiInput::Semantic) => self.semantic_enter(window, cx),
             Some(AiInput::SaveName) => self.confirm_save_prompt(cx),
+            Some(AiInput::Chat) => self.chat_send(cx),
             None => return false,
         }
         true
@@ -279,6 +300,7 @@ impl NoteSec {
                 self.saved.prompt = None;
                 cx.notify();
             }
+            Some(AiInput::Chat) => self.close_chat(cx),
             None => return false,
         }
         true
