@@ -1,4 +1,5 @@
 mod agenda;
+mod ai;
 mod app;
 mod assets;
 mod backup;

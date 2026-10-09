@@ -43,6 +43,10 @@ use std::ops::Range;
 use std::rc::Rc;
 use uuid::Uuid;
 
+/// Settings > AI and the Ask my notes panel (decision 42).
+mod ai_ui;
+use ai_ui::{AiSettings, AskState};
+
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace. Palette
 // commands (`commands.rs`) dispatch these too.
@@ -110,6 +114,8 @@ actions!(
         ToggleGraphJournals,
         ShowShortcuts,
         CustomizeShortcuts,
+        // AI (decision 42), no default keys.
+        AskMyNotes,
     ]
 );
 
@@ -434,6 +440,8 @@ struct SettingsState {
     hotkey_message: Option<HotkeyMessage>,
     /// Scroll position of the command list (tests bring rows into view).
     hotkey_scroll: ScrollHandle,
+    /// Settings > AI (decision 42): the field being edited, the model list.
+    ai: AiSettings,
 }
 
 /// The settings panel's sections (tab-like buttons at its top).
@@ -443,6 +451,8 @@ enum SettingsSection {
     General,
     /// Every command with its key, rebindable (decision 41).
     Shortcuts,
+    /// Provider, endpoint, models and API key (decision 42).
+    Ai,
 }
 
 /// A line under the Shortcuts list.
@@ -655,6 +665,8 @@ pub struct NoteSec {
     page_menu: Option<PageMenu>,
     /// True while the keyboard shortcuts dialog is open.
     shortcuts_open: bool,
+    /// The Ask my notes panel and its session history (decision 42).
+    ask: AskState,
     /// The pages in the trash, newest first (`Storage::list_trash`). Read
     /// at startup, when the trash tab is focused and after every change.
     trash: Vec<TrashEntry>,
@@ -833,6 +845,7 @@ impl NoteSec {
             settings: None,
             page_menu: None,
             shortcuts_open: false,
+            ask: AskState::default(),
             trash,
             trash_confirm: None,
             trash_error: None,
@@ -897,11 +910,12 @@ impl NoteSec {
                     ..
                 }),
             ) => editor,
-            _ => &self.editor,
+            _ => self.ai_editor().unwrap_or(&self.editor),
         }
     }
 
     fn active_editor_mut(&mut self) -> &mut EditorState {
+        let ask_active = self.ask_input_active();
         match (&mut self.search, &mut self.page_menu) {
             (Some(s), _) => &mut s.query,
             (
@@ -911,7 +925,8 @@ impl NoteSec {
                     ..
                 }),
             ) => editor,
-            _ => &mut self.editor,
+            _ => ai_ui::ai_editor_mut(&mut self.settings, &mut self.ask, ask_active)
+                .unwrap_or(&mut self.editor),
         }
     }
 
@@ -929,7 +944,7 @@ impl NoteSec {
     /// The palette's query box or the rename field has the keyboard (not a
     /// block): typing there records no undo history.
     fn text_input_open(&self) -> bool {
-        self.search.is_some() || self.renaming()
+        self.search.is_some() || self.renaming() || self.ai_editor().is_some()
     }
 
     // --- settings --------------------------------------------------------------
@@ -1159,6 +1174,7 @@ impl NoteSec {
             capture: None,
             hotkey_message: None,
             hotkey_scroll: ScrollHandle::new(),
+            ai: AiSettings::default(),
         });
         cx.notify();
     }
@@ -3263,6 +3279,9 @@ impl NoteSec {
             self.confirm_search(window, cx);
             return;
         }
+        if self.ai_enter(cx) {
+            return;
+        }
         if let Some(state) = &self.slash {
             if let Some(&kind) = self.slash_matches().get(state.menu.selected) {
                 self.apply_slash(kind, cx);
@@ -3811,6 +3830,8 @@ impl NoteSec {
             self.close_page_menu(cx);
         } else if self.shortcuts_open {
             self.close_shortcuts(cx);
+        } else if self.ai_escape(cx) {
+            // Cancelled a Settings > AI field, or closed the Ask panel.
         } else if self.settings.is_some() {
             self.close_settings(cx);
         } else if self.search.is_some() {
@@ -4907,10 +4928,21 @@ impl NoteSec {
                 .on_click(cx.listener(|this, _e, _window, cx| {
                     this.show_settings_section(SettingsSection::Shortcuts, cx)
                 })),
+            )
+            .child(
+                button(
+                    "settings-tab-ai",
+                    "AI".into(),
+                    section == SettingsSection::Ai,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::Ai, cx)
+                })),
             );
         let body = match section {
             SettingsSection::General => general.into_any_element(),
             SettingsSection::Shortcuts => self.render_hotkeys(state, cx),
+            SettingsSection::Ai => self.render_ai_settings(state, cx),
         };
 
         div()
@@ -7628,6 +7660,8 @@ impl Render for NoteSec {
 
         let shortcuts_overlay = self.shortcuts_open.then(|| self.render_shortcuts(cx));
 
+        let ask_overlay = self.ask.open.then(|| self.render_ask(cx));
+
         let trash_confirm_overlay = self
             .trash_confirm
             .as_ref()
@@ -7663,7 +7697,10 @@ impl Render for NoteSec {
 
         let is_editing = self.editing.is_some() || self.text_input_open();
         let shortcuts_open = self.shortcuts_open;
-        let settings_open = self.settings.is_some() && !shortcuts_open;
+        // While a Settings > AI field is edited it types, so the root takes
+        // "BlockEditor" (below) instead of "Settings".
+        let settings_open =
+            self.settings.is_some() && !shortcuts_open && !self.ai_settings_editing();
         let page_menu_open = self.page_menu.is_some() && !is_editing && !shortcuts_open;
         let trash_confirm_open = self.trash_confirm.is_some()
             && !is_editing
@@ -7755,9 +7792,12 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_fit_graph))
             .on_action(cx.listener(Self::on_toggle_graph_journals))
             .on_action(cx.listener(Self::on_show_shortcuts))
+            .on_action(cx.listener(Self::on_ask_my_notes))
             .child(sidebar)
             .child(content)
             .children(status_toast)
+            // Under the palette and dialogs, which can open over it.
+            .children(ask_overlay)
             .children(overlay)
             .children(settings_overlay)
             .children(page_menu_overlay)

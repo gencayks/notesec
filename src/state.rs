@@ -12,6 +12,12 @@
 //! Quit = ""                             # unbound
 //! ```
 //!
+//! It also holds the AI API key (`ai_api_key = "sk-…"`, decision 42) for
+//! Settings > AI's "API key" mode, **in plaintext**. Settings says so, and
+//! that git auto-backup (decision 39) commits this file to the graph's local
+//! repository when it is on. Keeping it here rather than in `config.toml`
+//! means the hand-edited settings file never carries a secret.
+//!
 //! This lives apart from `config.toml` on purpose: `recent` changes on every
 //! page you open, and rewriting the user's hand-edited settings file that
 //! often would be rude. Pages are identified by title; matching ignores case,
@@ -49,6 +55,24 @@ pub struct UiState {
         deserialize_with = "lenient_shortcuts"
     )]
     pub shortcuts: Overrides,
+    /// The API key for Settings > AI's "API key" mode (decision 42), in
+    /// plaintext. Empty (and then not written) unless the user pasted one.
+    /// Read leniently: anything but a string reads as no key.
+    #[serde(
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "lenient_string"
+    )]
+    pub ai_api_key: String,
+}
+
+/// A string, or empty for any other value (a hand-editing slip in one key
+/// must not cost the rest of the file).
+fn lenient_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default())
 }
 
 /// `[shortcuts]` read so a hand-editing slip there can't cost the rest of
@@ -110,7 +134,7 @@ impl UiState {
         let body = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let text = format!(
-            "# notesec UI state (favorites, recent pages, page order, custom keys)\n{body}"
+            "# notesec UI state (favorites, recent pages, page order, custom keys, AI API key in plaintext)\n{body}"
         );
         write_atomic(&Self::path(root), &text)
     }
@@ -228,6 +252,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+            ai_api_key: "sk-test-123".into(),
         };
         state.save(&dir).unwrap();
         assert_eq!(UiState::load(&dir), state);
@@ -269,6 +294,29 @@ mod tests {
         UiState::default().save(&dir).unwrap();
         let text = fs::read_to_string(UiState::path(&dir)).unwrap();
         assert!(!text.contains("[shortcuts]"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn api_key_is_optional_lenient_and_not_written_when_empty() {
+        let dir = temp_dir("apikey");
+        UiState::default().save(&dir).unwrap();
+        let text = fs::read_to_string(UiState::path(&dir)).unwrap();
+        assert!(!text.contains("ai_api_key"));
+        fs::write(
+            UiState::path(&dir),
+            "favorites = [\"A\"]\nai_api_key = 42\n",
+        )
+        .unwrap();
+        let state = UiState::load(&dir);
+        assert_eq!(
+            state.favorites,
+            titles(&["A"]),
+            "a bad key costs nothing else"
+        );
+        assert_eq!(state.ai_api_key, "");
+        fs::write(UiState::path(&dir), "ai_api_key = \" sk-x \"\n").unwrap();
+        assert_eq!(UiState::load(&dir).ai_api_key, "sk-x");
         let _ = fs::remove_dir_all(dir);
     }
 

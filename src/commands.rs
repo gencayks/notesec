@@ -150,6 +150,8 @@ commands! {
     ShowShortcuts => "Keyboard shortcuts", ["keys", "keymap", "cheatsheet", "help"], Nothing;
     CustomizeShortcuts => "Change keyboard shortcuts", ["customize", "rebind", "hotkeys", "key bindings", "remap"], Nothing;
     Quit => "Quit", ["exit", "close app"], Nothing;
+    // AI (decision 42)
+    AskMyNotes => "Ask my notes", ["ai", "chat", "question", "llm", "assistant", "answer"], Nothing;
 }
 
 /// A binding's keys as people write them: `Ctrl+Shift+T`, `Ctrl+=`,

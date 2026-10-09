@@ -5,13 +5,25 @@
 //! font_size = 16.0
 //! font_family = "Inter"   # optional; omit to use the system UI font
 //! git_backup = false      # commit the graph folder to local git (decision 39)
+//! # AI (decision 42). The mode is always the user's explicit choice:
+//! ai_provider = "local"    # "local" (default), "api" or "off"; never falls back
+//! ai_endpoint = "http://localhost:1234/v1"  # Local: loopback http only
+//! ai_model = ""            # Local chat model; empty picks the server's first one
+//! ai_embedding_model = ""  # embedding model; empty uses the chat model
+//! ai_api_base = "https://api.openai.com/v1"  # API key mode: https base URL
+//! ai_api_model = ""        # API key mode: model id (required by most providers)
 //! ```
+//!
+//! The API key itself is NOT stored here: it lives in `state.toml` as
+//! `ai_api_key` (plaintext; see `state.rs`), so this hand-edited settings
+//! file can be shared or committed without leaking it.
 //!
 //! The file is read once at startup. The app rewrites it when you change the
 //! theme, font size or font family (in the settings panel, via shortcuts, or
 //! from the Ctrl-K palette), so hand edits to other keys survive only if they
 //! are valid ones we know about.
 
+use crate::ai::AiProvider;
 use crate::storage::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -50,7 +62,25 @@ pub struct Config {
     /// Git auto-backup (`backup.rs`): commit the graph folder to a local
     /// git repository after changes. Off unless the user turns it on.
     pub git_backup: bool,
+    /// Which AI backend is active (decision 42): Local (default), API key
+    /// or Off. Never changes on its own.
+    pub ai_provider: AiProvider,
+    /// Local mode: the server's OpenAI-compatible API (`ai.rs`); only
+    /// loopback addresses are accepted.
+    pub ai_endpoint: String,
+    /// Local mode: the chat model's id; empty means the server's first
+    /// chat model.
+    pub ai_model: String,
+    /// The embedding model's id; empty means use the chat model.
+    pub ai_embedding_model: String,
+    /// API key mode: the provider's https base URL.
+    pub ai_api_base: String,
+    /// API key mode: the model id.
+    pub ai_api_model: String,
 }
+
+/// OpenAI's API, the most common OpenAI-compatible base URL.
+pub const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
 
 impl Default for Config {
     fn default() -> Self {
@@ -59,6 +89,12 @@ impl Default for Config {
             font_size: DEFAULT_FONT_SIZE,
             font_family: None,
             git_backup: false,
+            ai_provider: AiProvider::default(),
+            ai_endpoint: crate::ai::DEFAULT_ENDPOINT.to_string(),
+            ai_model: String::new(),
+            ai_embedding_model: String::new(),
+            ai_api_base: DEFAULT_API_BASE.to_string(),
+            ai_api_model: String::new(),
         }
     }
 }
@@ -102,6 +138,21 @@ impl Config {
             .is_some_and(|f| f.trim().is_empty())
         {
             self.font_family = None;
+        }
+        for field in [
+            &mut self.ai_endpoint,
+            &mut self.ai_model,
+            &mut self.ai_embedding_model,
+            &mut self.ai_api_base,
+            &mut self.ai_api_model,
+        ] {
+            *field = field.trim().to_string();
+        }
+        if self.ai_endpoint.is_empty() {
+            self.ai_endpoint = crate::ai::DEFAULT_ENDPOINT.to_string();
+        }
+        if self.ai_api_base.is_empty() {
+            self.ai_api_base = DEFAULT_API_BASE.to_string();
         }
         self
     }
@@ -158,6 +209,12 @@ mod tests {
             font_size: 20.0,
             font_family: Some("Inter".into()),
             git_backup: true,
+            ai_provider: AiProvider::Api,
+            ai_endpoint: "http://127.0.0.1:8080/v1".into(),
+            ai_model: "qwen2.5-7b".into(),
+            ai_embedding_model: "nomic-embed-text".into(),
+            ai_api_base: "https://api.x.ai/v1".into(),
+            ai_api_model: "grok-4".into(),
         };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), config);
@@ -184,6 +241,36 @@ mod tests {
         assert_eq!(c.theme, ThemeKind::Light);
         assert_eq!(c.font_size, DEFAULT_FONT_SIZE);
         assert!(!c.git_backup, "backup is off unless turned on");
+        assert_eq!(c.ai_endpoint, crate::ai::DEFAULT_ENDPOINT);
+        assert_eq!(c.ai_model, "");
+        assert_eq!(
+            c.ai_provider,
+            AiProvider::Local,
+            "local is the default mode"
+        );
+        assert_eq!(c.ai_api_base, DEFAULT_API_BASE);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ai_provider_reads_each_mode_and_never_holds_the_key() {
+        let dir = temp_dir("provider");
+        for (text, mode) in [
+            ("local", AiProvider::Local),
+            ("api", AiProvider::Api),
+            ("off", AiProvider::Off),
+        ] {
+            fs::write(Config::path(&dir), format!("ai_provider = \"{text}\"\n")).unwrap();
+            assert_eq!(Config::load(&dir).ai_provider, mode);
+        }
+        let config = Config {
+            ai_provider: AiProvider::Off,
+            ..Config::default()
+        };
+        config.save(&dir).unwrap();
+        let text = fs::read_to_string(Config::path(&dir)).unwrap();
+        assert!(text.contains("ai_provider = \"off\""));
+        assert!(!text.contains("key"), "the API key lives in state.toml");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -200,6 +287,14 @@ mod tests {
         let c = Config::load(&dir);
         assert_eq!(c.font_size, MAX_FONT_SIZE);
         assert_eq!(c.font_family, None);
+        fs::write(
+            Config::path(&dir),
+            "ai_endpoint = \" \"\nai_model = \" m \"\n",
+        )
+        .unwrap();
+        let c = Config::load(&dir);
+        assert_eq!(c.ai_endpoint, crate::ai::DEFAULT_ENDPOINT);
+        assert_eq!(c.ai_model, "m");
         let _ = fs::remove_dir_all(dir);
     }
 
