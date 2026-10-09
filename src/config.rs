@@ -13,6 +13,15 @@
 //! ai_api_base = "https://api.openai.com/v1"  # API key mode: https base URL
 //! ai_api_model = ""        # API key mode: model id (required by most providers)
 //! ai_api_embedding_model = ""  # API key mode embeddings; empty: ai_api_model
+//! vim_mode = false        # vim keybindings in the block editor (decision 48)
+//! web_clipper = false     # the local web clipper endpoint (decision 51)
+//! clipper_port = 27183    # its port on 127.0.0.1 (1024-65535)
+//! # Voice notes (decision 52, docs/VOICE_NOTES.md):
+//! voice_recorder = []      # e.g. ["arecord", "-D", "hw:1", "-f", "S16_LE", "-r", "16000", "-c", "1", "{file}"]
+//! whisper_binary = ""      # whisper.cpp's whisper-cli; empty: no transcription
+//! whisper_model = ""       # a ggml model file, e.g. ggml-base.bin
+//! whisper_language = "auto"
+//! voice_auto_transcribe = false
 //! ```
 //!
 //! The API key itself is NOT stored here: it lives in `state.toml` as
@@ -82,6 +91,29 @@ pub struct Config {
     /// API key mode: the embedding model's id; empty means `ai_api_model`.
     /// Separate from Local's: model names differ between servers.
     pub ai_api_embedding_model: String,
+    /// Vim keybindings in the block editor (`vim.rs`, decision 48). Off
+    /// unless the user turns it on.
+    pub vim_mode: bool,
+    /// The web clipper (`clipper/`, decision 51): an HTTP endpoint on
+    /// 127.0.0.1. Off unless the user turns it on.
+    pub web_clipper: bool,
+    /// Its port. Out of 1024-65535 reads as the default.
+    pub clipper_port: u16,
+    /// A recorder command (program, then arguments; `{file}` for the WAV
+    /// to write) instead of the detected one. Empty: detect.
+    pub voice_recorder: Vec<String>,
+    /// whisper.cpp's program, for local transcription. Empty: none.
+    pub whisper_binary: String,
+    /// Its model file.
+    pub whisper_model: String,
+    /// `auto` or a language code (`en`, `de`…).
+    pub whisper_language: String,
+    /// Transcribe each new voice note when it's recorded.
+    pub voice_auto_transcribe: bool,
+    /// Enabled plugins: id -> hash of the `plugin.wasm` that was enabled
+    /// (decision 55). Plugins not listed, or whose binary changed, are off.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plugins: std::collections::BTreeMap<String, String>,
 }
 
 /// OpenAI's API, the most common OpenAI-compatible base URL.
@@ -101,6 +133,15 @@ impl Default for Config {
             ai_api_base: DEFAULT_API_BASE.to_string(),
             ai_api_model: String::new(),
             ai_api_embedding_model: String::new(),
+            vim_mode: false,
+            web_clipper: false,
+            clipper_port: crate::clipper::DEFAULT_PORT,
+            voice_recorder: Vec::new(),
+            whisper_binary: String::new(),
+            whisper_model: String::new(),
+            whisper_language: "auto".into(),
+            voice_auto_transcribe: false,
+            plugins: Default::default(),
         }
     }
 }
@@ -137,6 +178,10 @@ impl Config {
     /// `1e9` must not make the UI unusable).
     fn sanitized(mut self) -> Self {
         self.font_size = self.clamp_size(self.font_size);
+        if self.clipper_port < 1024 {
+            self.clipper_port = crate::clipper::DEFAULT_PORT;
+        }
+        self.whisper_language = crate::voice::whisper::language(&self.whisper_language);
         // An empty family name means "unset".
         if self
             .font_family
@@ -202,6 +247,17 @@ mod tests {
     }
 
     #[test]
+    fn vim_mode_is_off_unless_the_file_says_so() {
+        assert!(!Config::default().vim_mode);
+        let dir = temp_dir("vim");
+        fs::write(Config::path(&dir), "theme = \"light\"\n").unwrap();
+        assert!(!Config::load(&dir).vim_mode);
+        fs::write(Config::path(&dir), "vim_mode = true\n").unwrap();
+        assert!(Config::load(&dir).vim_mode);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn missing_file_gives_defaults() {
         let dir = temp_dir("missing");
         assert_eq!(Config::load(&dir), Config::default());
@@ -223,11 +279,32 @@ mod tests {
             ai_api_base: "https://api.x.ai/v1".into(),
             ai_api_model: "grok-4".into(),
             ai_api_embedding_model: "text-embedding-3-small".into(),
+            vim_mode: true,
+            web_clipper: true,
+            clipper_port: 31337,
+            voice_recorder: vec!["rec".into(), "{file}".into()],
+            whisper_binary: "/usr/bin/whisper-cli".into(),
+            whisper_model: "/m/ggml-base.bin".into(),
+            whisper_language: "de".into(),
+            voice_auto_transcribe: true,
+            plugins: [("word-count".to_string(), "ab12".to_string())].into(),
         };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), config);
         // No temp file left behind by the atomic write.
         assert!(!dir.join(".config.toml.tmp").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_privileged_or_zero_clipper_port_reads_as_the_default() {
+        let dir = temp_dir("clipper-port");
+        for bad in ["clipper_port = 0", "clipper_port = 80"] {
+            fs::write(dir.join("config.toml"), bad).unwrap();
+            let config = Config::load(&dir);
+            assert_eq!(config.clipper_port, crate::clipper::DEFAULT_PORT);
+            assert!(!config.web_clipper);
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

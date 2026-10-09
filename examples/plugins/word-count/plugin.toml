@@ -1,0 +1,12 @@
+id = "word-count"
+name = "Word count"
+version = "1.0.0"
+api_version = 1
+description = "Counts the words of the current block: a command, and {{word-count}} in a block."
+
+[[commands]]
+id = "count"
+label = "Count words in this block"
+
+[render]
+macro = "word-count"

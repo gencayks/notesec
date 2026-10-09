@@ -19,6 +19,24 @@ tabs.rs        — open tabs: open/focus/close/cycle rules (NO ui code here)
 export.rs      — a page as one self-contained HTML string (NO ui code here)
 backup.rs      — git auto-backup: runs the `git` program (NO ui code here)
 hotkeys.rs     — custom keys: overrides on top of the default keymap (NO ui code)
+embed.rs       — live embeds: parse ![[page]] / block embeds, resolve (NO ui code)
+app/embed_ui.rs — the reading view's embed boxes (a submodule of app.rs)
+vim.rs         — vim mode's pure state machine: modes, motions, operators, counts, register, `:` line (NO ui code)
+app/vim_ui.rs  — vim keys into the editor, block-level effects, mode pill, Settings row (a submodule of app.rs)
+publish.rs     — publish a page as a static site folder: render, privacy, slugs, bundle files (no GPUI)
+app/publish_ui.rs — the Publish commands and the status buttons (a submodule of app.rs)
+import/        — import Obsidian, Logseq and Notion exports: walk, convert, plan, apply; CSV reader (no GPUI)
+app/import_ui.rs — the Import commands, folder picker, name-clash dialog (a submodule of app.rs)
+clipper/       — web clipper: localhost HTTP listener, request checks, HTML → outline, token (no GPUI)
+app/clipper_ui.rs — the clipper's Settings section, saving clips, the Clipped status (a submodule of app.rs)
+voice/         — voice notes: find and run a recorder, WAV check/repair, whisper.cpp transcription (no GPUI)
+app/voice_ui.rs — recording pill, note and transcript blocks, Play/Transcribe, Settings > Voice notes (a submodule of app.rs)
+whiteboard/    — whiteboards: cards/edges from a page's blocks, edits, view maths, hit testing (no GPUI)
+app/whiteboard_ui.rs — the whiteboard canvas: drawing, mouse/zoom, card editing, commands (a submodule of app.rs)
+vault/         — encrypted vault export/import: archive, Argon2id + chunked XChaCha20-Poly1305 (no GPUI)
+app/vault_ui.rs — the vault commands, masked passphrase dialog, pickers (a submodule of app.rs)
+plugins/       — WASM plugins: manifests, wasmi sandbox (fuel, memory cap), TOML in/out (no GPUI)
+app/plugins_ui.rs — Settings > Plugins, palette entries, applying actions, render-hook boxes (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1112,7 +1130,8 @@ that mutate, and data races are essentially impossible.
     picks up edits made while the app was closed): `backup::prepare`
     finds the repository (`rev-parse --show-toplevel`) or runs `git init`
     in the graph folder, then appends to the graph's `.gitignore` the
-    lines it lacks among `.trash/`, `exports/` and `.*.tmp` (the temp
+    lines it lacks among `.trash/`, `exports/`, `published/` (decision
+    49) and `.*.tmp` (the temp
     files of atomic saves) under a `# notesec: not backed up` comment.
     The user's own lines are never changed or reordered, and `/.trash`
     or `.trash` counts as present. Then everything is committed at once.
@@ -1365,10 +1384,9 @@ that mutate, and data races are essentially impossible.
     *The key* lives in `state.toml` as `ai_api_key` (not in the
     hand-edited `config.toml`), **in plaintext**, skipped when empty and
     read leniently (a non-string reads as no key without costing the
-    rest of the file). Settings says so next to the field, and that git
-    auto-backup (decision 39) commits `state.toml` to the graph's local
-    repository when it is on (`IGNORED` stays as it is: favorites and
-    custom keys should be backed up). The field is masked ("•••••••• (set)")
+    rest of the file). Settings says so next to the field. Git auto-backup
+    deliberately does not track `state.toml`, and encrypted vault exports
+    strip the key. The field is masked ("•••••••• (set)")
     and starts empty when edited, so the stored key is never drawn;
     "Remove key" clears it. Errors are built from our own wording only
     (`map_transport` never forwards ureq's text), so a key can't appear
@@ -1659,6 +1677,580 @@ that mutate, and data races are essentially impossible.
     - `.children(self.save_search_button(SearchKind::Global, cx))` under
       the global search heading
     - `SearchKind` in the `crate::state` import
+
+47. **Live embeds: `![[Page]]` and `![[((id))]]` show the source inline.**
+    *Syntax* (`embed::parse_embeds`): `![[Page name]]` embeds a whole
+    page, `![[((block-uuid))]]` a block with its children, and Logseq's
+    own `{{embed [[Page]]}}` / `{{embed ((uuid))}}` mean the same (an
+    imported Logseq graph uses them; "embed" in any case, spaces free).
+    Embeds inside fenced code are code. A malformed one (empty name, bad
+    uuid) is just text. A page name resolves exactly like a link
+    (`resolve_page`: title in any case, then aliases), so `![[JS]]`
+    embeds JavaScript. *What it is underneath:* the `[[Page]]` of a page
+    embed is an ordinary wikilink and the `((id))` of a block embed an
+    ordinary block reference, so with no extra code "Linked from" counts
+    embeds (as Logseq does), saving creates a missing embedded page like
+    any link target, the embedded block's `id::` is saved, and `[[`
+    after `!` opens the page picker and inserts the canonical title.
+    `parse_wikilinks` skips a `[[((uuid))]]` inner (it names a block, not
+    a page "((uuid))"). The graph adds an edge for a block embed to the
+    block's page (`graph::build`); page embeds were edges already.
+    *Live:* `embed::Resolver` reads the pages in memory each frame (and
+    the editor's unsaved text for the block being edited), so a change to
+    the source shows in every embed at once, also in the other split pane
+    while typing. Nothing is copied into the embedding page's file.
+    *Read-only:* the box shows the source's title (click: open the page)
+    and its blocks as an indented outline (click a block: open its page
+    and edit it there, `open_block_ref`). Editing in place would need a
+    second editor per embed and make "which block is being edited"
+    ambiguous across panes; one click to the real block is cheap. The
+    embedding block keeps its own text visible above the box (like
+    `{{query}}`), so a click on the text edits the embed itself. All
+    blocks of the source are shown: folding is a per-page view setting
+    and isn't carried into embeds. *Guards* (one resolver for the app and
+    the export): an embed of something already being shown further out
+    (a page embedding itself, A → B → A, a block inside itself) is drawn
+    once and then "Circular embed of “A”"; nesting stops after
+    `MAX_EMBED_DEPTH` = 4 levels with "Embeds nested more than 4 deep are
+    not shown"; a missing target says "Page “X” not found" / "Block not
+    found". A trashed page is not in `pages`, so it is missing. *Export*
+    (`export::page_html_with_embeds`) draws the same tree inline in a
+    bordered `.embed` box, notes as `.embed-note`. *Search and agenda*
+    read only the pages' own text, so embedded content is found (and a
+    task listed) once, on its source page. Block references to blocks
+    shown inside an embed resolve as always (by id).
+
+48. **Vim mode: normal/insert/visual editing behind a Settings toggle.**
+    Off by default (`vim_mode` in `config.toml`); Settings > General >
+    Editor > "Vim keybindings" (Off / On), or the palette's "Toggle vim
+    mode" (`ToggleVimMode`, no default key, rebindable in Shortcuts like
+    every command). With it off nothing below runs. *Split:* `vim.rs` is
+    a pure state machine over the editor's `EditorState` (text, cursor,
+    selection): it moves and edits within the block itself and returns an
+    `Effect` for what needs the outline or the app (other blocks, undo,
+    save, stop). `app/vim_ui.rs` feeds it keys and applies the effects;
+    `app.rs` has one-line hooks. *How keys arrive:* through the keystroke
+    interceptor, like hotkey capture (decision 41), because it runs before
+    the keymap AND before text input; a handled key calls
+    `stop_propagation`, so it neither fires a binding nor types. In Normal
+    and Visual mode the text-input handler also drops text (an IME commit
+    can arrive without a key-down), and the `[[` picker doesn't open.
+    *Which keys vim takes:* only while a block is being edited, and never
+    while the rename field, search, the palette, Settings (incl. key
+    capture), the Shortcuts sheet, a page menu or a trash confirmation is
+    open (and any later text input that sets `text_input_open`). In Insert
+    mode only Esc, and not while the slash menu, the `[[` picker or IME
+    composition is open (Esc closes those first, as without vim). Ctrl /
+    Alt / Super keys pass through to the app's shortcuts (Ctrl+K opens
+    the palette from Normal mode), except Ctrl-R (redo); arrows and Tab
+    pass too (Tab indents). Vim's own keys are fixed, not rebindable: a
+    modal grammar of operators, counts and motions doesn't fit a
+    one-key-per-command table (`d2w`, `3dd`). *Modes:* clicking a block (or any start of
+    editing) begins in Normal mode, as vim opens a file; a mouse
+    selection becomes Visual. `i a I A o O`, `c…`, `s` enter Insert; Esc
+    goes back (cursor one left, as vim); Esc in Normal clears a pending
+    command, else stops editing. j/k keep the current mode; Enter and
+    Up/Down in Insert stay in Insert (the app's own keys).
+    *The block is the line* for linewise commands: `dd`/`yy` take the
+    block with its children (a count takes that many sibling subtrees,
+    never climbing to a parent); `p` pastes them after the block's
+    subtree (replacing an empty childless block, like paste), `P` before
+    it; `o`/`O` open a block below/above; `>>`/`<<` indent/outdent; `cc`
+    clears the text. Deleting the last block leaves one empty block. j/k
+    move over the block's own lines (not wrapped rows), then into the
+    previous/next visible block keeping the column; gg/G go to the
+    first/last visible block. Within a block: h l w b e 0 ^ $, x X dw d$
+    D cw C s S, yw y$, r, ~, counts, v (characterwise, inclusive) and V
+    (the block). Graphemes are never split. *Register:* one internal
+    register, text or blocks; not the system clipboard (Ctrl+C/V still
+    are). *Undo:* each Normal-mode change is one step of the app's undo;
+    `u`/Ctrl-R are its undo/redo. *`:` line:* `:w` saves now and says
+    "Saved “Title”", `:q` stops editing, `:wq`/`:x` both, anything else
+    "Not an editor command: …" as an error status. *Indicator:* a pill at
+    the bottom left shows the mode and pending keys (`NORMAL  2d`) or the
+    `:` line being typed. Split panes share the one editor, so one vim.
+
+49. **Publish: a page as a self-contained static site in `published/`.**
+    The app doesn't host anything: "Publish page" (`PublishPage`) writes
+    a folder the user puts on any static host (GitHub Pages, Netlify
+    Drop, `python3 -m http.server`), and that folder is the "link". Like
+    Export, both commands need a page on screen (hidden on the graph,
+    trash and agenda tabs) and have no default key. *Layout*
+    (`publish.rs`): `<graph>/published/<slug>/` holds `index.html` (the
+    page), `<slug>.html` per linked page, `style.css` (the export's
+    stylesheet), `assets/<name>` (each image the pages show, once, cleaned
+    of metadata; real files rather than the export's base64: lighter and
+    cacheable on a host), `README.txt` (how to host it) and `.notesec-bundle` (the
+    manifest: the page's title and the files the app wrote). *Rendering*
+    is the HTML exporter (`export::document`, which `page_html_with_embeds`
+    now calls too): the same outline, embeds inline (decision 47), block
+    references resolved, no scripts, nothing from elsewhere. The CSP is
+    `default-src 'none'; img-src 'self'; style-src 'self'` (checked in
+    Chrome: the stylesheet and images load from disk and over http), so
+    table alignment became classes instead of inline `style=` (in exports
+    too). *Linked pages:* "Publish page with linked pages"
+    (`PublishPageWithLinks`) adds the pages the page links to one hop away
+    (`[[links]]` and `#tags` in its own blocks): existing, not journals
+    (a diary is published only on purpose, as the page itself), not
+    private. Links between published pages become relative
+    `<a href="beta.html">` (and back to `index.html`); links to anything
+    else stay styled text, as in an export. A linked page named "Index"
+    gets `index-2.html`. *Private pages:* `public:: false` or
+    `private:: true` among a page's properties (its first block, keys and
+    values in any case) means never published: publishing it is refused
+    with an error status (nothing written); it is left out as a linked
+    page; an embed of it (or of a block on it) shows "Private page, not
+    published"; a block reference to one of its blocks stays `((uuid))`.
+    *Properties:* every `key:: value` line (outside code) is left out of
+    the published pages: `alias::`, `tags::`, `public::` are metadata,
+    and a block holding only properties (the page properties) disappears
+    unless it has children. `id::` lines never reach a block's content.
+    *Privacy:* the bundle contains only the files above. `state.toml`
+    (with the AI key), `config.toml`, `.trash` and the pages' markdown
+    are never read for it; images are copied only from inside the graph,
+    not from hidden folders (`.trash`), `exports/` or `published/` (else
+    "Image not published"), and an image's note shows only its file name,
+    never a local path. *Image metadata* (`publish::clean_image`): every
+    image is decoded and re-encoded from its pixels, so no EXIF (camera,
+    time, GPS position), XMP, IPTC, ICC profile or text chunk survives;
+    the `image` crate's encoders write metadata only when given it
+    (`set_exif_metadata` / `set_icc_profile`, never called), checked in
+    its 0.25 source. The format is read from the bytes. An EXIF
+    orientation (`ImageDecoder::orientation`) is applied to the pixels
+    first (`DynamicImage::apply_orientation`), so photos stand the right
+    way up without the tag. Per format: JPEG stays JPEG at quality 90;
+    PNG stays PNG, lossless; WebP stays WebP, re-encoded lossless (the
+    crate has no lossy WebP encoder, so files can grow; an animated WebP
+    keeps its first frame); an animated GIF stays a GIF (frames and
+    delays kept, looping forever), a one-frame GIF becomes PNG; BMP and
+    TIFF become PNG (TIFF tags carry EXIF and browsers mostly can't show
+    TIFF). A renamed file (`scan.bmp` → `assets/scan.png`) is referenced
+    by its new name. A file that doesn't decode is not published (note
+    "Image not published"): copying it could carry the very metadata
+    this removes. SVG never gets here (the exporter shows it as "Not an
+    image": it could carry scripts). *Off the UI thread:* publishing
+    (rendering, re-encoding photos, writing) runs on a background thread
+    over a copy of the pages, with "Publishing “Page”…" meanwhile; a
+    second publish while one runs is refused with a status. *Slug:*
+    lowercase ASCII from the title (accents folded, `ß` → `ss`, other
+    runs → one hyphen, at most 60 bytes; "page" when nothing is left,
+    e.g. a title in another script), made unique among the published
+    folders with `-2`, `-3`. A page finds its own folder again through
+    the manifest's title, so republishing reuses it; a folder without our
+    manifest (or another page's) is never written into. Renaming a page
+    publishes to a new folder; the old one stays until deleted.
+    *Republishing* rewrites the bundle's files and deletes those the
+    previous manifest listed that aren't needed any more (a removed
+    image, a page no longer linked), and an emptied `assets/`. Files the
+    user added (a `CNAME`) stay. Paths are checked: a manifest entry with
+    `..` or an absolute path is ignored, a folder inside the bundle that
+    is a symbolic link is never written through or deleted from, and a
+    file that is a link is replaced, not written through. *Afterwards*
+    the status says "Published “Page” (and N linked pages) to <folder>"
+    with "Open folder" (`App::open_with_system`) and "Copy path" buttons,
+    shown while that status is. `published/` is not backed up (decision
+    39's `IGNORED`) and never loaded as pages (only `pages/` and
+    `journals/` are).
+
+50. **Import: Obsidian vaults, Logseq graphs and Notion exports.**
+    "Import from Obsidian…", "Import from Logseq…" and "Import from
+    Notion…" (`ImportObsidian`, `ImportLogseq`, `ImportNotion`; no key,
+    any tab) ask for a folder (`App::prompt_for_paths`, directories
+    only) and bring its notes into this graph as pages, links kept.
+    *Split:* `import/` is pure (no GPUI) and tested on fixture trees in
+    temp folders: `walk.rs` (which files), `markdown.rs` (paragraphs →
+    blocks, frontmatter → properties, link rewriting), `csv.rs`, one
+    reader per source, and `mod.rs` with the two steps; `app/import_ui.rs`
+    is the commands and the dialog. *Two steps:* `import::plan` reads and
+    converts everything and finds the names already taken, writing
+    nothing; `import::apply` writes. Both run on a background thread
+    ("Reading <folder>…", "Importing N pages from X…"); a second import
+    while one runs is refused with a status. *Never overwrites:* when
+    imported titles are taken (pages or aliases, any case) a dialog asks:
+    **Rename with suffix** (the default button: "T (imported)", then
+    "T (imported 2)"; links among the imported pages follow the new
+    name; a taken journal day comes in as the page "2026-10-09
+    (imported)"), **Skip them** (links to them then reach the existing
+    page), or **Cancel** (nothing written). No dialog when nothing
+    clashes. The dialog is modal like the others: vim keys, typing and
+    the tab keys don't reach the page behind it (`vim_applies`,
+    `overlay_open`, the text input handler), Escape cancels, and a block
+    opened while the export was being read is closed (saved) when it
+    appears. A file that exists on disk anyway is skipped, never
+    replaced; pages are written atomically (`write_atomic`). *Titles:*
+    a note's file name, flat; a folder only shows when two notes share
+    a name ("Work/Plan" next to "Plan"; the nearest the root keeps the
+    plain name, as Obsidian resolves `[[Plan]]`). Titles are cleaned for
+    our files (no `___` or control characters, at most 150 bytes,
+    "Untitled" when empty) and made unique among the imported ones.
+    *Tags and aliases* go in the first block in the same form as the AI tag
+    suggestions (decision 44): `tags:: #x, #[[y z]]` and `alias:: A, B`,
+    so chips and the tag index see them; each page also gets
+    `imported-from:: [[Import from X <date time>]]` there. *Rollback
+    aid:* that log page lists every page imported, renamed and skipped
+    file with its reason, the number of assets copied and the links to
+    pages that don't exist; its "Linked from" lists the same pages. There
+    is no bulk undo: delete pages from the list (they go to the trash).
+    *Assets* are copied into `<graph>/assets/` (decision 28) under sanitised unique
+    names (`photo-2.png` beside an existing `photo.png`) and links are
+    rewritten to `../assets/<name>` (images as `![…]`, other files as
+    links); only attachments a note uses are copied, except Logseq, whose
+    whole `assets/` folder comes. *Safety:* hidden folders (`.obsidian`,
+    `.trash`, `.git`…), `logseq/`, `bak/`, `node_modules`,
+    `version-files`, `__MACOSX` are skipped; a symbolic link is followed
+    only when it points inside the chosen folder (each folder once);
+    notes over 5 MB, attachments over 50 MB and files that aren't UTF-8
+    are skipped with a reason; at most 50,000 files; the graph itself,
+    a folder inside it or one containing it are refused, as is a file
+    (a `.zip`: "unzip the export first": there is no zip reader among
+    our crates, and we add none). After loading, history is cleared
+    (as after a restore, decision 37) and git backup sees the change.
+    *Block ids are never duplicated:* `apply` collects the ids already
+    in the graph (the loaded pages' saved ids, plus every `id::` in the
+    files of `pages/`, `journals/` and `.trash/`, whose pages can be
+    restored). An imported block whose id is among them gets a fresh
+    uuid, and every `((old))` in the imported pages (also inside
+    `![[((old))]]`) is rewritten to it through a remap table kept for
+    this import only, so the import's own references reach its copy. The
+    graph's pages are not touched: their `((old))` still reach the
+    original. An id that appears twice within the import is kept by the
+    first block (references reach it) and the others get fresh ids. The
+    log page says how many blocks got new ids and how many ids were
+    remapped (importing the same Logseq graph twice with Rename: every
+    `id::` block of the second copy).
+
+    Obsidian (`import/obsidian.rs`):
+
+    | Obsidian | notesec |
+    |---|---|
+    | `Folder/Note.md` | page "Note" ("Folder/Note" on a duplicate name) |
+    | YAML frontmatter `tags`, `aliases`/`alias` | first block `tags:: #a, #[[b c]]`, `alias:: …` |
+    | other frontmatter keys | `key:: value` (lists joined with commas; `title` dropped) |
+    | `# Heading` + paragraphs | a heading block with the paragraphs as children (levels > 3 → `###`) |
+    | lists, `- [ ]` / `- [x]` | nested blocks, `TODO` / `DONE` |
+    | fenced code | one block |
+    | `[[Note]]`, `[[Note\|alias]]`, `[[Note#Heading]]` | `[[Note]]` (label and anchor dropped) |
+    | `![[Note]]` | `![[Note]]` (live embed, decision 47) |
+    | `![[pic.png]]`, `![[pic.png\|300]]`, `[x](file.pdf)` | copied to assets, `![pic.png](../assets/pic.png)` |
+    | `[x](Other%20Note.md)` | `[[Other Note]]` |
+    | `[[#Heading]]` | plain text |
+    | daily note `2026-10-09.md` | journal |
+
+    Logseq (`import/logseq.rs`): needs `pages/` or `journals/`.
+
+    | Logseq | notesec |
+    |---|---|
+    | `pages/a___b.md`, `a%2Fb.md` | page "a/b" |
+    | `journals/2026_10_09.md` (also `-`, `.`, none) | journal 2026-10-09 |
+    | `[[Oct 9th, 2026]]` (the `:journal/page-title-format` of `logseq/config.edn`, or common formats) | `[[2026-10-09]]` |
+    | `((uuid))`, `id:: uuid` | kept: the ids are saved (decision 24), references resolve |
+    | first block of properties | first block; `title::` renames, `tags::` → `#x, #[[y z]]` |
+    | `assets/` | copied (renamed on a clash, links follow) |
+    | whiteboards, `.org` pages | skipped, listed with the reason |
+
+    Notion (`import/notion.rs`): the unzipped "Markdown & CSV" export.
+
+    | Notion | notesec |
+    |---|---|
+    | `Page 0123…cdef.md` (` ` or `-` + 32 hex) | page "Page" (duplicates "Parent/Page") |
+    | `[x](Other%20Page%200123….md)`, `notion.so/…-<id>` | `[[Other Page]]` |
+    | `Page 0123…/image.png` | copied to assets |
+    | database `DB 0123….csv` (`_all.csv` preferred) | page "DB": a table, first column `[[row page]]` |
+    | database row page `Key: value` lines | properties (`Tags` → `tags:: #a, #b`), `# Title` dropped |
+
+    *Not done:* links that don't resolve become `[[name]]` (counted in
+    the summary and listed in the log); labelled links and heading
+    anchors are lost (`[[Page|alias]]` → `[[Page]]`: the app has no
+    labelled links); Obsidian `^block` references, callouts and Dataview
+    stay text; Notion relations and rollups stay text in the table;
+    journals whose
+    title format isn't in `config.edn` or the common ones are linked as
+    plain pages; a code line starting with `- ` inside a block can read
+    back as a bullet (the outline format's known limit).
+
+51. **Web clipper: a localhost endpoint that saves pages from the browser.**
+    Off by default (`web_clipper` in `config.toml`); Settings > Web
+    clipper turns it on and off (the listener starts and stops at once),
+    shows the port (`clipper_port`, default 27183; −, +, Default, or any
+    1024-65535 in the file), the token masked with Copy and Regenerate,
+    the state ("Listening on 127.0.0.1:27183", or why not) and "Copy
+    bookmarklet". The request format, the bookmarklet's source, an
+    extension and the threat model are in `docs/WEB_CLIPPER.md`. *Split:*
+    `clipper/` has no GPUI: `http.rs` (an HTTP/1.1 reader with limits,
+    form and JSON bodies, responses), `server.rs` (listener and checks),
+    `html.rs` (HTML → outline rows) and `mod.rs` (token, titles, the
+    page, the bookmarklet); `app/clipper_ui.rs` is the app side. No new
+    crate: `std::net`, a hand-written HTTP parser and JSON reader, and the
+    `uuid` crate's v4 ids (the OS random source) for the token.
+    *Listener:* `TcpListener` on `127.0.0.1:<port>` only, non-blocking,
+    polled every 50 ms so `stop` (also on drop) closes the port promptly
+    and cleanly; each connection gets its own thread (at most 4 at once,
+    more get 503), one request, then `Connection: close`. A port in use
+    is an error status and a red line in Settings, never a panic.
+    *Checks, in order:* head at most 16 KB / 64 headers (431), HTTP/1.0
+    or 1.1 (505); `Host` exactly `127.0.0.1:<port>` or `localhost:<port>`
+    (403: DNS rebinding); path `/clip` (404); POST or OPTIONS (405);
+    `Content-Type` form or JSON (415); a token header, if sent, must
+    match before the body is read (403); no `Transfer-Encoding` (501:
+    clients send `Content-Length`; chunked parsing is surface we don't
+    need), `Content-Length` required (411) and at most 5 MB (413); the
+    whole request within 15 s (408); the token (header or `token` field)
+    compared in constant time (403); 30 clips a minute (429). Only then
+    is the HTML converted (on the connection's thread). *Hand-off:* the
+    clip goes to the app through a `std::sync::mpsc` channel with a reply
+    channel; GPUI has no channel a foreground task can await (its
+    `PriorityQueueReceiver` blocks), so while the clipper is on the UI
+    thread drains it every 200 ms (`background_executor().timer`). The
+    page is written there with `Storage::save` like any new page, so git
+    backup and the indexes see it; the connection waits up to 10 s for
+    the answer. *Page:* the request's title cleaned (`clipper::clip_title`:
+    one line, `[]` → `()`, `/` → `-`, no leading dot, then the import's
+    `clean_title`) and made unique with " (2)"; first block
+    `source:: <url>` (http/https only), `clipped:: [[<today>]]`,
+    `tags:: #clipped` (decision 44's form); then the content. *Inbox:*
+    "Clipped [[Title]]" is added at the end of today's journal (created
+    if needed; an empty first block is used). That puts new clips where
+    the day's notes are and lists them by date, with no special page to
+    maintain; `#clipped` lists them all. Saving a clip stops editing and,
+    like an import, clears undo history (a snapshot from before would
+    drop the page). The status says "Clipped “Title”" with Open.
+    *Conversion* (`clipper/html.rs`): a tokenizer that never looks inside
+    raw-text elements, then one pass that keeps headings (nesting what
+    follows, as the import does), paragraphs, nested lists, quotes, code
+    blocks, table rows, links (http/https/mailto after removing control
+    characters, relative ones resolved against the page's address,
+    `[ ] ( )` and spaces percent-encoded so they can't leave the link),
+    bold, italics and inline code; scripts, styles, frames, forms,
+    objects, SVG, media, templates and `<nav>` go with their content,
+    and no attribute but `href`/`src` is read. Images stay links (never
+    downloaded). Our syntax in the text is defanged with a zero-width
+    space: `[[`, `((`, `{{`, and line starts that would read as a
+    property (`id::` would take over block references), bullet,
+    heading, quote, fence or task; code lines get the line-start part
+    only. Output cap 1 MB / 5,000 blocks, with a note. *Responses:* JSON
+    for JSON requests; for the bookmarklet's form a self-contained page
+    "Saved to NoteSec ✓" (title escaped) whose one script, closing the
+    window, runs under a per-response CSP nonce (`default-src 'none'`).
+    CORS allows any origin without credentials (the token is the key);
+    a preflight asking for Private Network Access gets it. *Bookmarklet:*
+    a top-level form POST into a small new window, not `fetch` (blocked
+    more and more for public pages reaching localhost, and by pages'
+    `connect-src`); it sends the selection's HTML when there is one,
+    else `<article>`, `<main>` or the body. *Secrets:* the token lives in
+    `state.toml` (`clipper_token`) next to `ai_api_key`; publish never
+    reads that file, and sync/export must strip both. Git backup commits
+    `state.toml` locally (never pushes). *Limits:* sites with a strict
+    `form-action` CSP block the bookmarklet (use an extension); iframes
+    and shadow DOM aren't clipped; tables become rows; a "didn't answer
+    in time" 503 may follow a save that did happen; the port can only be
+    typed in `config.toml` beyond the − / + buttons (Settings has no text
+    field for it).
+
+52. **Voice notes: the microphone into the page, transcribed locally.**
+    "Record voice note" (palette, sidebar row; a toggle) starts a
+    recorder; a pill at the top right shows "● REC 0:12 / 30:00" with
+    Stop and Cancel ("Stop recording" / "Cancel recording" are in the
+    palette only while recording). Stopping adds
+    `![voice note](../assets/voice-2026-10-09-141503.wav)` (the image
+    syntax and relative path of pasted images; `-2`… if the name is
+    taken) below the block that was being edited (after its subtree),
+    else at the end of the page on screen, else today's journal; the
+    status says "Voice note saved (0:12) on “Page”". Setup, privacy and
+    sizes for users: `docs/VOICE_NOTES.md`. *Split:* `voice/` has no
+    GPUI: `mod.rs` (recorder detection and argument lists, WAV
+    check/repair, names), `run.rs` (spawning, SIGINT, timeouts),
+    `whisper.rs` (transcription, the Settings test);
+    `app/voice_ui.rs` is the app side. *No new crate:* audio capture is
+    a recorder program, found on `PATH` in this order: `pw-record`
+    (PipeWire), `parecord` (PulseAudio), `arecord` (ALSA), `ffmpeg`
+    (`-f pulse -i default`), all asked for 16 kHz mono 16-bit WAV (what
+    whisper.cpp wants, ~1.9 MB a minute); `voice_recorder` in
+    `config.toml` (program then arguments, `{file}` for the output)
+    replaces the search. None found: an error status naming the packages.
+    Every program runs with `Command` and an argument list, never a
+    shell, so no file name can become a command. *Recording:* outside
+    the vault, so a git backup that runs meanwhile can't commit half a
+    file, and in a private folder (`voice/private.rs`): a fresh
+    `notesec-voice-<random>` made with mode 0700 (`DirBuilderExt`; mkdir
+    fails on an existing name or planted symlink) under
+    `$XDG_RUNTIME_DIR/notesec-voice` (per user, tmpfs; checked to be a
+    real folder, ours, closed to others) or else the system temp folder.
+    The shared temp folder alone wouldn't do: the recorder's umask
+    (often 0644) would let other local users read the recording.
+    whisper's output and program logs use such folders too (a transcript
+    is as private). The folder goes, contents and all, when the
+    recording is done or cancelled. The finished file is moved into
+    `assets/` (`voice::store`): a rename on one file system, else (tmpfs
+    to home is EXDEV) a copy into `.voice-….wav.tmp` (a name backup
+    ignores), fsync, rename, then the source removed. Either way it gets
+    the mode a new file in `assets/` gets, like a pasted image (found by
+    creating a probe file: no umask call without libc), not the private
+    one.
+    *Stopping:* SIGINT through the `kill` program (`kill -INT <pid>`,
+    as Ctrl+C would: recorders then write their header's sizes), no
+    `libc`/`unsafe`; after 5 s `Child::kill`. That and checking the file
+    run off the UI thread. A 1 s timer moves the clock, stops at 30
+    minutes (`MAX_LENGTH`) and notices a recorder that quit by itself
+    (its output's last lines are shown). *Repair:* `normalize_wav`, a
+    pure function, rewrites the file as RIFF/WAVE with just `fmt ` and
+    `data`: sizes left at 0 or 0xFFFFFFFF (a recorder killed early) or
+    past the end become "to the end of the file", a half sample frame is
+    cut, metadata chunks (ffmpeg's `LIST`) are dropped; not RIFF, not
+    PCM, or no audio is an error and nothing is saved. *Cancel* kills
+    the recorder and deletes the file. Closing the app while recording
+    finishes the file into `assets/` without a block (documented).
+    *Transcription:* only with a whisper.cpp program set (Settings >
+    Voice notes, Choose… through the system file picker, or
+    `whisper_binary` / `whisper_model` / `whisper_language` in
+    `config.toml`; Settings shows each path as missing if it is, and
+    Test runs `--help` and checks the model's ggml/GGUF magic). Run as
+    `-m <model> -f <wav> -l <auto|xx> -nt -otxt -of <tmp>` off the UI
+    thread, one at a time (a queue), with a timeout of 2 minutes plus
+    6× the recording; `<tmp>.txt` is read (stdout if absent),
+    timestamps and `[BLANK_AUDIO]`-style markers removed, whitespace
+    collapsed, and the text defanged like clipped text (decision 51)
+    so speech can't make links, properties or bullets. It goes in as a
+    child of the note, `**Transcript:** …`; a note with one isn't done
+    twice. "Transcribe new voice notes automatically" (off by default)
+    does it after each recording; the chip's Transcribe button and
+    "Transcribe voice notes on page" do it on request. Errors (no
+    program, missing model, exit code with the end of stderr, timeout)
+    are statuses. Paths are config, not secrets: they're in
+    `config.toml`, not `state.toml`. NoteSec itself never touches the
+    network; what a program the user chose does is up to it. *Reading
+    view:* an audio target is a chip (🎙 name, ▶ Play, Transcribe), not
+    an image; Play opens the file with the system's player
+    (`open_with_system`, recorded in tests). *Export and publish* leave
+    audio out ("Voice note not included: name"): a page shouldn't grow
+    by megabytes, and publishing someone's voice should take a
+    deliberate step; the file is never copied. *Backup:* WAVs in
+    `assets/` are committed like images (they're notes). *Keys:* the
+    pill isn't a dialog, so typing, vim keys and shortcuts keep working
+    while recording, and Escape doesn't cancel it. *Limits:* Linux
+    recorders only (macOS/Windows need a custom command); the default
+    input device; no pause; WAV only (no compression); a program that
+    ignores SIGINT loses what it hadn't written when killed; editing the
+    page the note goes to is closed when it's inserted.
+
+53. **Whiteboards: a canvas page stored as ordinary blocks.** A page
+    whose first block is `type:: whiteboard` shows a canvas instead of
+    the outline. *Storage, no JSON:* each other top-level block is a
+    card, with `x::`, `y::`, `w::`, `h::` and an optional `color::`
+    (yellow, green, blue, red, purple, gray) after its text. A card is
+    text, `[[Page]]` (a page card: its title, which opens it, and the
+    page's first lines) or `((uuid))` (a live block card). Arrows are
+    children of a top-level `edges::` block,
+    `edge:: ((from)) -> ((to))` with an optional `label::`. The ends use
+    the normal `id::` mechanism, so cards keep their ids, and backlinks
+    and the graph count card links with no extra code. *Hand edits:*
+    unreadable or out-of-range coordinates get the card auto-placed
+    (rows of four under the placed cards, not saved until the card is
+    moved). Sizes are clamped, and arrows to missing cards or to
+    themselves are ignored. Nothing panics. *Canvas:* `canvas()` +
+    `PathBuilder` paint the arrows (a line and a filled head, anchored
+    on card borders); cards are absolutely placed divs, only those in
+    view (culling; 500 cards tested). Every press is hit-tested in
+    canvas coordinates (`geom::hit`: handles, cards top-down, the
+    page-card title strip, then arrows within a few px). Moves and
+    resizes are drawn from the drag state and written on release: one
+    undo step and one save each. Drags are tracked by root listeners, so
+    they continue past the canvas edge. Pan: drag empty space, middle
+    button, or Space+drag, or the wheel. Zoom: Ctrl+wheel or pinch
+    around the pointer, 0.1–4×, with Fit and 100% buttons and palette
+    commands. A board's view is per title and in memory. It is fitted
+    on first show, and refitted on the next frame if the first frame
+    had no size. *Editing:* a double-click on empty space makes a card
+    there; a double-click on a card edits it with the outline's block
+    editor (`BlockText`), which loads and saves the text without the
+    card's property lines (`editor_source`/`editor_content`). Enter
+    finishes. Tab, Alt+arrows, block hops and the empty-Backspace delete
+    do nothing in a card, and vim is off there (`vim_applies`). The
+    canvas has the "Whiteboard" key context only when nothing is edited
+    or open: then Delete/Backspace remove the selected card (with its
+    arrows) or arrow, and Esc deselects. Drag the dot on a selected card
+    onto another card to connect them. "Add page" uses the palette: the
+    pick becomes a page or block card. "Open as outline" shows the
+    blocks as usual (per page, in memory). *Export/publish:* an inline
+    SVG (lines, polygons, and each card's block HTML in a
+    `<foreignObject>`), all positioned by attributes, so it passes both
+    CSPs (publish forbids `style=""`), runs nothing and loads nothing.
+    *Limits:* the other split pane shows the outline; no multi-select
+    or copy/paste; the edited card's text isn't scaled with zoom; a
+    card's own text line like `x:: 5` would be read as its coordinate;
+    no curved arrows; no page-menu item (palette command "New
+    whiteboard").
+
+54. **Encrypted vault export/import (not sync).** Live end-to-end
+    encrypted sync is future work. "Export encrypted vault…" writes the
+    graph to one `.notesec-vault` file; "Import encrypted vault…"
+    unpacks one into a new, empty folder, never the open graph and never
+    merged. Threat model, contents and format: `docs/ENCRYPTION.md`.
+    *Crypto:* Argon2id (64 MiB, 3 passes, 1 lane; stored in the header
+    and bounded on import as a DoS guard) derives the key.
+    XChaCha20-Poly1305 encrypts 1 MiB chunks, STREAM-style: nonce = base
+    ‖ counter ‖ last flag, and AAD = header ‖ last flag. That
+    authenticates the header and catches truncation, reordering and
+    appended chunks. Salt and nonce come from `OsRng` (the `aead`
+    re-export). *New crates:* `chacha20poly1305 0.10` and `argon2 0.5`
+    (10 packages added to Cargo.lock); no tar/zip crate. The archive is
+    hand-rolled (path, length, bytes), and paths are checked when packing
+    and when unpacking. No `zeroize`: secrets are overwritten by hand
+    (`vault::wipe`, best effort without unsafe). *Contents:* pages,
+    journals, assets, `config.toml`, and `state.toml` parsed with `toml`
+    with `ai_api_key`/`clipper_token` removed at any depth (dropped whole
+    if it can't be parsed). Not included: `.git/`, `.trash/`,
+    `.notesec/`, `exports/`, `published/`, hidden and `*.tmp` files,
+    symlinks. *Import:* decrypt, authenticate and check everything in
+    memory first, then write new files into a staging folder in the
+    destination and move them out; a failure writes nothing. There's no
+    graph switching, so the status line says to start NoteSec with
+    `NOTESEC_DIR`. *UI:* a modal dialog. The passphrase fields are
+    `EditorState`s on the app's input path (`active_editor`), drawn as
+    bullets, with a `canvas()` registering `handle_input`. Export asks
+    twice and needs 12+ characters; Esc closes and wipes. It's in
+    `overlay_open`, `text_input_open` and `vim_applies`. Crypto runs on
+    the background executor. *Backup (agreed with track 1):* `IGNORED`
+    gains `/state.toml`, and `prepare` runs `git rm --cached state.toml`
+    once when it's tracked, then commits just that removal from a
+    temporary index (the pathspec commit would re-add the file from
+    disk; anything the user staged stays out). Older commits keep it; ENCRYPTION.md explains
+    purging with git filter-repo and rotating the secrets. *Limits:*
+    whole vault in memory (2 GiB cap); no in-app graph switching; a
+    failure partway through moving files out of staging can leave some
+    files in the (new) folder; wiping can't reach copies made by
+    reallocation.
+
+55. **WASM plugins, sandboxed with wasmi.** `plugins/<id>/plugin.toml` +
+    `plugin.wasm` in the graph; see docs/PLUGINS.md. *Runtime:* wasmi
+    2.0 (a pure-Rust interpreter; no wasmtime, no WASI), built with
+    `default-features = false` and `portable-dispatch`, because the
+    default tail-call dispatch overflowed the stack in debug builds. The
+    only import allowed is `env.host_log` (stderr, 20 lines per call).
+    Every call gets a fresh store and instance, with fuel (50M for
+    commands, 5M for render hooks), a 32 MiB memory cap via
+    `StoreLimits` (growth traps), 256 KiB input and 64 KiB output, and
+    bounds-checked pointers. *Formats:* TOML both ways. The input is
+    written by hand with `block` first, so a tiny WAT plugin can find
+    it. The output is parsed with `deny_unknown_fields` and checked
+    (≤16 actions, sizes, no control characters), and the actions are
+    applied by the app: insert/replace block (one undo step each,
+    saved like edits, refused if the page or block changed while it
+    ran), set status, open an existing page. Render output is plain
+    lines with `**bold**` / `*italic*`, drawn as GPUI text and never
+    HTML. *Trust:* plugins start disabled. `config.toml [plugins]` maps
+    id to a hash of the wasm (argon2 with fixed tiny parameters, reused
+    so there's no new crate), so a changed binary is off until enabled
+    again. Three failures in a row turn a plugin off (a failure while
+    drawing is queued and applied at the next render). *Threads:*
+    commands run on the background executor; render hooks run while
+    drawing, bounded by their fuel and cached per (hash, args, block
+    text), capped at 256 entries. *Palette:* `Target::Plugin(i)`
+    through `search::search_with`. Export, publish and vault don't run
+    hooks: macros stay as text. *Tests:* the example's committed wasm
+    must equal `wat` of its source (`wat` is a dev-dependency only).
+    *Limits:* no plugin state between calls; one command at a time;
+    render hooks on the UI thread; log lines only on stderr; no access
+    to other blocks than the current one.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

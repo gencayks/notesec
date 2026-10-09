@@ -1,6 +1,6 @@
 //! Export a page as one self-contained HTML file.
 //!
-//! Pure code (no GPUI, no files): [`page_html`] turns a page into the whole
+//! Pure code (no GPUI, no files): [`page_html_with_embeds`] turns a page into the whole
 //! document as a string, and the caller says how block references resolve
 //! and where image bytes come from. `app.rs` writes the result to
 //! `<graph>/exports/` (see `Storage::write_export`).
@@ -18,19 +18,30 @@
 //! a note instead. Links and tags become styled spans (with the page name in
 //! `data-page`), since the pages they point at aren't exported. A
 //! Content-Security-Policy meta tag makes a browser refuse anything else.
+//!
+//! Embeds (`![[Page]]`, `![[((id))]]`, decision 47) are drawn inline, in a
+//! bordered box headed by the source page's title, with the same guards as
+//! the app (`embed::Resolver`): a circular, too deep or missing embed is a
+//! note instead of content.
+//!
+//! [`document`] is the general form, which `publish` (decision 49) also uses:
+//! a stylesheet file instead of the inline one, images as files, and links
+//! to the other published pages as real `<a href>`s.
 
 use uuid::Uuid;
 
 use crate::agenda::parse_dates;
 use crate::code::{split_code, Part};
 use crate::display::DisplayBlock;
+use crate::embed::Resolved;
 use crate::model::{BlockKind, Page, TaskState};
 use crate::table::{parse_table, Align, Table};
 
-/// The stylesheet, inlined into every export. Light by default, dark when
+/// The stylesheet, inlined into every export (a published bundle has it as
+/// `style.css`). Light by default, dark when
 /// the system prefers it; printing (the browser's Print to PDF) drops the
 /// background colours.
-const CSS: &str = r#"
+pub const CSS: &str = r#"
 :root { --bg: #ffffff; --text: #1f2328; --muted: #6e7781; --accent: #0969da;
   --border: #d0d7de; --code-bg: #f6f8fa; --tag-bg: #ddf4ff; --danger: #cf222e; }
 @media (prefers-color-scheme: dark) {
@@ -57,6 +68,8 @@ li { margin: 2px 0; }
 .done > .text { color: var(--muted); text-decoration: line-through; }
 .task + .text, .task + .planning { display: inline; }
 .link { color: var(--accent); }
+a.link, a.tag { text-decoration: none; }
+a.link:hover, a.tag:hover { text-decoration: underline; }
 .tag { color: var(--accent); background: var(--tag-bg); border-radius: 4px; padding: 0 3px; }
 .ref { background: var(--tag-bg); border-bottom: 1px dashed var(--muted); }
 .planning { color: var(--muted); font-size: 0.9em; }
@@ -68,10 +81,23 @@ code { font: 0.9em/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospac
 table { border-collapse: collapse; margin: 4px 0; }
 th, td { border: 1px solid var(--border); padding: 4px 8px; }
 th { background: var(--code-bg); }
+.left { text-align: left; } .center { text-align: center; } .right { text-align: right; }
 img { max-width: 100%; max-height: 480px; display: block; margin: 4px 0; border-radius: 4px; }
 .image-missing { display: inline-block; color: var(--muted); border: 1px dashed var(--border);
   border-radius: 4px; padding: 2px 8px; font-size: 0.9em; }
+.embed { border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 6px; padding: 4px 12px 6px; margin: 6px 0; }
+.embed-title { color: var(--muted); font-size: 0.85em; }
+.embed-note { color: var(--muted); font-style: italic; font-size: 0.9em; }
 @media print { body { background: none; } main { max-width: none; padding: 0; } }
+.whiteboard { overflow-x: auto; margin: 1rem 0; }
+.whiteboard svg { max-width: 100%; height: auto; }
+.whiteboard .card-box { fill: var(--bg); stroke: var(--border); }
+.whiteboard .edge { stroke: var(--muted); stroke-width: 1.5; }
+.whiteboard .arrow { fill: var(--muted); }
+.whiteboard .edge-label { fill: var(--muted); font-size: 12px; text-anchor: middle; }
+.whiteboard .card { padding: 8px; overflow: hidden; height: 100%; box-sizing: border-box;
+  font-size: 14px; color: #1f2328; }
 "#;
 
 /// Resolves a `((block reference))` to the content of the block it names
@@ -81,51 +107,232 @@ pub type ResolveRef<'a> = &'a dyn Fn(Uuid) -> Option<String>;
 /// The bytes of the image an `![alt](target)` points at (`None`: missing).
 pub type LoadImage<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
 
+/// Where an image's bytes are, as [`Options::image`] answers it.
+pub enum ImageSrc {
+    /// Embedded as a `data:` URI.
+    Bytes(Vec<u8>),
+    /// A URL relative to the document (`assets/x.png`).
+    Url(String),
+    /// Not found: a note instead.
+    Missing,
+    /// There, but not to be shown (publish: outside the graph, or not
+    /// an image the app can clean): a note instead.
+    Withheld,
+}
+
+/// How [`document`] renders: where references, images and links go.
+pub struct Options<'a> {
+    pub resolve_ref: ResolveRef<'a>,
+    /// The image an `![alt](target)` shows (web images and non-images are
+    /// a note before this is asked).
+    pub image: &'a dyn Fn(&str) -> ImageSrc,
+    /// The `href` for a link or tag to the page named so (`None`: a styled
+    /// span, as in an export).
+    pub href: &'a dyn Fn(&str) -> Option<String>,
+    /// A stylesheet file to link instead of the inline `<style>`.
+    pub stylesheet: Option<&'a str>,
+    /// Notes about missing images show the target as written (else only
+    /// its file name, so no local path is published).
+    pub show_paths: bool,
+}
+
+/// The embeds in one of the exported page's blocks, resolved (see
+/// `embed::Resolver::resolve`; nested embeds come resolved inside).
+pub type ResolveEmbeds<'a> = &'a dyn Fn(&str) -> Vec<Resolved>;
+
 /// The whole HTML document for `page`: title, then every block as nested
-/// lists (all of them: folding is a view setting, not content).
+/// lists (all of them: folding is a view setting, not content). Embeds show
+/// as written; [`page_html_with_embeds`] draws them.
+#[cfg(test)]
 pub fn page_html(page: &Page, resolve_ref: ResolveRef, load_image: LoadImage) -> String {
-    let ctx = Ctx {
+    page_html_with_embeds(page, resolve_ref, &|_| Vec::new(), load_image)
+}
+
+/// [`page_html`], with each block's embeds drawn inline under it.
+pub fn page_html_with_embeds(
+    page: &Page,
+    resolve_ref: ResolveRef,
+    resolve_embeds: ResolveEmbeds,
+    load_image: LoadImage,
+) -> String {
+    let image = |target: &str| load_image(target).map_or(ImageSrc::Missing, ImageSrc::Bytes);
+    let options = Options {
         resolve_ref,
-        load_image,
+        image: &image,
+        href: &|_| None,
+        stylesheet: None,
+        show_paths: true,
     };
-    let title = escape(&page.title);
+    if crate::whiteboard::is_whiteboard(page) {
+        // The drawing replaces the outline (decision 53).
+        let board = crate::whiteboard::parse(page);
+        let svg = board_svg(&board, &options, &|text| text.to_string());
+        return document_with_board(
+            &page.title,
+            page.is_journal,
+            Some(svg),
+            Vec::new(),
+            &options,
+        );
+    }
+    let rows = page
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(ix, b)| {
+            (
+                page.depth_of(ix),
+                b.content.as_str(),
+                resolve_embeds(&b.content),
+            )
+        })
+        .collect();
+    document(&page.title, page.is_journal, rows, &options)
+}
+
+/// The whole HTML document for a page titled `title` whose blocks are
+/// `rows` (depth, content, resolved embeds), rendered as `options` say.
+pub fn document(
+    title: &str,
+    is_journal: bool,
+    rows: Vec<(usize, &str, Vec<Resolved>)>,
+    options: &Options,
+) -> String {
+    document_with_board(title, is_journal, None, rows, options)
+}
+
+/// [`document`], with a whiteboard's drawing (`board_svg`) after the
+/// title, before the rows.
+pub fn document_with_board(
+    title: &str,
+    is_journal: bool,
+    board: Option<String>,
+    rows: Vec<(usize, &str, Vec<Resolved>)>,
+    options: &Options,
+) -> String {
+    let ctx = options;
+    let title = escape(title);
     let mut out = String::new();
     out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
-    out.push_str(
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
-         img-src data:; style-src 'unsafe-inline'\">\n\
-         <meta name=\"generator\" content=\"notesec\">\n",
-    );
-    out.push_str(&format!("<title>{title}</title>\n<style>{CSS}</style>\n"));
-    out.push_str("</head>\n<body>\n");
-    let class = if page.is_journal {
-        "page journal"
+    // No scripts, nothing from elsewhere: only the stylesheet and images
+    // the document itself carries (inline) or sits next to (`'self'`).
+    let csp = if ctx.stylesheet.is_some() {
+        "default-src 'none'; img-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'"
     } else {
-        "page"
+        "default-src 'none'; img-src data:; style-src 'unsafe-inline'"
     };
+    out.push_str(&format!(
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\n\
+         <meta name=\"generator\" content=\"notesec\">\n"
+    ));
+    match ctx.stylesheet {
+        Some(href) => out.push_str(&format!(
+            "<title>{title}</title>\n<link rel=\"stylesheet\" href=\"{}\">\n",
+            escape(href)
+        )),
+        None => out.push_str(&format!("<title>{title}</title>\n<style>{CSS}</style>\n")),
+    }
+    out.push_str("</head>\n<body>\n");
+    let class = if is_journal { "page journal" } else { "page" };
     out.push_str(&format!(
         "<main class=\"{class}\">\n<h1 class=\"page-title\">{title}</h1>\n"
     ));
-    outline_html(&mut out, page, &ctx);
+    let has_board = board.is_some();
+    if let Some(board) = board {
+        out.push_str(&board);
+    }
+    // A whiteboard's export is its board alone.
+    if !has_board || !rows.is_empty() {
+        outline_html(&mut out, "<ul class=\"outline\">", rows, ctx);
+    }
     out.push_str("</main>\n</body>\n</html>\n");
     out
 }
 
-struct Ctx<'a> {
-    resolve_ref: ResolveRef<'a>,
-    load_image: LoadImage<'a>,
+type Ctx<'a> = Options<'a>;
+
+/// A whiteboard (decision 53) as an inline SVG: arrows as lines and
+/// triangles, each card a box with its text rendered like a block inside
+/// a `<foreignObject>`. Everything is placed by SVG attributes, not CSS,
+/// so it shows under both documents' CSPs (`style-src 'self'` blocks
+/// `style=""`), and inline SVG loads nothing. `clean` prepares a card's
+/// text (publish strips properties).
+pub fn board_svg(
+    board: &crate::whiteboard::Board,
+    ctx: &Ctx,
+    clean: &dyn Fn(&str) -> String,
+) -> String {
+    use crate::whiteboard::geom::{arrowhead, edge_line, Rect};
+    const MARGIN: f32 = 20.0;
+    let mut out = String::from("<div class=\"whiteboard\">");
+    let Some(all) = Rect::union(&board.rects()) else {
+        out.push_str("<p class=\"image-missing\">Empty whiteboard</p></div>\n");
+        return out;
+    };
+    let (x0, y0) = (all.x - MARGIN, all.y - MARGIN);
+    let (w, h) = (all.w + 2.0 * MARGIN, all.h + 2.0 * MARGIN);
+    out.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{x0:.1} {y0:.1} {w:.1} {h:.1}\" \
+         width=\"{w:.0}\" height=\"{h:.0}\" role=\"img\" aria-label=\"Whiteboard\">\n"
+    ));
+    for edge in &board.edges {
+        let Some((a, b)) = edge_line(board, edge.from, edge.to) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "<line class=\"edge\" x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\"/>\n",
+            a.x, a.y, b.x, b.y
+        ));
+        let head = arrowhead(a, b);
+        let points: Vec<String> = head
+            .iter()
+            .map(|p| format!("{:.1},{:.1}", p.x, p.y))
+            .collect();
+        out.push_str(&format!(
+            "<polygon class=\"arrow\" points=\"{}\"/>\n",
+            points.join(" ")
+        ));
+        if let Some(label) = &edge.label {
+            out.push_str(&format!(
+                "<text class=\"edge-label\" x=\"{:.1}\" y=\"{:.1}\">{}</text>\n",
+                (a.x + b.x) / 2.0,
+                (a.y + b.y) / 2.0 - 4.0,
+                escape(label)
+            ));
+        }
+    }
+    for card in &board.cards {
+        let r = card.rect;
+        let fill = card
+            .color
+            .and_then(|name| crate::whiteboard::COLORS.iter().find(|(n, _)| *n == name))
+            .map(|(_, rgb)| format!(" fill=\"#{rgb:06x}\""))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "<rect class=\"card-box\" x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"6\"{fill}/>\n\
+             <foreignObject x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\">\
+             <div xmlns=\"http://www.w3.org/1999/xhtml\" class=\"card\">",
+            r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h
+        ));
+        block_html(&mut out, &clean(&card.text), ctx);
+        out.push_str("</div></foreignObject>\n");
+    }
+    out.push_str("</svg></div>\n");
+    out
 }
 
-/// The blocks as nested `<ul>`s, one `<li>` per block, children in a `<ul>`
-/// inside their parent's `<li>`.
-fn outline_html(out: &mut String, page: &Page, ctx: &Ctx) {
-    out.push_str("<ul class=\"outline\">\n");
+/// Blocks (depth, content, resolved embeds) as nested `<ul>`s, one `<li>`
+/// per block, children in a `<ul>` inside their parent's `<li>`. `open` is
+/// the outermost `<ul ...>` tag.
+fn outline_html(out: &mut String, open: &str, rows: Vec<(usize, &str, Vec<Resolved>)>, ctx: &Ctx) {
+    out.push_str(open);
+    out.push('\n');
     let mut prev: Option<usize> = None;
-    for (ix, block) in page.blocks.iter().enumerate() {
+    for (depth, content, embeds) in rows {
         // Blocks are stored in outline order, so a block is at most one
         // level below the one before it.
-        let depth = page.depth_of(ix).min(prev.map_or(0, |p| p + 1));
+        let depth = depth.min(prev.map_or(0, |p| p + 1));
         match prev {
             None => {}
             Some(p) if depth > p => out.push_str("\n<ul>\n"),
@@ -137,7 +344,10 @@ fn outline_html(out: &mut String, page: &Page, ctx: &Ctx) {
             }
         }
         out.push_str("<li>");
-        block_html(out, &block.content, ctx);
+        block_html(out, content, ctx);
+        for embed in &embeds {
+            embed_html(out, embed, ctx);
+        }
         prev = Some(depth);
     }
     if let Some(p) = prev {
@@ -147,6 +357,31 @@ fn outline_html(out: &mut String, page: &Page, ctx: &Ctx) {
         }
     }
     out.push_str("</ul>\n");
+}
+
+/// One embed: its source's content in a box, or a note.
+fn embed_html(out: &mut String, embed: &Resolved, ctx: &Ctx) {
+    let (title, rows) = match embed {
+        Resolved::Page { title, rows } | Resolved::Block { title, rows } => (title, rows),
+        _ => {
+            let note = embed.note().unwrap_or_default();
+            out.push_str(&format!(
+                "<div class=\"embed-note\">{}</div>",
+                escape(&note)
+            ));
+            return;
+        }
+    };
+    out.push_str(&format!(
+        "<div class=\"embed\"><div class=\"embed-title\" data-page=\"{t}\">{t}</div>",
+        t = escape(title)
+    ));
+    let rows = rows
+        .iter()
+        .map(|r| (r.depth, r.content.as_str(), r.embeds.clone()))
+        .collect();
+    outline_html(out, "<ul class=\"embed-outline\">", rows, ctx);
+    out.push_str("</div>");
 }
 
 /// One block: `<div class="block ...">` with its task badge, then its
@@ -303,11 +538,23 @@ fn inline_html(out: &mut String, text: &str, block: bool, ctx: &Ctx) {
                 .find(|l| l.range.start <= range.start && range.end <= l.range.end)
                 .map_or(String::new(), |l| l.target.clone());
             let class = if format.tag { "tag" } else { "link" };
-            out.push_str(&format!(
-                "<span class=\"{class}\" data-page=\"{}\">",
-                escape(&target)
-            ));
-            close.push("</span>");
+            match (ctx.href)(&target) {
+                Some(href) => {
+                    out.push_str(&format!(
+                        "<a class=\"{class}\" href=\"{}\" data-page=\"{}\">",
+                        escape(&href),
+                        escape(&target)
+                    ));
+                    close.push("</a>");
+                }
+                None => {
+                    out.push_str(&format!(
+                        "<span class=\"{class}\" data-page=\"{}\">",
+                        escape(&target)
+                    ));
+                    close.push("</span>");
+                }
+            }
         }
         if format.block_ref {
             out.push_str("<span class=\"ref\">");
@@ -351,7 +598,7 @@ fn table_html(out: &mut String, table: &Table, ctx: &Ctx) {
                 Align::Center => "center",
                 Align::Right => "right",
             };
-            out.push_str(&format!("<{cell} style=\"text-align: {align}\">"));
+            out.push_str(&format!("<{cell} class=\"{align}\">"));
             inline_html(out, text, false, ctx);
             out.push_str(&format!("</{cell}>"));
         }
@@ -366,14 +613,25 @@ fn table_html(out: &mut String, table: &Table, ctx: &Ctx) {
     out.push_str("</table>");
 }
 
-/// An image as a `data:` URI, or a note saying why it isn't embedded.
+/// An image as a `data:` URI or a file next to the document, or a note
+/// saying why it isn't shown.
 fn image_html(out: &mut String, alt: &str, target: &str, ctx: &Ctx) {
     let missing = |out: &mut String, why: &str| {
+        let shown = if ctx.show_paths || target.contains("://") {
+            target
+        } else {
+            target.rsplit(['/', '\\']).next().unwrap_or(target)
+        };
         out.push_str(&format!(
             "<span class=\"image-missing\">{why}: {}</span>",
-            escape(target)
+            escape(shown)
         ));
     };
+    if crate::voice::is_audio_target(target) {
+        // Audio stays in the vault (decision 52): a page shouldn't carry
+        // megabytes of recording, or publish someone's voice by accident.
+        return missing(out, "Voice note not included");
+    }
     if target.contains("://") {
         // Fetching it would make the file depend on the network.
         return missing(out, "Web image not embedded");
@@ -381,13 +639,19 @@ fn image_html(out: &mut String, alt: &str, target: &str, ctx: &Ctx) {
     let Some(mime) = image_mime(target) else {
         return missing(out, "Not an image");
     };
-    match (ctx.load_image)(target) {
-        Some(bytes) => out.push_str(&format!(
+    match (ctx.image)(target) {
+        ImageSrc::Bytes(bytes) => out.push_str(&format!(
             "<img src=\"data:{mime};base64,{}\" alt=\"{}\">",
             base64(&bytes),
             escape(alt)
         )),
-        None => missing(out, "Image not found"),
+        ImageSrc::Url(url) => out.push_str(&format!(
+            "<img src=\"{}\" alt=\"{}\">",
+            escape(&url),
+            escape(alt)
+        )),
+        ImageSrc::Missing => missing(out, "Image not found"),
+        ImageSrc::Withheld => missing(out, "Image not published"),
     }
 }
 
@@ -646,10 +910,10 @@ mod tests {
              <code>fn main() { a &amp;&amp; b }</code></pre><div class=\"text\">after</div>"
         ));
         assert!(html.contains(
-            "<table><thead><tr><th style=\"text-align: left\">Name</th>\
-             <th style=\"text-align: right\">Qty</th></tr></thead><tbody><tr>\
-             <td style=\"text-align: left\"><strong>tea</strong></td>\
-             <td style=\"text-align: right\">2</td></tr></tbody></table>"
+            "<table><thead><tr><th class=\"left\">Name</th>\
+             <th class=\"right\">Qty</th></tr></thead><tbody><tr>\
+             <td class=\"left\"><strong>tea</strong></td>\
+             <td class=\"right\">2</td></tr></tbody></table>"
         ));
         // Links inside code are code.
         assert!(!self::html("- ```\n  [[x]] #y\n  ```\n").contains("data-page"));
@@ -680,6 +944,14 @@ mod tests {
         );
         assert!(!html.contains("src=\"http") && !html.contains("src=\"../"));
         assert_eq!(image_mime("A.JPG"), Some("image/jpeg"));
+        // Voice notes (decision 52) stay out, even when the file exists.
+        let page = Page::from_markdown("V", false, "- ![voice note](../assets/voice-1.wav)\n");
+        let load = |_: &str| Some(b"RIFF....WAVE".to_vec());
+        let html = page_html(&page, &no_refs, &load);
+        assert!(html.contains(
+            "<span class=\"image-missing\">Voice note not included: ../assets/voice-1.wav</span>"
+        ));
+        assert!(!html.contains("base64") && !html.contains("<audio"));
         assert_eq!(image_mime("x.svg"), None);
     }
 
@@ -697,5 +969,47 @@ mod tests {
             assert_eq!(base64(input.as_bytes()), expected, "{input}");
         }
         assert_eq!(base64(&[0xff, 0xfe, 0x00]), "//4A");
+    }
+
+    #[test]
+    fn embeds_are_drawn_inline_with_the_same_guards() {
+        let id = "6f9b2c1e-0000-4000-8000-0000000000e1";
+        let pages = vec![
+            Page::from_markdown(
+                "Host",
+                false,
+                &format!("- intro\n  - ![[Beta]]\n- ![[(({id}))]]\n- ![[Host]] ![[Gone]]\n"),
+            ),
+            Page::from_markdown(
+                "Beta",
+                false,
+                &format!("- b <one>\n  id:: {id}\n  - b child\n- **two**\n"),
+            ),
+        ];
+        let resolver = crate::embed::Resolver::new(&pages, None);
+        let embeds = |c: &str| resolver.resolve(c, Some(0));
+        let html = page_html_with_embeds(&pages[0], &no_refs, &embeds, &no_images);
+        let doc = outline(&html);
+        let beta = format!(
+            "<div class=\"embed\"><div class=\"embed-title\" data-page=\"Beta\">Beta</div>\
+             <ul class=\"embed-outline\">\n<li>{}\n<ul>\n<li>{}</li>\n</ul>\n</li>\n<li>{}</li>\n</ul>\n</div>",
+            text("b &lt;one&gt;"),
+            text("b child"),
+            text("<strong>two</strong>"),
+        );
+        assert!(doc.contains(&beta), "{doc}");
+        // The block embed: the block and its child only.
+        assert!(doc.contains(&format!(
+            "<ul class=\"embed-outline\">\n<li>{}\n<ul>\n<li>{}</li>\n</ul>\n</li>\n</ul>\n</div>",
+            text("b &lt;one&gt;"),
+            text("b child")
+        )));
+        assert!(
+            doc.contains("<div class=\"embed-note\">Circular embed of \u{201c}Host\u{201d}</div>")
+        );
+        assert!(doc.contains("<div class=\"embed-note\">Page \u{201c}Gone\u{201d} not found</div>"));
+        assert!(html.contains(".embed {"));
+        // Without a resolver, embeds stay as written.
+        assert!(!page_html(&pages[0], &no_refs, &no_images).contains("class=\"embed"));
     }
 }

@@ -20,7 +20,8 @@ use crate::model::{
     resolve_page, tag_counts, tag_query, BlockKind, Page, TaskState,
 };
 use crate::search::{
-    search, search_blocks, search_link_pages, search_templates, search_text, snippet, Hit, Target,
+    search_blocks, search_link_pages, search_templates, search_text, search_with, snippet, Hit,
+    Target,
 };
 use crate::state::{SearchKind, UiState};
 use crate::storage::{today_title, validate_title, Storage, Template, TrashEntry};
@@ -34,9 +35,10 @@ use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontStyle, FontWeight, GlobalElementId,
-    HighlightStyle, Hsla, KeyBinding, Keystroke, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ScrollHandle, ShapedLine, SharedString, Style,
-    StyledText, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
+    HighlightStyle, Hsla, KeyBinding, KeyDownEvent, KeyUpEvent, Keystroke, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ScrollHandle, ShapedLine,
+    SharedString, Style, StyledText, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle,
+    Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -48,6 +50,15 @@ mod ai_ui;
 mod mentions_ui;
 use ai_ui::{AiSettings, AskState, RelatedState, SavedUi, SemanticState, TagSuggestState};
 use mentions_ui::MentionsState;
+mod clipper_ui;
+mod embed_ui;
+mod import_ui;
+mod plugins_ui;
+mod publish_ui;
+mod vault_ui;
+mod vim_ui;
+mod voice_ui;
+mod whiteboard_ui;
 
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace. Palette
@@ -99,6 +110,11 @@ actions!(
         OpenAgenda,
         OpenTrash,
         ExportHtml,
+        PublishPage,
+        PublishPageWithLinks,
+        ImportObsidian,
+        ImportLogseq,
+        ImportNotion,
         ToggleGitBackup,
         SplitRight,
         ClosePane,
@@ -121,6 +137,20 @@ actions!(
         SemanticSearch,
         SuggestTags,
         SaveSearch,
+        ToggleVimMode,
+        RecordVoiceNote,
+        StopRecording,
+        CancelRecording,
+        TranscribeVoiceNotes,
+        NewWhiteboard,
+        WhiteboardFit,
+        WhiteboardZoomReset,
+        WhiteboardAddPage,
+        ToggleWhiteboardOutline,
+        ExportVault,
+        ImportVault,
+        // Delete / Backspace on a whiteboard canvas (no palette row).
+        WhiteboardDelete,
     ]
 );
 
@@ -255,6 +285,10 @@ pub fn shortcuts() -> Vec<Shortcut> {
         s("escape",         Escape,        Some("PageMenu"),    App, "Close a dialog or menu"),
         s("escape",         Escape,        Some("Shortcuts"),   App, "Close a dialog or menu"),
         s("escape",         Escape,        Some("TrashDialog"), App, "Close a dialog or menu"),
+        // A whiteboard canvas with the keyboard (nothing edited, no dialog).
+        s("delete",         WhiteboardDelete, Some("Whiteboard"), Editing, "Whiteboard: delete the selected card or arrow"),
+        s("backspace",      WhiteboardDelete, Some("Whiteboard"), Editing, "Whiteboard: delete the selected card or arrow"),
+        s("escape",         Escape,        Some("Whiteboard"),  App, "Close a dialog or menu"),
     ]
 }
 
@@ -458,6 +492,12 @@ enum SettingsSection {
     Shortcuts,
     /// Provider, endpoint, models and API key (decision 42).
     Ai,
+    /// The web clipper (decision 51, `clipper_ui`).
+    Clipper,
+    /// Voice notes: recorder and transcription (decision 52, `voice_ui`).
+    Voice,
+    /// WASM plugins: enable / disable (decision 55, `plugins_ui`).
+    Plugins,
 }
 
 /// A line under the Shortcuts list.
@@ -522,6 +562,9 @@ struct PageView {
     /// The "Linked from" rows' reading text, for tests.
     #[cfg(test)]
     backlink_texts: Vec<String>,
+    /// The embeds' text lines (`embed_ui::Embeds::lines`), for tests.
+    #[cfg(test)]
+    embed_lines: Vec<String>,
 }
 
 /// Debug selector prefix for the unfocused pane's page (`other-block-0`).
@@ -735,6 +778,12 @@ pub struct NoteSec {
     /// for tests.
     #[cfg(test)]
     backlink_texts: Vec<String>,
+    /// Each pane's embeds' text lines from the last render (decision 47),
+    /// for tests.
+    #[cfg(test)]
+    embed_lines: Vec<String>,
+    #[cfg(test)]
+    other_embed_lines: Vec<String>,
     /// Monospace font for code blocks: the first of `MONO_FONTS` installed.
     mono_font: Option<SharedString>,
     /// The code block (block id, its number in the block) under the mouse;
@@ -761,6 +810,24 @@ pub struct NoteSec {
     _backup_subscriptions: Vec<Subscription>,
     /// The keystroke interceptor behind Settings > Shortcuts' key capture.
     _key_capture: Subscription,
+    /// Vim mode's state (decision 48, `vim.rs`): used while
+    /// `config.vim_mode` is on and a block is being edited.
+    vim: crate::vim::Vim,
+    /// The last publish (decision 49, `publish_ui`).
+    publish: publish_ui::PublishState,
+    /// The import in progress (decision 50, `import_ui`).
+    import: import_ui::ImportState,
+    /// The web clipper's listener (decision 51, `clipper_ui`).
+    clipper: clipper_ui::ClipperState,
+    /// Voice notes: the recording and transcriptions (decision 52,
+    /// `voice_ui`).
+    voice: voice_ui::VoiceState,
+    /// Whiteboard canvases (decision 53, `whiteboard_ui.rs`).
+    whiteboard: whiteboard_ui::WhiteboardState,
+    /// Encrypted vault export/import (decision 54, `vault_ui.rs`).
+    vault: vault_ui::VaultState,
+    /// WASM plugins (decision 55, `plugins_ui.rs`).
+    plugins: plugins_ui::PluginsState,
 }
 
 impl NoteSec {
@@ -834,9 +901,12 @@ impl NoteSec {
         // captured key never also runs its old command.
         register_keys(cx, &state.shortcuts);
         let weak = cx.weak_entity();
-        let key_capture = cx.intercept_keystrokes(move |event, _window, cx| {
+        let key_capture = cx.intercept_keystrokes(move |event, window, cx| {
             let taken = weak
-                .update(cx, |app, cx| app.capture_keystroke(&event.keystroke, cx))
+                .update(cx, |app, cx| {
+                    app.capture_keystroke(&event.keystroke, cx)
+                        || app.vim_keystroke(&event.keystroke, window, cx)
+                })
                 .unwrap_or(false);
             if taken {
                 cx.stop_propagation();
@@ -892,6 +962,10 @@ impl NoteSec {
             other_layouts: Vec::new(),
             #[cfg(test)]
             backlink_texts: Vec::new(),
+            #[cfg(test)]
+            embed_lines: Vec::new(),
+            #[cfg(test)]
+            other_embed_lines: Vec::new(),
             mono_font,
             hovered_code: None,
             copied_code: None,
@@ -904,12 +978,24 @@ impl NoteSec {
             backup_seen,
             _backup_subscriptions: backup_subscriptions,
             _key_capture: key_capture,
+            vim: Default::default(),
+            publish: Default::default(),
+            import: Default::default(),
+            clipper: Default::default(),
+            voice: Default::default(),
+            whiteboard: Default::default(),
+            vault: Default::default(),
+            plugins: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
+        app.reload_plugins();
         if app.config.git_backup {
             // Commits what changed while the app was closed, too.
             app.start_backup(false, cx);
+        }
+        if app.config.web_clipper {
+            app.start_clipper(cx);
         }
         app
     }
@@ -920,6 +1006,9 @@ impl NoteSec {
     /// overlay is open, the rename field while renaming a page, otherwise
     /// the block editor.
     fn active_editor(&self) -> &EditorState {
+        if let Some(dialog) = &self.vault.dialog {
+            return dialog.field();
+        }
         match (&self.search, &self.page_menu) {
             (Some(s), _) => &s.query,
             (
@@ -935,6 +1024,9 @@ impl NoteSec {
 
     fn active_editor_mut(&mut self) -> &mut EditorState {
         let ai_input = self.ai_overlay_input();
+        if self.vault.dialog.is_some() {
+            return self.vault.dialog.as_mut().expect("open").field_mut();
+        }
         match (&mut self.search, &mut self.page_menu) {
             (Some(s), _) => &mut s.query,
             (
@@ -969,7 +1061,10 @@ impl NoteSec {
     /// The palette's query box or the rename field has the keyboard (not a
     /// block): typing there records no undo history.
     fn text_input_open(&self) -> bool {
-        self.search.is_some() || self.renaming() || self.ai_editor().is_some()
+        self.search.is_some()
+            || self.renaming()
+            || self.ai_editor().is_some()
+            || self.vault_dialog_open()
     }
 
     // --- settings --------------------------------------------------------------
@@ -1456,9 +1551,14 @@ impl NoteSec {
                 search_templates(&names, &query.text, MAX_RESULTS)
             }
             Some(s) if s.global => search_text(&self.pages, &s.query.text, MAX_TEXT_RESULTS),
-            Some(s) => search(
+            Some(s) => search_with(
                 &self.pages,
                 &self.available_commands(),
+                &self
+                    .plugin_commands()
+                    .into_iter()
+                    .map(|(_, _, label)| label)
+                    .collect::<Vec<_>>(),
                 &s.query.text,
                 MAX_RESULTS,
             ),
@@ -1483,6 +1583,9 @@ impl NoteSec {
     }
 
     fn toggle_search(&mut self, _: &ToggleSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_dialog_open() {
+            return;
+        }
         if self.search.is_some() {
             self.close_search(cx);
             return;
@@ -1540,6 +1643,7 @@ impl NoteSec {
 
     fn close_search(&mut self, cx: &mut Context<Self>) {
         self.search = None;
+        self.forget_whiteboard_pick();
         self.last_layout = None;
         self.last_bounds = None;
         cx.notify();
@@ -1593,7 +1697,7 @@ impl NoteSec {
         if let Some(ix) = self.editing {
             self.editor.clamp();
             self.editor.marked = None;
-            self.pages[self.selected].blocks[ix].content = self.editor.text.clone();
+            self.pages[self.selected].blocks[ix].content = self.editor_content(ix);
             self.reveal(ix);
         }
         self.save_all_pages();
@@ -1709,7 +1813,12 @@ impl NoteSec {
             Some(s) => (s.insert_after, s.resume, s.templates),
             None => (None, None, None),
         };
+        // "Add page" on a whiteboard: the pick becomes a card there.
+        let board = self.take_whiteboard_pick();
         self.close_search(cx);
+        if board.is_some_and(|b| self.add_picked_card(&b, &hit.target, cx)) {
+            return;
+        }
         match hit.target {
             Target::Page(page) => {
                 let title = self.pages[page].title.clone();
@@ -1763,6 +1872,17 @@ impl NoteSec {
                     self.editor.clamp();
                 }
                 window.dispatch_action(command.action(), cx)
+            }
+            Target::Plugin(entry) => {
+                // Opened while editing: back to that block, as it was.
+                if let (Some(ix), Some(editor)) = (insert_after, resume) {
+                    if ix < self.pages[self.selected].blocks.len() {
+                        self.start_edit(ix, window, cx);
+                        self.editor = editor;
+                        self.editor.clamp();
+                    }
+                }
+                self.run_plugin_command(entry, cx);
             }
             Target::Template(ix) => {
                 if let Some(template) = templates.as_ref().and_then(|t| t.get(ix)) {
@@ -1836,6 +1956,17 @@ impl NoteSec {
                 Command::RenamePage => page.as_deref().is_some_and(|t| self.can_rename(t)),
                 Command::DeletePage => self.can_delete(),
                 Command::ClosePane | Command::FocusOtherPane => self.split.is_some(),
+                Command::RecordVoiceNote => !self.recording(),
+                Command::StopRecording | Command::CancelRecording => self.recording(),
+                Command::WhiteboardFit
+                | Command::WhiteboardZoomReset
+                | Command::WhiteboardAddPage => self.whiteboard_shown(),
+                Command::ToggleWhiteboardOutline => {
+                    page.is_some() && crate::whiteboard::is_whiteboard(&self.pages[self.selected])
+                }
+                Command::InsertTemplate | Command::CollapseAll | Command::ExpandAll => {
+                    !self.whiteboard_shown()
+                }
                 _ => true,
             })
             .collect()
@@ -1890,7 +2021,7 @@ impl NoteSec {
     }
 
     fn on_insert_template(&mut self, _: &InsertTemplate, _: &mut Window, cx: &mut Context<Self>) {
-        if self.current_page().is_some() {
+        if self.current_page().is_some() && !self.whiteboard_shown() {
             self.open_template_picker(self.editing, cx);
         }
     }
@@ -2088,7 +2219,11 @@ impl NoteSec {
     /// inside a `[[`, say), the one typed last wins.
     fn ref_query(&self) -> Option<(Range<usize>, RefKind)> {
         self.editing?;
-        if self.search.is_some() || self.slash.is_some() || self.settings.is_some() {
+        if self.search.is_some()
+            || self.slash.is_some()
+            || self.settings.is_some()
+            || self.vim_takes_keys()
+        {
             return None;
         }
         let block = self.editor.block_ref_query().map(|r| (r, RefKind::Block));
@@ -2457,14 +2592,16 @@ impl NoteSec {
     }
 
     /// The Ctrl-K palette, the settings panel, a page menu, the shortcuts
-    /// list or a trash confirmation covers the page. All are modal, so the
-    /// tab keys do nothing while one is open.
+    /// list, a trash confirmation or the import clash dialog covers the
+    /// page. All are modal, so the tab keys do nothing while one is open.
     fn overlay_open(&self) -> bool {
         self.search.is_some()
             || self.settings.is_some()
             || self.page_menu.is_some()
             || self.shortcuts_open
             || self.trash_confirm.is_some()
+            || self.import_dialog_open()
+            || self.vault_dialog_open()
     }
 
     /// Ctrl+W. Ignored while an overlay is open. In the focused right pane
@@ -3073,7 +3210,7 @@ impl NoteSec {
     // --- export, status message ------------------------------------------------
 
     /// "Export page to HTML": write the page on screen as one
-    /// self-contained HTML file (`export::page_html`) to
+    /// self-contained HTML file (`export::page_html_with_embeds`) to
     /// `<graph>/exports/<page file>.html`, replacing an earlier export, and
     /// say where. The block being edited is saved first. Folded blocks are
     /// exported unfolded; images are embedded.
@@ -3089,7 +3226,11 @@ impl NoteSec {
                 .filter(|path| is_image_path(path))
                 .and_then(|path| std::fs::read(path).ok())
         };
-        let html = crate::export::page_html(page, &resolve_ref, &load_image);
+        let resolver = crate::embed::Resolver::new(pages, None);
+        let host = Some(self.selected);
+        let resolve_embeds = |content: &str| resolver.resolve(content, host);
+        let html =
+            crate::export::page_html_with_embeds(page, &resolve_ref, &resolve_embeds, &load_image);
         let status = match self.storage.write_export(page, &html) {
             Ok(path) => Status {
                 text: format!("Exported to {}", path.display()),
@@ -3187,11 +3328,13 @@ impl NoteSec {
     /// block's content actually changed.
     fn sync_content(&mut self) -> bool {
         let Some(ix) = self.editing else { return false };
+        // A whiteboard card keeps its x::/y::/… lines (decision 53).
+        let content = self.editor_content(ix);
         let block = &mut self.pages[self.selected].blocks[ix];
-        if block.content == self.editor.text {
+        if block.content == content {
             return false;
         }
-        block.content = self.editor.text.clone();
+        block.content = content;
         true
     }
 
@@ -3209,7 +3352,7 @@ impl NoteSec {
     /// cursor at the beginning (used for a freshly split block); otherwise at
     /// the end.
     fn load_editor(&mut self, ix: usize, cursor_at_start: bool) {
-        let content = self.pages[self.selected].blocks[ix].content.clone();
+        let content = self.editor_source(ix);
         self.editor = EditorState::new(&content);
         self.slash = None;
         self.selecting = false;
@@ -3270,11 +3413,13 @@ impl NoteSec {
         self.commit();
         self.text_history_active = false;
         self.load_editor(ix, false);
+        self.vim.reset();
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
     fn stop_edit(&mut self, cx: &mut Context<Self>) {
+        self.vim.reset();
         self.commit();
         self.text_history_active = false;
         self.editing = None;
@@ -3296,6 +3441,9 @@ impl NoteSec {
 
     /// Enter: split the block at the cursor; the right half becomes a new block.
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_dialog_open() {
+            return self.confirm_vault(cx);
+        }
         if self.renaming() {
             self.confirm_rename(cx);
             return;
@@ -3318,6 +3466,10 @@ impl NoteSec {
             return;
         }
         let Some(ix) = self.editing else { return };
+        if self.card_editing() {
+            // A whiteboard card has no "next block": Enter finishes it.
+            return self.stop_edit(cx);
+        }
         self.text_history_active = false;
         self.record_edit();
         let rest = self.editor.split_off_at_cursor();
@@ -3337,10 +3489,16 @@ impl NoteSec {
     }
 
     fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_dialog_open() {
+            return self.vault_next_field(cx);
+        }
         self.restructure(cx, |page, ix| page.indent(ix));
     }
 
     fn shift_tab(&mut self, _: &ShiftTab, _: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_dialog_open() {
+            return self.vault_next_field(cx);
+        }
         self.restructure(cx, |page, ix| page.outdent(ix));
     }
 
@@ -3348,6 +3506,9 @@ impl NoteSec {
     /// save. The block keeps its index (document order never changes).
     fn restructure(&mut self, cx: &mut Context<Self>, op: impl FnOnce(&mut Page, usize) -> bool) {
         let Some(ix) = self.editing else { return };
+        if self.card_editing() {
+            return; // cards aren't nested
+        }
         self.close_slash_as_typing();
         self.text_history_active = false;
         let before = self.history_state();
@@ -3372,6 +3533,9 @@ impl NoteSec {
     /// Alt+Up / Alt+Down: swap the edited block (and its children) with its
     /// previous / next sibling. Editing continues in the moved block.
     fn move_edited_block(&mut self, up: bool, cx: &mut Context<Self>) {
+        if self.card_editing() {
+            return;
+        }
         let Some(ix) = self.editing else { return };
         if self.search.is_some() {
             return;
@@ -3470,6 +3634,10 @@ impl NoteSec {
                 self.record_state(before);
             }
             cx.notify();
+            return;
+        }
+        if self.card_editing() {
+            // An emptied card stays (Delete on the canvas removes it).
             return;
         }
         // Empty block: delete it (never the last remaining block, and never a
@@ -3628,6 +3796,9 @@ impl NoteSec {
         if self.move_cursor_line(-1, cx) {
             return;
         }
+        if self.card_editing() {
+            return;
+        }
         if let Some(prev) = self.editing.and_then(|ix| self.visible_neighbor(ix, false)) {
             self.move_edit(prev, cx);
         }
@@ -3650,6 +3821,9 @@ impl NoteSec {
             return;
         }
         if self.move_cursor_line(1, cx) {
+            return;
+        }
+        if self.card_editing() {
             return;
         }
         if let Some(next) = self.editing.and_then(|ix| self.visible_neighbor(ix, true)) {
@@ -3854,7 +4028,11 @@ impl NoteSec {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.trash_confirm.is_some() {
+        if self.vault_dialog_open() {
+            self.close_vault_dialog(cx);
+        } else if self.import_dialog_open() {
+            self.answer_import_clash(None, cx);
+        } else if self.trash_confirm.is_some() {
             self.close_trash_confirm(cx);
         } else if self.page_menu.is_some() {
             // Closes the menu, cancels a rename or a delete.
@@ -3876,7 +4054,7 @@ impl NoteSec {
             // First Esc only drops the selection; the next one stops editing.
             self.editor.clear_selection();
             cx.notify();
-        } else {
+        } else if !self.whiteboard_escape(cx) {
             self.stop_edit(cx);
         }
     }
@@ -4311,6 +4489,9 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_takes_keys() || self.import_dialog_open() {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.active_editor().range_from_utf16(r))
@@ -4371,6 +4552,9 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_takes_keys() || self.import_dialog_open() {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.active_editor().range_from_utf16(r))
@@ -4933,12 +5117,14 @@ impl NoteSec {
                         "Local git commits {} s after changes. Never pushes.",
                         backup::BACKUP_AFTER.as_secs()
                     )),
-            );
+            )
+            .child(self.render_vim_settings(cx));
 
         let section = state.section;
         let tabs = div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .gap_2()
             .child(
                 button(
@@ -4969,11 +5155,44 @@ impl NoteSec {
                 .on_click(cx.listener(|this, _e, _window, cx| {
                     this.show_settings_section(SettingsSection::Ai, cx)
                 })),
+            )
+            .child(
+                button(
+                    "settings-tab-clipper",
+                    "Web clipper".into(),
+                    section == SettingsSection::Clipper,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::Clipper, cx)
+                })),
+            )
+            .child(
+                button(
+                    "settings-tab-voice",
+                    "Voice notes".into(),
+                    section == SettingsSection::Voice,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::Voice, cx)
+                })),
+            )
+            .child(
+                button(
+                    "settings-tab-plugins",
+                    "Plugins".into(),
+                    section == SettingsSection::Plugins,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::Plugins, cx)
+                })),
             );
         let body = match section {
             SettingsSection::General => general.into_any_element(),
             SettingsSection::Shortcuts => self.render_hotkeys(state, cx),
             SettingsSection::Ai => self.render_ai_settings(state, cx),
+            SettingsSection::Clipper => self.render_clipper_settings(cx),
+            SettingsSection::Voice => self.render_voice_settings(cx),
+            SettingsSection::Plugins => self.render_plugin_settings(cx),
         };
 
         div()
@@ -5876,6 +6095,7 @@ impl NoteSec {
         #[cfg(test)]
         {
             self.other_layouts = view.layouts;
+            self.other_embed_lines = view.embed_lines;
         }
         view.element
     }
@@ -5931,6 +6151,8 @@ impl NoteSec {
         let page = &self.pages[page_ix];
         #[cfg(test)]
         let mut reading_layouts = Vec::new();
+        #[cfg(test)]
+        let mut embed_lines = Vec::new();
         let visible = page.visible_blocks(&self.collapsed);
         // The drop gap below each row's lower half: just before the next
         // visible row, or the end of the page after the last one.
@@ -6017,6 +6239,7 @@ impl NoteSec {
                             // Prose with images in it: each image is drawn on
                             // its own between the text around it, and the line
                             // breaks next to an image are dropped.
+                            let voice_entity = cx.entity();
                             let mut prose =
                                 |pieces: &mut Vec<AnyElement>, text: &str, first: bool| {
                                     let mut pos = 0;
@@ -6037,7 +6260,20 @@ impl NoteSec {
                                             &text[pos..image.range.start],
                                             &mut first,
                                         );
-                                        pieces.push(self.render_image(prefix, ix, images, &image));
+                                        pieces.push(
+                                            if crate::voice::is_audio_target(&image.target) {
+                                                self.render_audio(
+                                                    prefix,
+                                                    ix,
+                                                    images,
+                                                    &image,
+                                                    block.id,
+                                                    &voice_entity,
+                                                )
+                                            } else {
+                                                self.render_image(prefix, ix, images, &image)
+                                            },
+                                        );
                                         images += 1;
                                         pos = image.range.end;
                                     }
@@ -6218,15 +6454,34 @@ impl NoteSec {
                             .child(div().px_2().pb_1().text_color(theme.muted).child(header))
                             .children(items)
                     });
-                let content = match query_list {
-                    Some(list) => div()
+                // Embedded pages and blocks, live (decision 47).
+                let embeds = display
+                    .as_ref()
+                    .and_then(|_| self.render_embeds(prefix, page_ix, ix, source, cx));
+                #[cfg(test)]
+                if let Some(embeds) = &embeds {
+                    embed_lines.extend(embeds.lines.iter().cloned());
+                }
+                // Plugin render hooks: `{{macro}}` boxes (decision 55).
+                let plugin_boxes = display
+                    .as_ref()
+                    .and_then(|_| self.render_plugin_boxes(source));
+                let extras: Vec<AnyElement> = query_list
+                    .map(IntoElement::into_any_element)
+                    .into_iter()
+                    .chain(embeds.map(|e| e.element))
+                    .chain(plugin_boxes)
+                    .collect();
+                let content = if extras.is_empty() {
+                    content
+                } else {
+                    div()
                         .flex_1()
                         .flex()
                         .flex_col()
                         .child(content)
-                        .child(list)
-                        .into_any_element(),
-                    None => content,
+                        .children(extras)
+                        .into_any_element()
                 };
                 // A press on a row that isn't being edited starts editing it
                 // with the cursor under the mouse, and a drag from there
@@ -6591,12 +6846,16 @@ impl NoteSec {
             layouts: reading_layouts,
             #[cfg(test)]
             backlink_texts,
+            #[cfg(test)]
+            embed_lines,
         }
     }
 }
 
 impl Render for NoteSec {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Plugins found failing while drawing the last frame are turned off.
+        self.apply_plugin_disables(cx);
         // A drag released outside the sidebar just ends (GPUI drops it), so
         // forget where it would have landed.
         if !cx.has_active_drag() {
@@ -6627,6 +6886,8 @@ impl Render for NoteSec {
         let drop_before = self.page_drop.as_ref().map(|d| d.before.clone());
         let preview_font = self.font_family.clone();
         let saved_searches = self.render_saved_searches(cx);
+        // "Record voice note" / "Stop recording" (decision 52).
+        let voice_item = self.render_voice_sidebar_item(cx);
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = self.mode == Mode::Notes && ix == self.selected;
             let is_favorite = self.state.is_favorite(&page.title);
@@ -6995,6 +7256,7 @@ impl Render for NoteSec {
             .child(graph_item)
             .child(agenda_item)
             .child(trash_item)
+            .child(voice_item)
             .when(!favorite_rows.is_empty(), |d| {
                 d.child(section_header("FAVORITES")).children(favorite_rows)
             })
@@ -7173,12 +7435,18 @@ impl Render for NoteSec {
         #[cfg(test)]
         {
             self.backlink_texts = page_view.backlink_texts;
+            self.embed_lines = page_view.embed_lines;
         }
         let main = page_view.element;
 
         // --- Search overlay (Ctrl-K) -----------------------------------------
         let overlay = self.search.as_ref().map(|state| {
             let hits = self.search_results();
+            let plugin_labels: Vec<String> = self
+                .plugin_commands()
+                .into_iter()
+                .map(|(_, _, l)| l)
+                .collect();
             let selected = state.selected;
             let templates = state.templates.as_deref();
             let headers: Vec<Option<&'static str>> =
@@ -7223,6 +7491,23 @@ impl Render for NoteSec {
                                         .flex_shrink_0()
                                         .text_color(theme.muted)
                                         .child(hint(c.action().as_ref())),
+                                ),
+                            Target::Plugin(i) => div()
+                                .debug_selector(move || format!("plugin-command-{i}"))
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_color(theme.text)
+                                        .child(plugin_labels.get(i).cloned().unwrap_or_default()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(theme.muted)
+                                        .child("plugin"),
                                 ),
                             Target::Template(t) => row(
                                 div().text_color(theme.accent).child(
@@ -7519,11 +7804,13 @@ impl Render for NoteSec {
 
         // The main area: the tab bar, then the page, the graph or the empty
         // state.
+        let whiteboard_shown = self.whiteboard_shown();
         let view: AnyElement = match (&self.mode, &self.graph) {
             (Mode::Graph, Some(graph)) => graph.clone().into_any_element(),
             (Mode::Agenda, _) => self.render_agenda(cx),
             (Mode::Trash, _) => self.render_trash(cx),
             (Mode::Empty, _) => empty_state(cx).into_any_element(),
+            _ if whiteboard_shown => self.render_whiteboard(cx),
             _ => main.into_any_element(),
         };
 
@@ -7532,7 +7819,10 @@ impl Render for NoteSec {
         // focuses it first (capture phase), so the click then acts there.
         let split = self.split.clone();
         #[cfg(test)]
-        self.other_layouts.clear();
+        {
+            self.other_layouts.clear();
+            self.other_embed_lines.clear();
+        }
         let other: Option<AnyElement> = match &split {
             None => None,
             // The left pane: its active tab.
@@ -7708,6 +7998,8 @@ impl Render for NoteSec {
 
         // The status message: a small box at the bottom right, over the
         // page but under any dialog.
+        let publish_actions = self.render_publish_actions(cx);
+        let clipper_actions = self.render_clipper_actions(cx);
         let status_toast = self.status.as_ref().map(|status| {
             div()
                 .debug_selector(|| "status-toast".to_string())
@@ -7732,9 +8024,12 @@ impl Render for NoteSec {
                 })
                 .shadow_md()
                 .child(status.text.clone())
+                .children(publish_actions)
+                .children(clipper_actions)
         });
 
         let is_editing = self.editing.is_some() || self.text_input_open();
+        let whiteboard_focused = self.whiteboard_focused();
         let shortcuts_open = self.shortcuts_open;
         // While a Settings > AI field is edited it types, so the root takes
         // "BlockEditor" (below) instead of "Settings".
@@ -7769,6 +8064,17 @@ impl Render for NoteSec {
                 d.key_context("PageMenu")
             })
             .when(trash_confirm_open, |d| d.key_context("TrashDialog"))
+            .when(whiteboard_focused, |d| d.key_context("Whiteboard"))
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, _| {
+                if e.keystroke.key == "space" {
+                    this.set_whiteboard_space(true);
+                }
+            }))
+            .on_key_up(cx.listener(|this, e: &KeyUpEvent, _, _| {
+                if e.keystroke.key == "space" {
+                    this.set_whiteboard_space(false);
+                }
+            }))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::tab))
             .on_action(cx.listener(Self::shift_tab))
@@ -7790,6 +8096,10 @@ impl Render for NoteSec {
             // so these live on the root rather than the block.
             .on_mouse_move(cx.listener(Self::on_text_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_text_mouse_up))
+            // Whiteboard drags, likewise (written on release).
+            .on_mouse_move(cx.listener(Self::on_board_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_board_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_board_mouse_up))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::bold))
             .on_action(cx.listener(Self::italic))
@@ -7835,15 +8145,36 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_semantic_search))
             .on_action(cx.listener(Self::on_suggest_tags))
             .on_action(cx.listener(Self::on_save_search))
+            .on_action(cx.listener(Self::on_toggle_vim_mode))
+            .on_action(cx.listener(Self::on_publish_page))
+            .on_action(cx.listener(Self::on_publish_page_with_links))
+            .on_action(cx.listener(Self::on_import_obsidian))
+            .on_action(cx.listener(Self::on_import_logseq))
+            .on_action(cx.listener(Self::on_import_notion))
+            .on_action(cx.listener(Self::on_record_voice_note))
+            .on_action(cx.listener(Self::on_stop_recording))
+            .on_action(cx.listener(Self::on_cancel_recording))
+            .on_action(cx.listener(Self::on_transcribe_voice_notes))
+            .on_action(cx.listener(Self::on_new_whiteboard))
+            .on_action(cx.listener(Self::on_export_vault))
+            .on_action(cx.listener(Self::on_import_vault))
+            .on_action(cx.listener(Self::on_whiteboard_fit))
+            .on_action(cx.listener(Self::on_whiteboard_zoom_reset))
+            .on_action(cx.listener(Self::on_whiteboard_add_page))
+            .on_action(cx.listener(Self::on_toggle_whiteboard_outline))
+            .on_action(cx.listener(Self::on_whiteboard_delete))
             .child(sidebar)
             .child(content)
             .children(status_toast)
-            // Under the palette and dialogs, which can open over it.
+            .children(self.render_vim_pill())
+            .children(self.render_voice_pill(cx))
             .children(ask_overlay)
             .children(overlay)
             .children(settings_overlay)
             .children(page_menu_overlay)
             .children(shortcuts_overlay)
+            .children(self.render_import_dialog(cx))
+            .children(self.render_vault_dialog(cx))
             .children(trash_confirm_overlay)
     }
 }
@@ -12397,12 +12728,29 @@ mod tests {
                 })
                 .collect()
         });
-        assert_eq!(commands, Command::ALL);
+        // All but the ones for a recording in progress (decision 52) and
+        // the ones for a whiteboard on screen (decision 53).
+        let all: Vec<Command> = Command::ALL
+            .iter()
+            .copied()
+            .filter(|c| {
+                !matches!(
+                    c,
+                    Command::StopRecording
+                        | Command::CancelRecording
+                        | Command::WhiteboardFit
+                        | Command::WhiteboardZoomReset
+                        | Command::WhiteboardAddPage
+                        | Command::ToggleWhiteboardOutline
+                )
+            })
+            .collect();
+        assert_eq!(commands, all);
         // Every row is rendered (the list scrolls; arrows reach the last).
-        for c in Command::ALL {
+        for c in &all {
             assert!(has(cx, &format!("command-{}", c.name())), "{c:?}");
         }
-        for _ in 0..Command::ALL.len() + 12 {
+        for _ in 0..all.len() + 12 {
             cx.simulate_keystrokes("down");
         }
         let last = view.update(cx, |app, _| {
@@ -12420,7 +12768,7 @@ mod tests {
         assert!(offered.contains(&Command::CollapseAll));
         cx.simulate_keystrokes("escape ctrl-g ctrl-k");
         let offered = view.update(cx, |app, _| app.available_commands());
-        for c in Command::ALL {
+        for c in &all {
             assert_eq!(
                 offered.contains(c),
                 c.needs() == Needs::Nothing,
@@ -14598,6 +14946,2276 @@ mod tests {
         view.update(cx, |app, _| {
             assert_eq!(app.pages[app.selected].title, "JavaScript")
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- live embeds (decision 47) -------------------------------------------
+
+    const EMBED_ID: &str = "6f9b2c1e-0000-4000-8000-0000000000e1";
+
+    fn embed_lines(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        view.update(cx, |app, _| app.embed_lines.clone())
+    }
+
+    fn lines(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Start editing row `row` by clicking its own text (the middle of a
+    /// row with an embed is the embed), with the cursor at the end.
+    fn click_host_text(view: &Entity<NoteSec>, cx: &mut VisualTestContext, row: usize) {
+        let at = view.update(cx, |app, _| {
+            let (_, layout) = app.reading_layouts.iter().find(|(r, _)| *r == row).unwrap();
+            let p = layout.position_for_index(0).unwrap();
+            point(p.x + px(1.), p.y + layout.line_height() / 2.)
+        });
+        cx.simulate_click(at, Modifiers::none());
+        cx.simulate_keystrokes("end");
+    }
+
+    #[gpui::test]
+    fn embeds_show_the_source_live_and_open_it_on_click(cx: &mut TestAppContext) {
+        let test = format!("- intro ![[Beta]]\n- ![[(({EMBED_ID}))]]\n");
+        let beta = format!("- one\n  id:: {EMBED_ID}\n  - child\n- two\n");
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "embed-live",
+            &[("Test", &test), ("Beta", &beta)],
+            "Test",
+        );
+        let pages_before = view.update(cx, |app, _| app.pages.len());
+        assert_eq!(
+            embed_lines(&view, cx),
+            lines(&[
+                "[Beta]",
+                "  one",
+                "    child",
+                "  two",
+                "[Beta]",
+                "  one",
+                "    child"
+            ])
+        );
+        assert!(has(cx, "embed-0-title-0") && has(cx, "embed-0-block-3"));
+        assert!(has(cx, "embed-1-title-0") && has(cx, "embed-1-block-2"));
+        assert!(!has(cx, "embed-1-block-3"));
+        // The embedding block's own text stays (and stays editable).
+        assert_eq!(
+            reading_text(&view, cx, 0).as_deref(),
+            Some("intro ![[Beta]]")
+        );
+
+        // Edit the source; the embeds show it when we come back.
+        click_sidebar_page(&view, cx, "Beta");
+        edit_and_leave(cx, 1, " edited");
+        click_sidebar_page(&view, cx, "Test");
+        assert_eq!(
+            embed_lines(&view, cx),
+            lines(&[
+                "[Beta]",
+                "  one",
+                "    child edited",
+                "  two",
+                "[Beta]",
+                "  one",
+                "    child edited"
+            ])
+        );
+
+        // Editing and saving the host: the block embed is no page link, so
+        // no "((id))" page appears, and the file keeps the syntax.
+        click_host_text(&view, cx, 1);
+        cx.simulate_input(" here");
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert_eq!(app.pages.len(), pages_before));
+        assert_eq!(
+            file(&dir),
+            format!("- intro ![[Beta]]\n- ![[(({EMBED_ID}))]] here\n")
+        );
+
+        // A click on an embedded block edits it on its own page.
+        click_on(cx, "embed-1-block-2");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Beta");
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.text, "child edited");
+        });
+        cx.simulate_keystrokes("escape");
+        click_sidebar_page(&view, cx, "Test");
+        // The title opens the source page, without editing anything.
+        click_on(cx, "embed-0-title-0");
+        view.update(cx, |app, _| {
+            assert_eq!(app.pages[app.selected].title, "Beta");
+            assert_eq!(app.editing, None);
+            // Both embeds count in Beta's "Linked from".
+            assert_eq!(app.backlink_texts.len(), 2);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn embed_notes_for_cycles_missing_trashed_and_deep_targets(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "embed-notes",
+            &[
+                ("Test", "- ![[Test]]\n- ![[Gone]] ![[Beta]]\n- ![[P1]]\n"),
+                ("Beta", "- beta ![[test]]\n"),
+                ("P1", "- 1 ![[P2]]\n"),
+                ("P2", "- 2 ![[P3]]\n"),
+                ("P3", "- 3 ![[P4]]\n"),
+                ("P4", "- 4 ![[P5]]\n"),
+                ("P5", "- 5\n"),
+            ],
+            "Test",
+        );
+        assert_eq!(
+            embed_lines(&view, cx),
+            lines(&[
+                "Circular embed of \u{201c}Test\u{201d}",
+                "Page \u{201c}Gone\u{201d} not found",
+                "[Beta]",
+                "  beta ![[test]]",
+                "    Circular embed of \u{201c}Test\u{201d}",
+                "[P1]",
+                "  1 ![[P2]]",
+                "    [P2]",
+                "      2 ![[P3]]",
+                "        [P3]",
+                "          3 ![[P4]]",
+                "            [P4]",
+                "              4 ![[P5]]",
+                "                Embeds nested more than 4 deep are not shown",
+            ])
+        );
+        assert!(has(cx, "embed-0-note-0") && has(cx, "embed-1-note-0"));
+
+        // A trashed page is a missing one.
+        view.update(cx, |app, cx| app.delete_page("Beta", cx).unwrap());
+        click_sidebar_page(&view, cx, "Test");
+        let shown = embed_lines(&view, cx);
+        assert_eq!(
+            shown[1..3],
+            lines(&[
+                "Page \u{201c}Gone\u{201d} not found",
+                "Page \u{201c}Beta\u{201d} not found"
+            ])
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn an_embed_in_one_pane_follows_typing_in_the_other(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "embed-split",
+            &[("Test", "- ![[Beta]]\n"), ("Beta", "- one\n- two\n")],
+            "Test",
+        );
+        // Test on the left, Beta on the right (focused), being edited.
+        cx.simulate_keystrokes("ctrl-\\");
+        click_sidebar_page(&view, cx, "Beta");
+        assert_eq!(split_of(&view, cx), split_is("Beta", true));
+        assert!(in_pane(cx, "other-embed-0-title-0", "left"));
+        click_block(cx, 1);
+        cx.simulate_input(" typing");
+        let other = view.update(cx, |app, _| app.other_embed_lines.clone());
+        assert_eq!(other, lines(&["[Beta]", "  one", "  two typing"]));
+        // Nothing saved yet: it is the editor's text.
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Beta")).unwrap(),
+            "- one\n- two\n"
+        );
+        cx.simulate_keystrokes("escape");
+        let other = view.update(cx, |app, _| app.other_embed_lines.clone());
+        assert_eq!(other, lines(&["[Beta]", "  one", "  two typing"]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn bang_double_bracket_picks_a_page_by_alias_and_embeds_its_title(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "embed-picker",
+            &[
+                ("Test", "- \n- {{embed [[js]]}}\n"),
+                ("JavaScript", "alias:: JS\n\n- the language\n"),
+            ],
+            "Test",
+        );
+        let pages_before = view.update(cx, |app, _| app.pages.len());
+        // Logseq's form, by alias, resolves like a link. The page's
+        // properties block shows as it does on the page.
+        let js = ["[JavaScript]", "  alias:: JS", "  the language"];
+        assert_eq!(embed_lines(&view, cx), lines(&js));
+        click_block(cx, 0);
+        cx.simulate_input("![[js");
+        assert!(has(cx, "ref-menu"));
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.editor.text, "![[JavaScript]]"));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(file(&dir), "- ![[JavaScript]]\n- {{embed [[js]]}}\n");
+        assert_eq!(embed_lines(&view, cx), lines(&[js, js].concat()));
+        view.update(cx, |app, _| assert_eq!(app.pages.len(), pages_before));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- vim mode (decision 48) ----------------------------------------------
+
+    /// Like `setup`, with vim mode on.
+    fn setup_vim<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        markdown: &str,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        let (view, cx, dir) = setup(cx, name, markdown);
+        view.update(cx, |app, cx| {
+            app.config.vim_mode = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (view, cx, dir)
+    }
+
+    fn vim_label(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Option<String> {
+        view.update(cx, |app, _| app.vim_label())
+    }
+
+    fn block_texts(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        view.update(cx, |app, _| {
+            app.pages[app.selected]
+                .blocks
+                .iter()
+                .map(|b| b.content.clone())
+                .collect()
+        })
+    }
+
+    fn editing_text(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> (Option<usize>, String) {
+        view.update(cx, |app, _| (app.editing, app.editor.text.clone()))
+    }
+
+    #[gpui::test]
+    fn vim_is_off_by_default_and_editing_is_unchanged(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "vim-off", "- one\n");
+        view.update(cx, |app, _| assert!(!app.config.vim_mode));
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end");
+        cx.simulate_input(" ijk:wq");
+        assert_eq!(editing_text(&view, cx), (Some(0), "one ijk:wq".into()));
+        assert!(!has(cx, "vim-mode"));
+        assert_eq!(vim_label(&view, cx), None);
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), "- one ijk:wq\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_settings_row_and_the_command_turn_vim_on_and_off(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "vim-settings", "- one\n");
+        cx.simulate_keystrokes("ctrl-,");
+        assert!(has(cx, "settings-editor") && has(cx, "vim-mode-off"));
+        click_on(cx, "vim-mode-on");
+        view.update(cx, |app, _| assert!(app.config.vim_mode));
+        assert!(saved_config(&dir).vim_mode);
+        click_on(cx, "vim-mode-off");
+        assert!(!saved_config(&dir).vim_mode);
+        cx.simulate_keystrokes("escape");
+
+        // The palette command, which Settings > Shortcuts lists too.
+        run_in_palette(cx, "Toggle vim mode");
+        assert!(saved_config(&dir).vim_mode);
+        assert_eq!(status_text(&view, cx).as_deref(), Some("Vim mode is on"));
+        view.update(cx, |app, _| {
+            assert!(app
+                .key_table()
+                .iter()
+                .all(|s| s.description != "Toggle vim mode"));
+            assert!(Command::ALL.contains(&Command::ToggleVimMode));
+        });
+        run_in_palette(cx, "Toggle vim mode");
+        assert!(!saved_config(&dir).vim_mode);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn normal_mode_keys_never_type_and_i_and_esc_switch_modes(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-modes", "- hello world\n");
+        // A click starts editing in Normal mode, shown at the bottom.
+        click_block(cx, 0);
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("NORMAL"));
+        assert!(has(cx, "vim-mode"));
+        cx.simulate_input("qzQZ");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello world".into()));
+        // Motions, then insert.
+        cx.simulate_input("0w");
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 6));
+        cx.simulate_input("2d");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("NORMAL  2d"));
+        cx.simulate_keystrokes("escape");
+        cx.simulate_input("i");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("INSERT"));
+        cx.simulate_input("big ");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello big world".into()));
+        // Esc: Normal, still editing. Esc again: stop, saved.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("NORMAL"));
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 9));
+        // Visual: select the word under the cursor and delete it.
+        cx.simulate_input("bve");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("VISUAL"));
+        cx.simulate_input("d");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello  world".into()));
+        cx.simulate_input("x");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello world".into()));
+        // Each change is one undo step.
+        cx.simulate_input("u");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello  world".into()));
+        cx.simulate_keystrokes("ctrl-r");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello world".into()));
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert!(!has(cx, "vim-mode"));
+        assert_eq!(file(&dir), "- hello world\n");
+        // An input method's text is ignored in Normal mode too.
+        click_block(cx, 0);
+        view.update_in(cx, |app, window, cx| {
+            app.replace_text_in_range(None, "zz", window, cx);
+            app.replace_and_mark_text_in_range(None, "zz", None, window, cx);
+        });
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello world".into()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn dd_yy_and_p_work_on_whole_blocks(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-blocks", "- one\n  - child\n- two\n- three\n");
+        click_block(cx, 0);
+        // `dd` takes the block with its child.
+        cx.simulate_input("dd");
+        assert_eq!(block_texts(&view, cx), ["two", "three"]);
+        assert_eq!(editing_text(&view, cx), (Some(0), "two".into()));
+        assert_eq!(file(&dir), "- two\n- three\n");
+        // `p`: below, as it was.
+        cx.simulate_input("p");
+        assert_eq!(block_texts(&view, cx), ["two", "one", "child", "three"]);
+        assert_eq!(editing_text(&view, cx), (Some(1), "one".into()));
+        assert_eq!(file(&dir), "- two\n- one\n  - child\n- three\n");
+        // `yy` + `P`: a copy above.
+        cx.simulate_input("GyyggP");
+        assert_eq!(
+            block_texts(&view, cx),
+            ["three", "two", "one", "child", "three"]
+        );
+        assert_eq!(editing_text(&view, cx), (Some(0), "three".into()));
+        // `u` undoes the paste, then the earlier paste.
+        cx.simulate_input("u");
+        assert_eq!(block_texts(&view, cx), ["two", "one", "child", "three"]);
+        cx.simulate_input("2dd");
+        assert_eq!(block_texts(&view, cx), ["three"]);
+        // The last block: it is emptied, the page keeps one block.
+        cx.simulate_input("dd");
+        assert_eq!(block_texts(&view, cx), [""]);
+        assert_eq!(editing_text(&view, cx), (Some(0), "".into()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn o_and_capital_o_open_blocks_and_esc_closes_the_slash_menu_first(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-open", "- one\n- two\n");
+        click_block(cx, 0);
+        cx.simulate_input("o");
+        assert_eq!(block_texts(&view, cx), ["one", "", "two"]);
+        assert_eq!(editing_text(&view, cx), (Some(1), "".into()));
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("INSERT"));
+        cx.simulate_input("new");
+        // Enter in Insert mode splits as always and stays in Insert.
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("next");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("INSERT"));
+        cx.simulate_keystrokes("escape");
+        cx.simulate_input("O");
+        cx.simulate_input("/");
+        assert!(has(cx, "slash-menu"));
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "slash-menu"));
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("INSERT"));
+        cx.simulate_keystrokes("escape escape");
+        // Esc on the menu took the "/" back, as without vim.
+        assert_eq!(file(&dir), "- one\n- new\n- \n- next\n- two\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn j_k_gg_g_and_indent_move_through_the_outline(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-moves", "- one\n- two\n  second line\n- three\n");
+        click_block(cx, 0);
+        cx.simulate_input("0j");
+        assert_eq!(editing_text(&view, cx).0, Some(1));
+        // `j` inside a multi-line block, then on to the next block.
+        cx.simulate_input("j");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, 4);
+        });
+        cx.simulate_input("j");
+        assert_eq!(editing_text(&view, cx).0, Some(2));
+        cx.simulate_input("k");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, 4, "on its last line");
+        });
+        cx.simulate_input("gg");
+        assert_eq!(editing_text(&view, cx).0, Some(0));
+        cx.simulate_input("G");
+        assert_eq!(editing_text(&view, cx).0, Some(2));
+        cx.simulate_input(">>");
+        assert_eq!(file(&dir), "- one\n- two\n  second line\n  - three\n");
+        cx.simulate_input("<<");
+        assert_eq!(file(&dir), "- one\n- two\n  second line\n- three\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn colon_commands_save_stop_and_complain(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-colon", "- one\n");
+        click_block(cx, 0);
+        cx.simulate_input("0x:w");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some(":w"));
+        // The page isn't written before `:w` (only on leaving the block).
+        assert_eq!(file(&dir), "- one\n");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(file(&dir), "- ne\n");
+        assert_eq!(
+            status_text(&view, cx).as_deref(),
+            Some("Saved \u{201c}Test\u{201d}")
+        );
+        assert_eq!(editing_text(&view, cx), (Some(0), "ne".into()));
+        cx.simulate_input(":bogus");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            status_text(&view, cx).as_deref(),
+            Some("Not an editor command: bogus")
+        );
+        view.update(cx, |app, _| assert!(app.status.as_ref().unwrap().error));
+        cx.simulate_input("x:q");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), "- e\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn shortcuts_the_palette_and_the_rename_field_are_not_vim(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "vim-other-inputs", &tab_pages(), "Test");
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        click_block(cx, 0);
+        // Ctrl+K opens the palette from Normal mode, and it takes typing.
+        cx.simulate_keystrokes("ctrl-k");
+        view.update(cx, |app, _| assert!(app.search.is_some()));
+        cx.simulate_input("dd");
+        view.update(cx, |app, _| {
+            assert_eq!(app.search.as_ref().unwrap().query.text, "dd");
+            assert_eq!(app.vim_label(), None);
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(block_texts(&view, cx), ["see [[Alpha]]"]);
+
+        // The rename field types plain text.
+        click_block(cx, 0);
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-rename");
+        cx.simulate_input("Gamma");
+        cx.simulate_keystrokes("enter");
+        assert!(page_file(&dir, "Gamma").exists());
+
+        // Ctrl+G still toggles the graph from Normal mode.
+        click_sidebar_page(&view, cx, "Test");
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-g");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- publish (decision 49) -------------------------------------------------
+
+    /// Every file under `dir`, relative, sorted.
+    fn files_under(dir: &std::path::Path) -> Vec<String> {
+        fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else {
+                    out.push(p.strip_prefix(base).unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    const PUBLISH_SECRET: &str = "sk-test-NOTESEC-PUBLISH-0123456789";
+
+    #[gpui::test]
+    fn publish_writes_a_self_contained_bundle_without_secrets(cx: &mut TestAppContext) {
+        let pages = [
+            (
+                "Test",
+                "- see [[Alpha]] and [[Private]]\n- ![pic](../assets/p.png)\n- ![[Alpha]]\n",
+            ),
+            ("Alpha", "- quoted text\n"),
+            ("Private", "public:: false\n\n- dear diary\n"),
+        ];
+        let (view, cx, dir) = setup_pages(cx, "publish", &pages, "Test");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(dir.join("assets/p.png"), png.into_inner()).unwrap();
+        // Secrets the graph folder holds: never published.
+        let key_line = format!("ai_api_key = \"{PUBLISH_SECRET}\"\n");
+        std::fs::write(dir.join("state.toml"), &key_line).unwrap();
+        std::fs::write(dir.join("config.toml"), format!("# {PUBLISH_SECRET}\n")).unwrap();
+        std::fs::create_dir_all(dir.join(".trash/1/pages")).unwrap();
+        std::fs::write(
+            dir.join(".trash/1/pages/Gone.md"),
+            format!("- {PUBLISH_SECRET}\n"),
+        )
+        .unwrap();
+
+        let loaded = view.update(cx, |app, _| app.pages.len());
+        // The block being edited is saved first.
+        click_block(cx, 0);
+        run_in_palette(cx, "publish page with linked pages");
+        view.update(cx, |app, _| assert!(app.editing.is_none()));
+        cx.run_until_parked();
+        let bundle = dir.join("published/test");
+        assert_eq!(
+            files_under(&bundle),
+            [
+                ".notesec-bundle",
+                "README.txt",
+                "alpha.html",
+                "assets/p.png",
+                "index.html",
+                "style.css"
+            ]
+        );
+        for file in files_under(&bundle) {
+            let bytes = std::fs::read(bundle.join(&file)).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(PUBLISH_SECRET), "{file}");
+            assert!(!text.contains("dear diary"), "{file}");
+        }
+        // The test is only meaningful if the key was there all along.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state.toml")).unwrap(),
+            key_line
+        );
+        let index = std::fs::read_to_string(bundle.join("index.html")).unwrap();
+        assert!(index.contains("<a class=\"link\" href=\"alpha.html\" data-page=\"Alpha\">"));
+        assert!(index.contains("<span class=\"link\" data-page=\"Private\">"));
+        assert!(index.contains("<img src=\"assets/p.png\" alt=\"pic\">"));
+        assert!(index.contains("data-page=\"Alpha\">Alpha</div><ul class=\"embed-outline\">"));
+
+        // The status says where, with the folder's buttons.
+        assert_eq!(
+            status_text(&view, cx),
+            Some(format!(
+                "Published \u{201c}Test\u{201d} and 1 linked page to {}",
+                bundle.display()
+            ))
+        );
+        click_on(cx, "publish-open-folder");
+        view.update(cx, |app, _| {
+            assert_eq!(app.publish.opened, [bundle.clone()])
+        });
+        click_on(cx, "publish-copy-path");
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied, Some(bundle.display().to_string()));
+
+        // Published files are never read as pages, now or on the next start.
+        view.update(cx, |app, _| assert_eq!(app.pages.len(), loaded));
+        assert_eq!(Storage::open(dir.clone()).unwrap().load_all().len(), loaded);
+        // Another status message: the buttons go with the publish status.
+        view.update(cx, |app, cx| {
+            app.show_status(
+                Status {
+                    text: "something else".into(),
+                    error: false,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(has(cx, "status-toast") && !has(cx, "publish-open-folder"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn publish_refuses_private_pages_and_needs_a_page(cx: &mut TestAppContext) {
+        let pages = [
+            ("Secret", "private:: true\n\n- plans\n"),
+            ("Open", "- hi\n"),
+        ];
+        let (view, cx, dir) = setup_pages(cx, "publish-private", &pages, "Secret");
+        let offered = view.update(cx, |app, _| app.available_commands());
+        assert!(offered.contains(&Command::PublishPage));
+        assert!(offered.contains(&Command::PublishPageWithLinks));
+        cx.dispatch_action(PublishPage);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.error);
+        assert!(
+            status.text.contains("\u{201c}Secret\u{201d} is private"),
+            "{}",
+            status.text
+        );
+        assert!(!dir.join("published").exists());
+        assert!(!has(cx, "publish-open-folder"));
+
+        // On the graph or trash tab there is no page: no command, and the
+        // actions do nothing.
+        for tab in ["graph", "trash"] {
+            match tab {
+                "graph" => cx.simulate_keystrokes("ctrl-g"),
+                _ => click_on(cx, "sidebar-trash"),
+            }
+            let offered = view.update(cx, |app, _| app.available_commands());
+            assert!(!offered.contains(&Command::PublishPage), "{tab}");
+            assert!(!offered.contains(&Command::PublishPageWithLinks), "{tab}");
+            cx.simulate_keystrokes("ctrl-k");
+            cx.simulate_input("publish page");
+            assert!(!has(cx, "command-PublishPage"));
+            cx.simulate_keystrokes("escape");
+            cx.dispatch_action(PublishPage);
+            cx.dispatch_action(PublishPageWithLinks);
+            assert!(!dir.join("published").exists());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A small Obsidian vault outside the graph, for the import tests.
+    fn obsidian_vault(name: &str) -> PathBuf {
+        let vault =
+            std::env::temp_dir().join(format!("notesec-vault-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&vault);
+        std::fs::create_dir_all(vault.join("Sub")).unwrap();
+        std::fs::create_dir_all(vault.join(".obsidian")).unwrap();
+        std::fs::write(vault.join(".obsidian/app.json"), "{}").unwrap();
+        std::fs::write(
+            vault.join("Home.md"),
+            "---\ntags: [project, big idea]\n---\n# Home\nSee [[Other|the other one]] and ![[pic.png]].\n",
+        )
+        .unwrap();
+        std::fs::write(vault.join("Sub/Other.md"), "Back to [[Home]].\n").unwrap();
+        std::fs::write(vault.join("Sub/pic.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
+        vault
+    }
+
+    fn pick(cx: &mut VisualTestContext, folder: &std::path::Path) {
+        assert!(cx.did_prompt_for_paths());
+        let folder = folder.to_path_buf();
+        cx.simulate_path_prompt_response(move |options| {
+            assert!(options.directories && !options.files && !options.multiple);
+            Some(vec![folder])
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn import_from_obsidian_loads_pages_assets_and_a_log(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "import-obsidian", &[("Test", "- a\n")], "Test");
+        let vault = obsidian_vault("ui");
+        let offered = view.update(cx, |app, _| app.available_commands());
+        for command in [
+            Command::ImportObsidian,
+            Command::ImportLogseq,
+            Command::ImportNotion,
+        ] {
+            assert!(offered.contains(&command), "{command:?}");
+        }
+        run_in_palette(cx, "import from obsidian");
+        pick(cx, &vault);
+
+        assert!(!has(cx, "import-clash"));
+        let status = status_text(&view, cx).unwrap();
+        assert!(
+            status.starts_with("Imported 2 pages and 1 asset from Obsidian"),
+            "{status}"
+        );
+        let (log, home) = view.update(cx, |app, _| {
+            let log = app.current_page().unwrap();
+            let home = app
+                .pages
+                .iter()
+                .find(|p| p.title == "Home")
+                .unwrap()
+                .to_markdown();
+            (log, home)
+        });
+        assert!(log.starts_with("Import from Obsidian "), "{log}");
+        assert!(home.contains("tags:: #project, #[[big idea]]"), "{home}");
+        assert!(
+            home.contains(&format!("imported-from:: [[{log}]]")),
+            "{home}"
+        );
+        assert!(
+            home.contains("See [[Other]] and ![pic.png](../assets/pic.png)."),
+            "{home}"
+        );
+        assert!(view.update(cx, |app, _| app.find_page("Other").is_some()));
+        assert!(dir.join("assets/pic.png").exists());
+        assert!(dir.join("pages/Home.md").exists());
+        // Nothing from the hidden app folder.
+        assert!(view.update(cx, |app, _| app.find_page("app").is_none()));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[gpui::test]
+    fn import_asks_before_renaming_or_skipping_taken_names(cx: &mut TestAppContext) {
+        let pages = [("Test", "- a\n"), ("Home", "- mine\n")];
+        let (view, cx, dir) = setup_pages(cx, "import-clash", &pages, "Test");
+        let vault = obsidian_vault("clash");
+
+        // Cancel: nothing is written.
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        assert!(has(cx, "import-clash"));
+        click_on(cx, "import-clash-cancel");
+        assert!(!has(cx, "import-clash"));
+        assert!(status_text(&view, cx).unwrap().contains("cancelled"));
+        assert!(!dir.join("pages/Other.md").exists());
+        assert!(!dir.join("assets").join("pic.png").exists());
+
+        // Skip: Home stays mine, Other comes in and links to my Home.
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        click_on(cx, "import-clash-skip");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Home.md")).unwrap(),
+            "- mine\n"
+        );
+        let status = status_text(&view, cx).unwrap();
+        assert!(
+            status.contains("Imported 1 page") && status.contains("skipped 1"),
+            "{status}"
+        );
+        assert!(dir.join("pages/Other.md").exists());
+
+        // Rename: both are taken now, and get the suffix; links follow.
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        assert!(has(cx, "import-clash"));
+        click_on(cx, "import-clash-rename");
+        let status = status_text(&view, cx).unwrap();
+        assert!(
+            status.contains("Imported 2 pages") && status.contains("renamed 2"),
+            "{status}"
+        );
+        let renamed = view.update(cx, |app, _| {
+            app.pages
+                .iter()
+                .find(|p| p.title == "Other (imported)")
+                .map(|p| p.to_markdown())
+        });
+        assert!(renamed.unwrap().contains("Back to [[Home (imported)]]."));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Home.md")).unwrap(),
+            "- mine\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[gpui::test]
+    fn import_refuses_the_graph_itself_and_a_cancelled_picker_does_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx, dir) = setup_pages(cx, "import-refuse", &[("Test", "- a\n")], "Test");
+        let before = view.update(cx, |app, _| app.pages.len());
+        cx.dispatch_action(ImportLogseq);
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert_eq!(view.update(cx, |app, _| app.pages.len()), before);
+
+        cx.dispatch_action(ImportLogseq);
+        pick(cx, &dir.join("pages"));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.error, "{}", status.text);
+        assert!(
+            status.text.contains("outside this graph"),
+            "{}",
+            status.text
+        );
+
+        // A Notion zip: unzip first.
+        let zip = std::env::temp_dir().join(format!("notesec-export-{}.zip", std::process::id()));
+        std::fs::write(&zip, b"PK\x03\x04").unwrap();
+        cx.dispatch_action(ImportNotion);
+        pick(cx, &zip);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error && status.text.contains("unzip"),
+            "{}",
+            status.text
+        );
+        assert_eq!(view.update(cx, |app, _| app.pages.len()), before);
+        let _ = std::fs::remove_file(zip);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn vim_keys_never_reach_a_block_behind_the_import_dialog(cx: &mut TestAppContext) {
+        let pages = [("Test", "- keep me\n- second\n"), ("Home", "- mine\n")];
+        let (view, cx, dir) = setup_pages(cx, "import-vim", &pages, "Test");
+        let vault = obsidian_vault("vim");
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        assert!(has(cx, "import-clash"));
+        // A block in edit mode behind the dialog: the user clicked one while
+        // the export was still being read (too quick to time in a test, so
+        // made directly). Vim keys must not reach it.
+        view.update_in(cx, |app, window, cx| app.start_edit(0, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("d d x p");
+        cx.simulate_input("typed");
+        assert_eq!(block_texts(&view, cx), ["keep me", "second"]);
+        view.update(cx, |app, _| {
+            assert!(!app.vim_applies());
+            assert_eq!(app.vim_label(), None);
+        });
+        // Escape cancels the dialog (nothing imported).
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "import-clash"));
+        assert!(!dir.join("pages/Other.md").exists());
+        view.update(cx, |app, cx| app.stop_edit(cx));
+
+        // Keys can't open a block behind the dialog either.
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        assert!(has(cx, "import-clash"));
+        cx.simulate_keystrokes("enter i o down d d");
+        cx.simulate_input("x");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(block_texts(&view, cx), ["keep me", "second"]);
+        click_on(cx, "import-clash-cancel");
+        // Showing the dialog closes an open block first.
+        let root = dir.clone();
+        view.update_in(cx, |app, window, cx| {
+            app.start_edit(0, window, cx);
+            let existing = app.import_existing();
+            let plan =
+                crate::import::plan(crate::import::Source::Obsidian, &vault, &root, &existing)
+                    .unwrap();
+            app.offer_import_clash(plan, cx);
+            assert_eq!(app.editing, None);
+        });
+        cx.run_until_parked();
+        assert!(has(cx, "import-clash"));
+        click_on(cx, "import-clash-cancel");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Test.md")).unwrap(),
+            "- keep me\n- second\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    /// Send `raw` to the clipper on `port` from another thread while the
+    /// app runs (it saves clips on its UI thread); the whole answer.
+    fn post_clip(cx: &mut VisualTestContext, port: u16, raw: String) -> String {
+        let client = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer);
+            answer
+        });
+        for _ in 0..4000 {
+            if client.is_finished() {
+                break;
+            }
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        client.join().unwrap()
+    }
+
+    fn clip_request(port: u16, content_type: &str, extra: &str, body: &str) -> String {
+        format!(
+            "POST /clip HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {content_type}\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[gpui::test]
+    fn the_web_clipper_saves_posted_pages_as_inbox_pages(cx: &mut TestAppContext) {
+        let pages = [("Test", "- a\n"), ("Article", "- mine\n")];
+        let (view, cx, dir) = setup_pages(cx, "clipper", &pages, "Test");
+        // Off by default: nothing listens.
+        view.update(cx, |app, _| {
+            assert!(!app.config.web_clipper);
+            assert_eq!(app.clipper_listening(), None);
+        });
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-clipper");
+        assert!(has(cx, "settings-clipper"));
+        // Port 0: any free port (the test mustn't take the real one).
+        view.update(cx, |app, _| app.config.clipper_port = 0);
+        click_on(cx, "clipper-on");
+        let (port, token) = view.update(cx, |app, _| {
+            (
+                app.clipper_listening().unwrap(),
+                app.state.clipper_token.clone(),
+            )
+        });
+        assert_ne!(port, 0);
+        assert_eq!(token.len(), 64);
+        assert!(saved_config(&dir).web_clipper);
+        let saved_state = std::fs::read_to_string(dir.join("state.toml")).unwrap();
+        assert!(saved_state.contains(&format!("clipper_token = \"{token}\"")));
+        click_on(cx, "clipper-copy-bookmarklet");
+        let copied = cx.read_from_clipboard().and_then(|i| i.text()).unwrap();
+        assert!(copied.starts_with("javascript:"));
+        assert!(copied.contains(&format!("http://127.0.0.1:{port}/clip")));
+        assert!(copied.contains(&token));
+        cx.simulate_keystrokes("escape");
+
+        // A form post (the bookmarklet's): a taken title gets " (2)".
+        let html = "%3Ch1%3EBig%3C%2Fh1%3E%3Cp%3Etext+%3Ca+href%3D%22javascript%3Ax()%22+onclick%3D%22y()%22%3Elink%3C%2Fa%3E%3C%2Fp%3E%3Cscript%3Eevil()%3C%2Fscript%3E";
+        let body = format!("token={token}&title=Article&url=https%3A%2F%2Fe.com%2Fa&html={html}");
+        let answer = post_clip(
+            cx,
+            port,
+            clip_request(port, "application/x-www-form-urlencoded", "", &body),
+        );
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(answer.contains("Saved to NoteSec"));
+        let today = today_title();
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Article (2)")).unwrap(),
+            format!(
+                "- source:: https://e.com/a\n  clipped:: [[{today}]]\n  tags:: #clipped\n- # Big\n  - text link\n"
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Article")).unwrap(),
+            "- mine\n"
+        );
+        let journal = dir
+            .join("journals")
+            .join(format!("{}.md", today.replace('-', "_")));
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap(),
+            "- Clipped [[Article (2)]]\n"
+        );
+        assert_eq!(
+            status_text(&view, cx).as_deref(),
+            Some("Clipped \u{201c}Article (2)\u{201d}")
+        );
+        click_on(cx, "clipper-open");
+        view.update(cx, |app, _| {
+            assert_eq!(app.current_page().as_deref(), Some("Article (2)"))
+        });
+
+        // JSON (an extension's), token in the header; the inbox grows.
+        let json =
+            r#"{"title":"From JSON","url":"https://e.com/j","html":"<ul><li>one</li></ul>"}"#;
+        let answer = post_clip(
+            cx,
+            port,
+            clip_request(
+                port,
+                "application/json",
+                &format!("X-NoteSec-Token: {token}\r\n"),
+                json,
+            ),
+        );
+        assert!(
+            answer.ends_with(r#"{"ok":true,"title":"From JSON"}"#),
+            "{answer}"
+        );
+        assert!(page_file(&dir, "From JSON").exists());
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap(),
+            "- Clipped [[Article (2)]]\n- Clipped [[From JSON]]\n"
+        );
+
+        // A wrong token: 403, nothing written.
+        let body = "token=0000&title=Nope&html=x".to_string();
+        let answer = post_clip(
+            cx,
+            port,
+            clip_request(port, "application/x-www-form-urlencoded", "", &body),
+        );
+        assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+        assert!(!page_file(&dir, "Nope").exists());
+        assert!(view.update(cx, |app, _| app.find_page("Nope").is_none()));
+
+        // Regenerate: the old token stops working at once.
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-clipper");
+        click_on(cx, "clipper-regenerate");
+        let (port, new_token) = view.update(cx, |app, _| {
+            (
+                app.clipper_listening().unwrap(),
+                app.state.clipper_token.clone(),
+            )
+        });
+        assert_ne!(new_token, token);
+        let body = format!("token={token}&title=Old&html=x");
+        let answer = post_clip(
+            cx,
+            port,
+            clip_request(port, "application/x-www-form-urlencoded", "", &body),
+        );
+        assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+        assert!(!page_file(&dir, "Old").exists());
+
+        // Off: the port closes.
+        click_on(cx, "clipper-off");
+        assert_eq!(view.update(cx, |app, _| app.clipper_listening()), None);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(!saved_config(&dir).web_clipper);
+        // The port buttons (while off, so nothing binds the real port).
+        click_on(cx, "clipper-port-reset");
+        assert_eq!(
+            saved_config(&dir).clipper_port,
+            crate::clipper::DEFAULT_PORT
+        );
+        click_on(cx, "clipper-port-down");
+        assert_eq!(
+            saved_config(&dir).clipper_port,
+            crate::clipper::DEFAULT_PORT - 1
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_clipper_port_in_use_is_shown_not_a_panic(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "clipper-busy", &[("Test", "- a\n")], "Test");
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        view.update(cx, |app, _| app.config.clipper_port = taken);
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-clipper");
+        click_on(cx, "clipper-on");
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.error);
+        assert!(
+            status.text.contains(&format!("port {taken} is in use")),
+            "{}",
+            status.text
+        );
+        assert!(has(cx, "clipper-status"));
+        assert_eq!(view.update(cx, |app, _| app.clipper_listening()), None);
+        drop(holder);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Stub programs for voice notes (decision 52) in `dir/bin`: a
+    /// recorder that writes a WAV with unset sizes (as a recorder that's
+    /// interrupted early leaves it) and waits for SIGINT, a whisper that
+    /// writes `<-of>.txt` (or fails), and a model file. Real processes,
+    /// run with argument lists like the real ones.
+    fn voice_stubs(dir: &std::path::Path, whisper_body: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut wav = crate::voice::wav_bytes(&[100; 1600]);
+        wav[4..8].copy_from_slice(&0u32.to_le_bytes());
+        wav[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        let fixture = bin.join("fixture.wav");
+        std::fs::write(&fixture, wav).unwrap();
+        let script = |name: &str, body: String| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let recorder = script(
+            "stub-recorder",
+            format!(
+                "trap 'exit 0' INT\ncp '{}' \"$2\"\nwhile true; do sleep 0.05; done",
+                fixture.display()
+            ),
+        );
+        let whisper = script("stub-whisper", whisper_body.to_string());
+        let model = bin.join("ggml-test.bin");
+        std::fs::write(&model, b"lmgg-model").unwrap();
+        (recorder, whisper, model)
+    }
+
+    const WHISPER_OK: &str = r#"for a in "$@"; do [ "$prev" = "-of" ] && base="$a"; [ "$prev" = "-f" ] && wav="$a"; prev="$a"; done
+[ -f "$wav" ] || exit 3
+printf '[00:00:00.000 --> 00:00:01.000]   Buy milk [[and]] eggs.\n[00:00:01.000 --> 00:00:02.000]  [BLANK_AUDIO]\n' > "$base.txt""#;
+
+    fn use_voice_stubs(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        dir: &std::path::Path,
+        whisper_body: &str,
+    ) {
+        let (recorder, whisper, model) = voice_stubs(dir, whisper_body);
+        view.update(cx, |app, _| {
+            app.config.voice_recorder =
+                vec![recorder.display().to_string(), "-o".into(), "{file}".into()];
+            app.config.whisper_binary = whisper.display().to_string();
+            app.config.whisper_model = model.display().to_string();
+        });
+    }
+
+    fn voice_files(dir: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(dir.join("assets"))
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("voice-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        files
+    }
+
+    /// Let the stub recorder start and write its file (real time).
+    fn let_it_record(cx: &mut VisualTestContext) {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_voice_note_is_recorded_repaired_and_transcribed(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "voice-e2e",
+            &[("Test", "- first\n  - child\n- last\n")],
+            "Test",
+        );
+        use_voice_stubs(&view, cx, &dir, WHISPER_OK);
+        view.update(cx, |app, _| app.config.voice_auto_transcribe = true);
+        // Editing "first": the note goes below its subtree.
+        click_block(cx, 0);
+        assert!(!has(cx, "voice-pill"));
+        cx.dispatch_action(RecordVoiceNote);
+        assert!(view.update(cx, |app, _| app.recording()));
+        assert!(has(cx, "voice-pill") && has(cx, "voice-stop") && has(cx, "voice-cancel"));
+        let offered = view.update(cx, |app, _| app.available_commands());
+        assert!(offered.contains(&Command::StopRecording));
+        assert!(offered.contains(&Command::CancelRecording));
+        assert!(!offered.contains(&Command::RecordVoiceNote));
+        // Typing goes on while recording.
+        cx.simulate_input("!");
+        let_it_record(cx);
+        let elapsed = view.update(cx, |app, _| app.voice.elapsed);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "{elapsed:?}"
+        );
+
+        click_on(cx, "voice-stop");
+        cx.run_until_parked();
+        assert!(!view.update(cx, |app, _| app.recording()));
+        let files = voice_files(&dir);
+        assert_eq!(files.len(), 1, "{files:?}");
+        let name = &files[0];
+        assert!(name.starts_with("voice-") && name.ends_with(".wav"));
+        // The header was repaired (sizes were 0 / 0xFFFFFFFF).
+        assert_eq!(
+            std::fs::read(dir.join("assets").join(name)).unwrap(),
+            crate::voice::wav_bytes(&[100; 1600])
+        );
+        let note = format!("![voice note](../assets/{name})");
+        let transcript = "**Transcript:** Buy milk [\u{200b}[and]] eggs.";
+        assert_eq!(
+            block_texts(&view, cx),
+            ["first!", "child", note.as_str(), transcript, "last"]
+        );
+        view.update(cx, |app, _| {
+            let blocks = &app.pages[app.selected].blocks;
+            assert_eq!(blocks[2].parent_id, None, "a sibling of `first`");
+            assert_eq!(blocks[3].parent_id, Some(blocks[2].id), "under the note");
+            assert_eq!(app.editing, None);
+        });
+        assert_eq!(
+            file(&dir),
+            format!("- first!\n  - child\n- {note}\n  - {transcript}\n- last\n")
+        );
+        assert!(!has(cx, "voice-pill"));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.text.starts_with("Transcribed"), "{}", status.text);
+
+        // Reading view: a voice chip with Play (the system player).
+        assert!(has(cx, "voice-2-0") && !has(cx, "image-2-0-missing"));
+        click_on(cx, "voice-2-0-play");
+        view.update(cx, |app, _| {
+            assert_eq!(app.voice.opened, [dir.join("pages/../assets").join(name)]);
+            assert_eq!(app.editing, None, "Play doesn't start editing");
+        });
+        // Transcribe again: one transcript only.
+        click_on(cx, "voice-2-0-transcribe");
+        cx.run_until_parked();
+        assert_eq!(block_texts(&view, cx).len(), 5);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.text.contains("already has a transcript"),
+            "{}",
+            status.text
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn cancel_deletes_the_recording_and_keys_still_work(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            "voice-cancel",
+            &[("Test", "- one\n- two\n- three\n")],
+            "Test",
+        );
+        use_voice_stubs(&view, cx, &dir, WHISPER_OK);
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("Record voice");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(view.update(cx, |app, _| app.recording()));
+        let_it_record(cx);
+        // Recorded outside the vault until finished.
+        let temp = view.update(cx, |app, _| app.recording_file()).unwrap();
+        assert!(temp.is_file() && !temp.starts_with(&dir));
+        // In a folder only we can enter (decision 52).
+        let private = temp.parent().unwrap().to_path_buf();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&private).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        assert!(voice_files(&dir).is_empty());
+        // The pill is not modal: vim keys edit as usual, and Escape
+        // (vim's) doesn't stop the recording.
+        click_block(cx, 0);
+        view.update(cx, |app, _| {
+            assert!(!app.overlay_open());
+            assert!(app.vim_applies(), "vim still owns the keys");
+        });
+        cx.simulate_keystrokes("d d");
+        assert_eq!(block_texts(&view, cx), ["two", "three"]);
+        cx.simulate_keystrokes("escape");
+        assert!(view.update(cx, |app, _| app.recording()));
+        assert!(has(cx, "voice-pill"));
+
+        click_on(cx, "voice-cancel");
+        cx.run_until_parked();
+        assert!(!view.update(cx, |app, _| app.recording()));
+        assert!(!temp.exists(), "the recording is deleted");
+        assert!(!private.exists(), "with its folder");
+        assert!(voice_files(&dir).is_empty());
+        assert_eq!(block_texts(&view, cx), ["two", "three"]);
+        assert!(!has(cx, "voice-pill"));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert_eq!(status.text, "Recording cancelled");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn recording_from_the_sidebar_without_an_open_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "voice-sidebar", &[("Test", "- a\n")], "Test");
+        use_voice_stubs(&view, cx, &dir, WHISPER_OK);
+        click_on(cx, "sidebar-voice");
+        assert!(view.update(cx, |app, _| app.recording()));
+        let_it_record(cx);
+        // The toggle stops it; no auto-transcription unless asked for.
+        cx.dispatch_action(RecordVoiceNote);
+        cx.run_until_parked();
+        let name = voice_files(&dir).pop().unwrap();
+        let note = format!("![voice note](../assets/{name})");
+        assert_eq!(block_texts(&view, cx), ["a", note.as_str()]);
+        // Transcribing the page's notes on request.
+        cx.dispatch_action(TranscribeVoiceNotes);
+        cx.run_until_parked();
+        assert_eq!(
+            block_texts(&view, cx)[2],
+            "**Transcript:** Buy milk [\u{200b}[and]] eggs."
+        );
+        cx.dispatch_action(TranscribeVoiceNotes);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.text.starts_with("No voice notes without"),
+            "{}",
+            status.text
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn recording_stops_at_the_length_limit(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "voice-limit", &[("Test", "- a\n")], "Test");
+        use_voice_stubs(&view, cx, &dir, WHISPER_OK);
+        view.update(cx, |app, _| {
+            app.voice.max_length = std::time::Duration::from_millis(200)
+        });
+        cx.dispatch_action(RecordVoiceNote);
+        let_it_record(cx);
+        cx.run_until_parked();
+        assert!(!view.update(cx, |app, _| app.recording()));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status
+                .text
+                .starts_with("Recording stopped at the 0:00 limit. Voice note saved"),
+            "{}",
+            status.text
+        );
+        assert_eq!(block_texts(&view, cx).len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn voice_errors_are_shown(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "voice-errors", &[("Test", "- a\n")], "Test");
+        // No recorder anywhere: the packages to install.
+        let empty = dir.join("empty-bin");
+        std::fs::create_dir_all(&empty).unwrap();
+        view.update(cx, |app, _| {
+            app.voice.path_var = Some(empty.clone().into_os_string())
+        });
+        cx.dispatch_action(RecordVoiceNote);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error && status.text.contains("pipewire") && status.text.contains("alsa-utils")
+        );
+        assert!(!view.update(cx, |app, _| app.recording()));
+
+        // A recorder that quits at once without audio: the file goes.
+        use std::os::unix::fs::PermissionsExt;
+        let quitter = empty.join("arecord");
+        std::fs::write(
+            &quitter,
+            "#!/bin/sh\necho 'arecord: no such device' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&quitter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cx.dispatch_action(RecordVoiceNote);
+        assert!(view.update(cx, |app, _| app.recording()));
+        let_it_record(cx);
+        cx.run_until_parked();
+        assert!(!view.update(cx, |app, _| app.recording()));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.error, "{}", status.text);
+        assert!(
+            status.text.contains("stopped by itself") && status.text.contains("no such device"),
+            "{}",
+            status.text
+        );
+        assert!(voice_files(&dir).is_empty());
+        assert_eq!(block_texts(&view, cx), ["a"]);
+
+        // Whisper failing: its exit code and stderr; no transcript.
+        use_voice_stubs(
+            &view,
+            cx,
+            &dir,
+            "echo 'error: failed to load model' >&2\nexit 2",
+        );
+        cx.dispatch_action(RecordVoiceNote);
+        let_it_record(cx);
+        cx.dispatch_action(StopRecording);
+        cx.run_until_parked();
+        cx.dispatch_action(TranscribeVoiceNotes);
+        cx.run_until_parked();
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error
+                && status.text.contains("exit 2")
+                && status.text.contains("failed to load model"),
+            "{}",
+            status.text
+        );
+        assert_eq!(block_texts(&view, cx).len(), 2);
+        // A missing model.
+        view.update(cx, |app, _| {
+            app.config.whisper_model = "/nonexistent/m.bin".into()
+        });
+        cx.dispatch_action(TranscribeVoiceNotes);
+        cx.run_until_parked();
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error && status.text.contains("model not found"),
+            "{}",
+            status.text
+        );
+        // No whisper program at all.
+        view.update(cx, |app, _| app.config.whisper_binary.clear());
+        cx.dispatch_action(TranscribeVoiceNotes);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error && status.text.contains("Settings > Voice notes"),
+            "{}",
+            status.text
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn voice_settings_pick_and_test_whisper(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "voice-settings", &[("Test", "- a\n")], "Test");
+        let help =
+            "case \"$1\" in --help) echo 'usage: whisper-cli [options] file0.wav'; exit 0;; esac";
+        let (recorder, whisper, model) = voice_stubs(&dir, help);
+        view.update(cx, |app, _| {
+            app.config.voice_recorder = vec![recorder.display().to_string()]
+        });
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-voice");
+        assert!(has(cx, "settings-voice") && has(cx, "voice-recorder"));
+        let choose = |cx: &mut VisualTestContext, button: &str, path: PathBuf| {
+            click_on(cx, button);
+            assert!(cx.did_prompt_for_paths());
+            cx.simulate_path_prompt_response(move |options| {
+                assert!(options.files && !options.directories && !options.multiple);
+                Some(vec![path])
+            });
+            cx.run_until_parked();
+        };
+        choose(cx, "voice-whisper-choose", whisper.clone());
+        choose(cx, "voice-model-choose", model.clone());
+        assert_eq!(
+            saved_config(&dir).whisper_binary,
+            whisper.display().to_string()
+        );
+        assert_eq!(
+            saved_config(&dir).whisper_model,
+            model.display().to_string()
+        );
+        click_on(cx, "voice-test");
+        cx.run_until_parked();
+        let check = view.update(cx, |app, _| app.voice.check.clone()).unwrap();
+        assert_eq!(
+            check,
+            Ok("Ready: stub-whisper with ggml-test.bin (0 MB)".to_string())
+        );
+        assert!(has(cx, "voice-check"));
+        click_on(cx, "voice-auto-on");
+        assert!(saved_config(&dir).voice_auto_transcribe);
+        click_on(cx, "voice-model-clear");
+        assert_eq!(saved_config(&dir).whisper_model, "");
+        click_on(cx, "voice-test");
+        cx.run_until_parked();
+        let check = view.update(cx, |app, _| app.voice.check.clone()).unwrap();
+        assert!(check.unwrap_err().contains("no model"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Whiteboards (decision 53) ---------------------------------------------
+
+    const BOARD: &str = "- type:: whiteboard\n\
+        - Alpha\n  x:: 0\n  y:: 0\n  w:: 200\n  h:: 100\n\
+        - [[Test]]\n  x:: 400\n  y:: 0\n  w:: 200\n  h:: 100\n";
+
+    fn setup_board<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            name,
+            &[("Board", BOARD), ("Test", "- first line\n- second\n")],
+            "Board",
+        );
+        // The first frame learns the canvas size; the view is fitted to it.
+        cx.run_until_parked();
+        (view, cx, dir)
+    }
+
+    fn board(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> crate::whiteboard::Board {
+        view.update(cx, |app, _| {
+            crate::whiteboard::parse(&app.pages[app.selected])
+        })
+    }
+
+    fn board_zoom(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> f32 {
+        view.update(cx, |app, _| app.board_view().zoom)
+    }
+
+    fn board_file(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("pages/Board.md")).unwrap()
+    }
+
+    fn mouse_drag(
+        cx: &mut VisualTestContext,
+        button: MouseButton,
+        from: Point<Pixels>,
+        to: Point<Pixels>,
+    ) {
+        cx.simulate_mouse_down(from, button, Modifiers::none());
+        let mid = point((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
+        cx.simulate_mouse_move(mid, Some(button), Modifiers::none());
+        cx.simulate_mouse_move(to, Some(button), Modifiers::none());
+        cx.simulate_mouse_up(to, button, Modifiers::none());
+    }
+
+    fn double_click(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 2,
+        });
+    }
+
+    /// A spot on the canvas with no card: its bottom left corner.
+    fn empty_spot(cx: &mut VisualTestContext) -> Point<Pixels> {
+        let canvas = bounds_of(cx, "whiteboard");
+        point(
+            canvas.origin.x + px(60.),
+            canvas.origin.y + canvas.size.height - px(60.),
+        )
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1.0
+    }
+
+    #[gpui::test]
+    fn whiteboard_cards_move_and_resize_in_one_undo_step_each(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-move");
+        assert!(has(cx, "whiteboard") && has(cx, "wb-card-0") && has(cx, "wb-card-1"));
+        assert!(!has(cx, "block-0"), "the canvas, not the outline");
+        let zoom = board_zoom(&view, cx);
+        let undo = view.update(cx, |app, _| app.undo_stack.len());
+
+        let from = bounds_of(cx, "wb-card-0").center();
+        mouse_drag(cx, MouseButton::Left, from, from + point(px(50.), px(30.)));
+        let r = board(&view, cx).cards[0].rect;
+        assert!(
+            near(r.x, (50.0 / zoom).round()) && near(r.y, (30.0 / zoom).round()),
+            "{r:?}"
+        );
+        assert!(
+            board_file(&dir).contains(&format!("x:: {}\n", r.x)),
+            "saved on release"
+        );
+        assert_eq!(
+            view.update(cx, |app, _| app.undo_stack.len()),
+            undo + 1,
+            "one step"
+        );
+
+        let handle = bounds_of(cx, "wb-resize").center();
+        mouse_drag(
+            cx,
+            MouseButton::Left,
+            handle,
+            handle + point(px(40.), px(20.)),
+        );
+        let r2 = board(&view, cx).cards[0].rect;
+        assert!(
+            near(r2.w, 200.0 + 40.0 / zoom) && near(r2.h, 100.0 + 20.0 / zoom),
+            "{r2:?}"
+        );
+        assert_eq!((r2.x, r2.y), (r.x, r.y));
+        assert_eq!(view.update(cx, |app, _| app.undo_stack.len()), undo + 2);
+
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(board(&view, cx).cards[0].rect, r);
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(
+            board(&view, cx).cards[0].rect,
+            crate::whiteboard::geom::Rect::new(0., 0., 200., 100.)
+        );
+        assert!(board_file(&dir).contains("- Alpha\n  x:: 0\n  y:: 0\n"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_double_click_creates_and_edits_cards(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-create");
+        let blocks = view.update(cx, |app, _| app.pages[app.selected].blocks.len());
+        let spot = empty_spot(cx);
+        double_click(cx, spot);
+        assert_eq!(board(&view, cx).cards.len(), 3);
+        assert!(has(cx, "wb-card-editor"), "the new card is being edited");
+        cx.simulate_input("Hello [[Test]]");
+        cx.simulate_keystrokes("enter");
+        let card = board(&view, cx).cards[2].clone();
+        assert_eq!(card.text, "Hello [[Test]]", "Enter finishes the card");
+        assert!(card.placed);
+        assert_eq!(view.update(cx, |app, _| app.editing), None);
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].blocks.len()),
+            blocks + 1
+        );
+        // The card is where the double-click was.
+        let at = view.update(cx, |app, _| {
+            let local = app.local(spot).unwrap();
+            app.board_view().to_world(local)
+        });
+        assert!(card.rect.contains(at), "{:?} {at:?}", card.rect);
+        assert!(board_file(&dir).contains("- Hello [[Test]]\n  x:: "));
+
+        // Double-click on a card edits its text alone; its place stays.
+        let before = board(&view, cx).cards[0].rect;
+        let at = bounds_of(cx, "wb-card-0").center();
+        double_click(cx, at);
+        assert_eq!(view.update(cx, |app, _| app.editor.text.clone()), "Alpha");
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("escape");
+        let alpha = board(&view, cx).cards[0].clone();
+        assert_eq!((alpha.text.as_str(), alpha.rect), ("Alpha!", before));
+
+        // Delete removes the selected card; undo brings it back.
+        click_on(cx, "wb-card-2");
+        cx.simulate_keystrokes("delete");
+        assert_eq!(board(&view, cx).cards.len(), 2);
+        assert!(!board_file(&dir).contains("Hello"));
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(board(&view, cx).cards.len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_cards_connect_and_arrows_delete(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-connect");
+        let a = bounds_of(cx, "wb-card-0");
+        let b = bounds_of(cx, "wb-card-1");
+        cx.simulate_click(a.center(), Modifiers::none());
+        let handle = bounds_of(cx, "wb-connect").center();
+        mouse_drag(cx, MouseButton::Left, handle, b.center());
+        let g = board(&view, cx);
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(
+            (g.edges[0].from, g.edges[0].to),
+            (g.cards[0].id, g.cards[1].id)
+        );
+        let saved = board_file(&dir);
+        assert!(
+            saved.contains(&format!(
+                "edge:: (({})) -> (({}))",
+                g.cards[0].id, g.cards[1].id
+            )),
+            "{saved}"
+        );
+        assert!(
+            saved.contains(&format!("id:: {}", g.cards[0].id)),
+            "ids kept for the refs"
+        );
+        let edge = g.edges[0].id;
+        assert_eq!(
+            view.update(cx, |app, _| app.whiteboard.selected),
+            Some(whiteboard_ui::Selection::Edge(edge))
+        );
+
+        // Backspace deletes the selected arrow.
+        cx.simulate_keystrokes("backspace");
+        assert!(board(&view, cx).edges.is_empty());
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(board(&view, cx).edges.len(), 1);
+
+        // Clicking the arrow selects it.
+        let spot = empty_spot(cx);
+        cx.simulate_click(spot, Modifiers::none());
+        assert_eq!(view.update(cx, |app, _| app.whiteboard.selected), None);
+        let mid = point((a.right() + b.left()) / 2.0, a.center().y);
+        cx.simulate_click(mid, Modifiers::none());
+        assert_eq!(
+            view.update(cx, |app, _| app.whiteboard.selected),
+            Some(whiteboard_ui::Selection::Edge(edge))
+        );
+        cx.simulate_keystrokes("delete");
+        assert!(board(&view, cx).edges.is_empty());
+
+        // Deleting a card takes its arrows along.
+        cx.simulate_keystrokes("ctrl-z");
+        cx.simulate_click(a.center(), Modifiers::none());
+        cx.simulate_keystrokes("delete");
+        let g = board(&view, cx);
+        assert_eq!((g.cards.len(), g.edges.len()), (1, 0));
+        assert!(!board_file(&dir).contains("edge::"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_zooms_around_the_pointer_and_pans(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-zoom");
+        let at = bounds_of(cx, "whiteboard").center();
+        let world = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| {
+                app.board_view().to_world(app.local(at).unwrap())
+            })
+        };
+        let (z0, w0) = (board_zoom(&view, cx), world(&view, cx));
+        let ctrl = Modifiers {
+            control: true,
+            ..Modifiers::none()
+        };
+        cx.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(0.), px(100.))),
+            modifiers: ctrl,
+            touch_phase: TouchPhase::Moved,
+        });
+        let (z1, w1) = (board_zoom(&view, cx), world(&view, cx));
+        assert!(z1 > z0 * 1.5, "{z0} -> {z1}");
+        assert!(
+            (w1.x - w0.x).abs() < 0.5 && (w1.y - w0.y).abs() < 0.5,
+            "the point stays put"
+        );
+        for _ in 0..20 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Lines(point(0., 10.)),
+                modifiers: ctrl,
+                touch_phase: TouchPhase::Moved,
+            });
+        }
+        assert_eq!(board_zoom(&view, cx), crate::whiteboard::geom::MAX_ZOOM);
+        cx.simulate_event(gpui::PinchEvent {
+            position: at,
+            delta: -0.5,
+            modifiers: Modifiers::none(),
+            phase: TouchPhase::Moved,
+        });
+        assert_eq!(
+            board_zoom(&view, cx),
+            crate::whiteboard::geom::MAX_ZOOM / 2.0
+        );
+
+        click_on(cx, "wb-zoom-reset");
+        assert_eq!(board_zoom(&view, cx), 1.0);
+        click_on(cx, "wb-fit");
+        assert!(
+            has(cx, "wb-card-0") && has(cx, "wb-card-1"),
+            "fit shows every card"
+        );
+        let canvas = bounds_of(cx, "whiteboard");
+        for card in ["wb-card-0", "wb-card-1"] {
+            let b = bounds_of(cx, card);
+            assert!(
+                b.left() >= canvas.left() && b.right() <= canvas.right(),
+                "{card} in view"
+            );
+        }
+
+        // Plain wheel and a middle-button drag pan.
+        let o = view.update(cx, |app, _| app.board_view().offset);
+        cx.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(10.), px(-20.))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        let o2 = view.update(cx, |app, _| app.board_view().offset);
+        assert_eq!((o2.x - o.x, o2.y - o.y), (10.0, -20.0));
+        mouse_drag(cx, MouseButton::Middle, at, at + point(px(30.), px(40.)));
+        let o3 = view.update(cx, |app, _| app.board_view().offset);
+        assert!(near(o3.x - o2.x, 30.0) && near(o3.y - o2.y, 40.0));
+        // Panning the empty canvas with the left button, too.
+        let spot = empty_spot(cx);
+        mouse_drag(cx, MouseButton::Left, spot, spot + point(px(-15.), px(5.)));
+        let o4 = view.update(cx, |app, _| app.board_view().offset);
+        assert!(near(o4.x - o3.x, -15.0) && near(o4.y - o3.y, 5.0));
+        assert_eq!(board_file(&dir), BOARD, "viewing changes nothing on disk");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_first_view_is_refitted_to_the_real_canvas(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-refit");
+        // Drawn before the canvas had a size; the next frame fits it.
+        let ran = cx.update(|window, cx| window.simulate_next_frame(cx));
+        assert!(ran >= 1);
+        cx.run_until_parked();
+        let canvas = bounds_of(cx, "whiteboard");
+        let fitted = view.update(cx, |app, _| {
+            let g = crate::whiteboard::parse(&app.pages[app.selected]);
+            crate::whiteboard::geom::Viewport::fit(
+                &g.rects(),
+                f32::from(canvas.size.width),
+                f32::from(canvas.size.height),
+            )
+        });
+        assert_eq!(view.update(cx, |app, _| app.board_view()), fitted);
+        let (a, b) = (bounds_of(cx, "wb-card-0"), bounds_of(cx, "wb-card-1"));
+        let middle = (a.left() + b.right()) / 2.0;
+        assert!(
+            (f32::from(middle - canvas.center().x)).abs() < 1.0,
+            "centred"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_page_cards_open_their_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-page-card");
+        assert!(has(cx, "wb-card-1-title"));
+        click_on(cx, "wb-card-1-title");
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].title.clone()),
+            "Test"
+        );
+        assert!(has(cx, "block-0") && !has(cx, "whiteboard"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_add_page_uses_the_palette(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-add-page");
+        click_on(cx, "wb-add-page");
+        assert!(view.update(cx, |app, _| app.search.is_some()));
+        cx.simulate_input("Test");
+        cx.simulate_keystrokes("enter");
+        let g = board(&view, cx);
+        assert_eq!(g.cards.len(), 3);
+        assert_eq!(
+            g.cards[2].kind,
+            crate::whiteboard::CardKind::Page("Test".into())
+        );
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].title.clone()),
+            "Board"
+        );
+        // An ordinary palette pick afterwards just opens the page.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("Test");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].title.clone()),
+            "Test"
+        );
+        cx.simulate_keystrokes("ctrl-z");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_keys_never_reach_the_outline_or_vim(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-keys");
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        let page = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| app.pages[app.selected].to_markdown())
+        };
+        let before = page(&view, cx);
+        let spot = empty_spot(cx);
+        cx.simulate_click(spot, Modifiers::none());
+        assert!(view.update(cx, |app, _| app.whiteboard_focused()));
+        cx.simulate_keystrokes("d d o enter tab shift-tab delete backspace alt-up");
+        assert_eq!(
+            page(&view, cx),
+            before,
+            "no outline or vim edits on the canvas"
+        );
+
+        // Editing a card: plain typing, no blocks split, indented or moved.
+        let at = bounds_of(cx, "wb-card-0").center();
+        double_click(cx, at);
+        assert!(view.update(cx, |app, _| app.card_editing() && !app.vim_applies()));
+        cx.simulate_keystrokes("tab alt-down down up");
+        assert!(
+            view.update(cx, |app, _| app.editing == Some(1)),
+            "still on the card"
+        );
+        cx.simulate_input("dd");
+        cx.simulate_keystrokes("enter");
+        let after = view.update(cx, |app, _| app.pages[app.selected].clone());
+        assert_eq!(after.blocks.len(), 3);
+        assert!(after.blocks.iter().all(|b| b.parent_id.is_none()));
+        assert_eq!(board(&view, cx).cards[0].text, "Alphadd");
+
+        // Delete only acts on the canvas: not while the palette has the keys.
+        click_on(cx, "wb-card-0");
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_keystrokes("delete backspace");
+        assert_eq!(board(&view, cx).cards.len(), 2);
+        cx.simulate_keystrokes("escape");
+        assert!(view.update(cx, |app, _| app.whiteboard.selected.is_some()));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            view.update(cx, |app, _| app.whiteboard.selected),
+            None,
+            "Esc deselects"
+        );
+        cx.simulate_keystrokes("delete");
+        assert_eq!(
+            board(&view, cx).cards.len(),
+            2,
+            "nothing selected, nothing deleted"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_opens_as_outline_and_new_ones_are_made(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-outline");
+        click_on(cx, "wb-outline");
+        assert!(has(cx, "block-1") && !has(cx, "whiteboard"));
+        // As an outline the card's properties are ordinary text.
+        click_block(cx, 1);
+        assert!(view.update(cx, |app, _| app.editor.text.contains("x:: 0")));
+        cx.simulate_keystrokes("escape");
+        cx.dispatch_action(ToggleWhiteboardOutline);
+        assert!(has(cx, "whiteboard"));
+
+        cx.dispatch_action(NewWhiteboard);
+        cx.dispatch_action(NewWhiteboard);
+        let (title, board) = view.update(cx, |app, _| {
+            let page = &app.pages[app.selected];
+            (page.title.clone(), crate::whiteboard::is_whiteboard(page))
+        });
+        assert_eq!(title, "Whiteboard 1");
+        assert!(board && has(cx, "whiteboard"));
+        let saved = std::fs::read_to_string(dir.join("pages/Whiteboard.md")).unwrap();
+        assert!(saved.starts_with("- type:: whiteboard"), "{saved}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Encrypted vaults (decision 54) ----------------------------------------
+
+    fn vault_dialog(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(String, Option<String>, bool)> {
+        view.update(cx, |app, _| {
+            app.vault
+                .dialog
+                .as_ref()
+                .map(|d| (d.field().text.clone(), d.error.clone(), d.busy))
+        })
+    }
+
+    #[gpui::test]
+    fn vault_export_and_import_through_the_dialog(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "vault-ui", "- hello vault\n");
+        std::fs::write(dir.join("state.toml"), "clipper_token = \"tok-SECRET\"\n").unwrap();
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        let out = std::env::temp_dir().join(format!("notesec-vault-ui-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(out.join("dest")).unwrap();
+
+        cx.dispatch_action(ExportVault);
+        assert!(has(cx, "vault-dialog") && has(cx, "vault-pass") && has(cx, "vault-confirm"));
+        assert!(view.update(cx, |app, _| app.overlay_open() && !app.vim_applies()));
+        // Too short: Enter goes to the second field, then refuses.
+        cx.simulate_input("dd short");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("dd short");
+        cx.simulate_keystrokes("enter");
+        let (_, error, _) = vault_dialog(&view, cx).unwrap();
+        assert!(error.unwrap().contains("At least 12"));
+        assert_eq!(
+            file(&dir),
+            "- hello vault\n",
+            "typing went to the field, not vim"
+        );
+        // Esc closes the dialog and wipes the fields.
+        cx.simulate_keystrokes("escape");
+        assert!(vault_dialog(&view, cx).is_none() && !has(cx, "vault-dialog"));
+
+        cx.dispatch_action(ExportVault);
+        assert_eq!(vault_dialog(&view, cx).unwrap().0, "", "a fresh dialog");
+        cx.simulate_input("correct horse battery");
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input("correct horse battery?");
+        cx.simulate_keystrokes("enter");
+        assert!(vault_dialog(&view, cx)
+            .unwrap()
+            .1
+            .unwrap()
+            .contains("don't match"));
+        cx.simulate_keystrokes("backspace enter");
+        assert!(
+            vault_dialog(&view, cx).unwrap().2,
+            "busy: the save picker is open"
+        );
+        cx.simulate_new_path_selection(|_| Some(out.join("mine")));
+        cx.run_until_parked();
+        assert!(vault_dialog(&view, cx).is_none());
+        let file_path = out.join("mine.notesec-vault");
+        let bytes = std::fs::read(&file_path).unwrap();
+        assert!(bytes.starts_with(crate::vault::MAGIC));
+        let status = view.update(cx, |app, _| app.status.clone().unwrap().text);
+        assert!(status.contains("mine.notesec-vault"), "{status}");
+
+        // Import: the file, then a new empty folder, then the passphrase.
+        cx.dispatch_action(ImportVault);
+        cx.simulate_path_prompt_response(|o| o.files.then(|| vec![file_path.clone()]));
+        cx.run_until_parked();
+        let dest = out.join("dest");
+        cx.simulate_path_prompt_response(|o| o.directories.then(|| vec![dest.clone()]));
+        cx.run_until_parked();
+        assert!(has(cx, "vault-pass") && !has(cx, "vault-confirm"));
+        cx.simulate_input("not the passphrase");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let (text, error, busy) = vault_dialog(&view, cx).unwrap();
+        assert!(error.unwrap().contains("Wrong passphrase") && !busy && text.is_empty());
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            0,
+            "nothing written"
+        );
+        cx.simulate_input("correct horse battery");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(vault_dialog(&view, cx).is_none());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("pages/Test.md")).unwrap(),
+            "- hello vault\n"
+        );
+        assert!(!std::fs::read_to_string(dest.join("state.toml"))
+            .unwrap()
+            .contains("SECRET"));
+        let status = view.update(cx, |app, _| app.status.clone().unwrap().text);
+        assert!(status.contains("NOTESEC_DIR="), "{status}");
+
+        // The open notes' own folder is refused as a destination.
+        cx.dispatch_action(ImportVault);
+        cx.simulate_path_prompt_response(|o| o.files.then(|| vec![file_path.clone()]));
+        cx.run_until_parked();
+        let graph = dir.clone();
+        cx.simulate_path_prompt_response(move |_| Some(vec![graph]));
+        cx.run_until_parked();
+        assert!(vault_dialog(&view, cx).is_none());
+        let status = view.update(cx, |app, _| app.status.clone().unwrap());
+        assert!(status.error && status.text.contains("open notes"));
+        let _ = std::fs::remove_dir_all(out);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Plugins (decision 55) ------------------------------------------------
+
+    const WORD_COUNT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/plugins/word-count");
+
+    /// Put a plugin in `<dir>/plugins/<id>/` and reload the plugins.
+    fn install_plugin(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        dir: &std::path::Path,
+        id: &str,
+        manifest: &str,
+        wasm: &[u8],
+    ) {
+        let folder = dir.join("plugins").join(id);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(folder.join("plugin.wasm"), wasm).unwrap();
+        view.update(cx, |app, cx| {
+            app.reload_plugins();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn install_word_count(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        dir: &std::path::Path,
+    ) {
+        let manifest = std::fs::read_to_string(format!("{WORD_COUNT}/plugin.toml")).unwrap();
+        let wasm = std::fs::read(format!("{WORD_COUNT}/plugin.wasm")).unwrap();
+        install_plugin(view, cx, dir, "word-count", &manifest, &wasm);
+    }
+
+    /// A plugin `id` with one command "Go" whose `run_command` body is
+    /// `body`; its memory holds `output` at offset 100.
+    fn test_plugin(output: &str, body: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(module
+                 (memory (export "memory") 1)
+                 (data (i32.const 100) "{output}")
+                 (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+                 (func (export "run_command") (param i32 i32) (result i64) {body}))"#
+        ))
+        .unwrap()
+    }
+
+    fn test_manifest(id: &str) -> String {
+        format!(
+            "id = \"{id}\"\nname = \"{id}\"\nversion = \"1\"\napi_version = 1\n\
+             [[commands]]\nid = \"go\"\nlabel = \"Go {id}\"\n"
+        )
+    }
+
+    fn plugin_hits(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> usize {
+        view.update(cx, |app, _| {
+            app.search_results()
+                .iter()
+                .filter(|h| matches!(h.target, Target::Plugin(_)))
+                .count()
+        })
+    }
+
+    fn run_palette(cx: &mut VisualTestContext, query: &str) {
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input(query);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn word_count_plugin_is_off_until_enabled_then_counts_and_renders(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(
+            cx,
+            "plugin-word-count",
+            "- one two three\n- {{word-count}} here\n",
+        );
+        install_word_count(&view, cx, &dir);
+        // Found, but disabled: no palette entry, no render box.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("count words");
+        assert_eq!(plugin_hits(&view, cx), 0);
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "plugin-render-word-count"));
+        assert!(saved_config(&dir).plugins.is_empty());
+
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-plugins");
+        assert!(has(cx, "plugins-reload"));
+        click_on(cx, "plugin-toggle-word-count");
+        let hash = view.update(cx, |app, _| app.plugins.found[0].hash.clone());
+        assert_eq!(saved_config(&dir).plugins.get("word-count"), Some(&hash));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // The render hook draws under the block with the macro.
+        assert!(has(cx, "plugin-render-word-count"));
+        view.update(cx, |app, _| {
+            assert_eq!(app.plugin_render_texts(), ["2 words"])
+        });
+
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("count words");
+        assert_eq!(plugin_hits(&view, cx), 1);
+        view.update(cx, |app, _| {
+            assert_eq!(app.search_results()[0].target, Target::Plugin(0))
+        });
+        assert!(has(cx, "plugin-command-0"));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            status_text(&view, cx).as_deref(),
+            Some("Word count: Words: 3")
+        );
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+        assert_eq!(file(&dir), "- one two three\n- {{word-count}} here\n");
+
+        // Turning it off again is saved too.
+        cx.simulate_keystrokes("escape ctrl-,");
+        click_on(cx, "settings-tab-plugins");
+        click_on(cx, "plugin-toggle-word-count");
+        assert!(saved_config(&dir).plugins.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_changed_plugin_binary_must_be_enabled_again(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "plugin-changed", "- a\n");
+        install_word_count(&view, cx, &dir);
+        view.update(cx, |app, cx| app.set_plugin_enabled("word-count", true, cx));
+        assert_eq!(view.update(cx, |app, _| app.plugin_commands().len()), 1);
+        let manifest = std::fs::read_to_string(format!("{WORD_COUNT}/plugin.toml")).unwrap();
+        let other = test_plugin("", "(i64.const 0)");
+        install_plugin(&view, cx, &dir, "word-count", &manifest, &other);
+        view.update(cx, |app, _| {
+            assert!(app.plugin_commands().is_empty());
+            assert!(!app.plugin_enabled(&app.plugins.found[0]));
+        });
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-plugins");
+        click_on(cx, "plugin-toggle-word-count");
+        assert_eq!(view.update(cx, |app, _| app.plugin_commands().len()), 1);
+        assert_eq!(
+            saved_config(&dir).plugins.get("word-count"),
+            Some(&crate::plugins::wasm_hash(&other))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_plugin_failing_three_times_is_turned_off(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "plugin-failing", "- a\n");
+        install_plugin(
+            &view,
+            cx,
+            &dir,
+            "crash",
+            &test_manifest("crash"),
+            &test_plugin("", "unreachable"),
+        );
+        view.update(cx, |app, cx| app.set_plugin_enabled("crash", true, cx));
+        for n in 1..=2 {
+            run_palette(cx, "go crash");
+            let status = status_text(&view, cx).unwrap();
+            assert!(
+                status.contains("crash failed") && status.contains("crashed"),
+                "{status}"
+            );
+            view.update(cx, |app, _| assert_eq!(app.plugin_failures("crash"), n));
+        }
+        run_palette(cx, "go crash");
+        assert!(status_text(&view, cx).unwrap().contains("turned off"));
+        view.update(cx, |app, _| assert!(app.plugin_commands().is_empty()));
+        assert!(saved_config(&dir).plugins.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn plugin_edits_are_saved_and_each_is_one_undo_step(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "plugin-edits", "- old\n- other\n");
+        let output = r#"[[actions]]\0atype = \"replace_block\"\0atext = \"REPLACED\"\0a[[actions]]\0atype = \"insert_block\"\0atext = \"NEW\"\0a"#;
+        let len = output.replace("\\0a", "\n").replace("\\\"", "\"").len();
+        let body = format!("(i64.or (i64.shl (i64.const 100) (i64.const 32)) (i64.const {len}))");
+        install_plugin(
+            &view,
+            cx,
+            &dir,
+            "edit",
+            &test_manifest("edit"),
+            &test_plugin(output, &body),
+        );
+        view.update(cx, |app, cx| app.set_plugin_enabled("edit", true, cx));
+        click_block(cx, 0);
+        run_palette(cx, "go edit");
+        assert_eq!(file(&dir), "- REPLACED\n- NEW\n- other\n");
+        cx.simulate_keystrokes("escape ctrl-z");
+        assert_eq!(file(&dir), "- REPLACED\n- other\n");
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(file(&dir), "- old\n- other\n");
+
+        // With no block being edited, replace_block is refused; the insert
+        // goes after the last top-level block.
+        view.update(cx, |app, cx| {
+            app.commit();
+            app.editing = None;
+            app.run_plugin_command(0, cx);
+        });
+        cx.run_until_parked();
+        assert!(status_text(&view, cx).unwrap().contains("needs a block"));
+        assert_eq!(file(&dir), "- old\n- other\n- NEW\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

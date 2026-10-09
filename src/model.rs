@@ -113,7 +113,8 @@ pub struct Reference {
 /// Find every well-formed `[[name]]` in `text`, in order.
 ///
 /// A link needs a non-empty name that contains no `[`, `]` or newline. In
-/// `[[a [[b]]` only the inner `[[b]]` counts.
+/// `[[a [[b]]` only the inner `[[b]]` counts. `[[((uuid))]]` (the inside of
+/// a block embed, `![[((uuid))]]`, decision 47) names a block, not a page.
 pub fn parse_wikilinks(text: &str) -> Vec<Reference> {
     let mut links = Vec::new();
     let mut pos = 0;
@@ -129,6 +130,11 @@ pub fn parse_wikilinks(text: &str) -> Vec<Reference> {
         if inner.contains(['[', ']', '\n']) || inner.trim().is_empty() {
             // Not a valid link; resume scanning just after this `[`.
             pos = start + 1;
+            continue;
+        }
+        let name = inner.trim();
+        if name.starts_with("((") && name.ends_with("))") {
+            pos = end + 2;
             continue;
         }
         links.push(Reference {
@@ -736,6 +742,66 @@ impl Page {
         at
     }
 
+    /// Vim's `O` (decision 48): a new block with `content` just before
+    /// block `index`, as its sibling. Returns its index (`index`).
+    pub fn insert_before(&mut self, index: usize, content: String) -> usize {
+        let parent_id = self.blocks[index].parent_id;
+        self.blocks.insert(
+            index,
+            Block {
+                id: Uuid::new_v4(),
+                content,
+                parent_id,
+                page_id: self.id.clone(),
+                order: 0,
+            },
+        );
+        self.renumber();
+        index
+    }
+
+    /// The blocks in `range` (whole subtrees, in document order) copied
+    /// onto a scratch page, the outermost ones at its top level: what vim's
+    /// `yy` / `dd` keep for `p` (decision 48).
+    pub fn copy_blocks(&self, range: Range<usize>) -> Page {
+        let mut copy = Page::new("", false);
+        let ids: HashSet<Uuid> = self.blocks[range.clone()].iter().map(|b| b.id).collect();
+        copy.blocks = self.blocks[range]
+            .iter()
+            .map(|b| Block {
+                parent_id: b.parent_id.filter(|p| ids.contains(p)),
+                ..b.clone()
+            })
+            .collect();
+        copy.renumber();
+        copy
+    }
+
+    /// Remove the blocks in `range` (whole subtrees). A page is never left
+    /// without blocks: an empty one gets a single empty block.
+    pub fn remove_blocks(&mut self, range: Range<usize>) {
+        self.blocks.drain(range);
+        if self.blocks.is_empty() {
+            self.push_block(String::new());
+        }
+        self.renumber();
+    }
+
+    /// The end of `count` consecutive sibling subtrees starting at block
+    /// `index`, for vim's `3dd`; fewer when the siblings run out.
+    pub fn subtrees_end(&self, index: usize, count: usize) -> usize {
+        // Only following siblings: a count never climbs out to a block
+        // shallower than the first one, which would orphan its children.
+        let depth = self.depth_of(index);
+        (0..count.max(1)).fold(index, |at, _| {
+            if at < self.blocks.len() && (at == index || self.depth_of(at) == depth) {
+                self.subtree_end(at)
+            } else {
+                at
+            }
+        })
+    }
+
     /// Tab: make the block a child of its previous sibling. Fails (returns
     /// false) for the first child, which has nothing to nest under.
     pub fn indent(&mut self, index: usize) -> bool {
@@ -877,6 +943,20 @@ impl Page {
             }
             None => (None, self.blocks.len()),
         };
+        self.splice_copies(at, parent_id, source)
+    }
+
+    /// Vim's `P` with yanked blocks (decision 48): copies of `source`'s
+    /// blocks just before block `index`, as its siblings (nested ones keep
+    /// their nesting). Returns where they landed.
+    pub fn insert_blocks_before(&mut self, index: usize, source: &Page) -> Range<usize> {
+        let parent_id = self.blocks.get(index).and_then(|b| b.parent_id);
+        self.splice_copies(index.min(self.blocks.len()), parent_id, source)
+    }
+
+    /// Insert fresh-id copies of `source`'s blocks at `at`, its top-level
+    /// blocks under `parent_id`.
+    fn splice_copies(&mut self, at: usize, parent_id: Option<Uuid>, source: &Page) -> Range<usize> {
         let new_ids: std::collections::HashMap<Uuid, Uuid> = source
             .blocks
             .iter()
@@ -1742,5 +1822,44 @@ mod tests {
                 blocks: vec![2]
             }]
         );
+    }
+
+    #[test]
+    fn vim_block_helpers_copy_remove_and_insert_subtrees() {
+        let mut page = Page::from_markdown("P", false, "- a\n  - a1\n    - a2\n- b\n  - b1\n- c\n");
+        let texts = |p: &Page| -> Vec<String> {
+            p.blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| format!("{}{}", "  ".repeat(p.depth_of(i)), b.content))
+                .collect()
+        };
+        // `2dd` on "a": a's subtree, then b's.
+        assert_eq!(page.subtrees_end(0, 1), 3);
+        assert_eq!(page.subtrees_end(0, 2), 5);
+        assert_eq!(page.subtrees_end(0, 9), 6);
+        assert_eq!(
+            page.subtrees_end(1, 2),
+            3,
+            "a1's subtree, then nothing deeper"
+        );
+        // A copy keeps the nesting inside, its roots at the top level.
+        let copy = page.copy_blocks(1..3);
+        assert_eq!(texts(&copy), ["a1", "  a2"]);
+        assert_eq!(copy.blocks[0].parent_id, None);
+        // Removing whole subtrees.
+        page.remove_blocks(0..3);
+        assert_eq!(texts(&page), ["b", "  b1", "c"]);
+        // Pasting above a nested block: siblings of it.
+        let at = page.insert_blocks_before(1, &copy);
+        assert_eq!(at, 1..3);
+        assert_eq!(texts(&page), ["b", "  a1", "    a2", "  b1", "c"]);
+        // `O`.
+        assert_eq!(page.insert_before(3, "new".into()), 3);
+        assert_eq!(texts(&page), ["b", "  a1", "    a2", "  new", "  b1", "c"]);
+        // Removing everything leaves one empty block.
+        let n = page.blocks.len();
+        page.remove_blocks(0..n);
+        assert_eq!(texts(&page), [""]);
     }
 }

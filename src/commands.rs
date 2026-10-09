@@ -115,6 +115,22 @@ commands! {
     DeletePage => "Delete current page", ["remove", "trash"], Page;
     CopyPageTitle => "Copy page title", ["clipboard", "name"], Page;
     ExportHtml => "Export page to HTML", ["export", "html", "save", "share", "web page"], Page;
+    PublishPage => "Publish page", ["publish", "share", "website", "static site", "html", "host"], Page;
+    ImportObsidian => "Import from Obsidian\u{2026}", ["import", "obsidian", "vault", "markdown", "migrate"], Nothing;
+    ImportLogseq => "Import from Logseq\u{2026}", ["import", "logseq", "graph", "migrate"], Nothing;
+    ImportNotion => "Import from Notion\u{2026}", ["import", "notion", "export", "csv", "migrate"], Nothing;
+    PublishPageWithLinks => "Publish page with linked pages", ["publish", "share", "website", "static site", "links"], Page;
+    RecordVoiceNote => "Record voice note", ["voice", "audio", "microphone", "mic", "dictate", "memo"], Nothing;
+    StopRecording => "Stop recording", ["voice", "audio", "save", "finish"], Nothing;
+    CancelRecording => "Cancel recording", ["voice", "audio", "discard"], Nothing;
+    TranscribeVoiceNotes => "Transcribe voice notes on page", ["whisper", "speech", "text", "voice"], Page;
+    NewWhiteboard => "New whiteboard", ["canvas", "board", "diagram", "cards", "mind map", "draw"], Nothing;
+    WhiteboardFit => "Whiteboard: fit all", ["zoom to fit", "canvas", "board"], Page;
+    WhiteboardZoomReset => "Whiteboard: zoom 100%", ["actual size", "canvas", "board", "reset zoom"], Page;
+    WhiteboardAddPage => "Whiteboard: add page or block card\u{2026}", ["canvas", "board", "card", "insert"], Page;
+    ToggleWhiteboardOutline => "Whiteboard: open as outline / canvas", ["canvas", "board", "blocks", "text"], Page;
+    ExportVault => "Export encrypted vault\u{2026}", ["encrypt", "backup", "passphrase", "password", "secure", "usb", "cloud"], Nothing;
+    ImportVault => "Import encrypted vault\u{2026}", ["decrypt", "restore", "passphrase", "password", "secure"], Nothing;
     ToggleFavorite => "Toggle favorite", ["star", "unstar", "bookmark", "favourite"], Page;
     SortPagesAz => "Sort pages A-Z", ["alphabetical", "order"], Nothing;
     // Editing
@@ -147,6 +163,7 @@ commands! {
     // App
     OpenSettings => "Open settings", ["preferences", "theme", "font"], Nothing;
     ToggleGitBackup => "Toggle git auto-backup", ["git", "backup", "version", "history", "autosave"], Nothing;
+    ToggleVimMode => "Toggle vim mode", ["vim", "vi", "modal editing", "keybindings", "normal mode"], Nothing;
     ShowShortcuts => "Keyboard shortcuts", ["keys", "keymap", "cheatsheet", "help"], Nothing;
     CustomizeShortcuts => "Change keyboard shortcuts", ["customize", "rebind", "hotkeys", "key bindings", "remap"], Nothing;
     Quit => "Quit", ["exit", "close app"], Nothing;

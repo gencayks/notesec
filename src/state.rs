@@ -7,6 +7,8 @@
 //! recent = ["2026-10-08", "Projects"]   # most recent first
 //! page_order = ["Projects", "Inbox"]    # absent: alphabetical
 //!
+//! clipper_token = "3f9c…"               # the web clipper's secret (decision 51)
+//!
 //! [shortcuts]                           # absent: the default keys
 //! SplitRight = "ctrl-alt-s"             # see hotkeys.rs (decision 41)
 //! Quit = ""                             # unbound
@@ -19,9 +21,9 @@
 //!
 //! It also holds the AI API key (`ai_api_key = "sk-…"`, decision 42) for
 //! Settings > AI's "API key" mode, **in plaintext**. Settings says so, and
-//! that git auto-backup (decision 39) commits this file to the graph's local
-//! repository when it is on. Keeping it here rather than in `config.toml`
-//! means the hand-edited settings file never carries a secret.
+//! that git auto-backup (decision 39) deliberately does **not** track this
+//! file. Keeping it here rather than in `config.toml` means the hand-edited
+//! settings file never carries a secret. Vault exports strip the key.
 //!
 //! This lives apart from `config.toml` on purpose: `recent` changes on every
 //! page you open, and rewriting the user's hand-edited settings file that
@@ -76,6 +78,11 @@ pub struct UiState {
         deserialize_with = "lenient_saved_searches"
     )]
     pub saved_searches: Vec<SavedSearch>,
+    /// The web clipper's token (decision 51), made on first use. A secret
+    /// like `ai_api_key`: never published, and to be left out of any
+    /// sync or export of this file.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub clipper_token: String,
 }
 
 /// Which search a saved search re-runs.
@@ -331,6 +338,7 @@ mod tests {
                 kind: SearchKind::Global,
                 query: "meeting".into(),
             }],
+            clipper_token: "0a1b2c".into(),
         };
         state.save(&dir).unwrap();
         assert_eq!(UiState::load(&dir), state);

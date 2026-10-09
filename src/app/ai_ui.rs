@@ -844,7 +844,7 @@ impl NoteSec {
                         div()
                             .debug_selector(|| "ai-key-note".to_string())
                             .text_color(theme.muted)
-                            .child("The key is stored in plaintext in state.toml in your graph folder. If git auto-backup is on, it is also committed to the graph's local git repository."),
+                            .child("The key is stored in plaintext in state.toml. Git backups do not track state.toml, and vault exports strip the key."),
                     )
                     .child(field(AiField::ApiModel, cx))
                     .child(field(AiField::ApiEmbeddingModel, cx));
