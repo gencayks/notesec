@@ -51,6 +51,7 @@ mod mentions_ui;
 use ai_ui::{AiSettings, AskState, RelatedState, SavedUi, SemanticState, TagSuggestState};
 use mentions_ui::MentionsState;
 mod appearance_ui;
+mod capture_ui;
 mod clipper_ui;
 mod embed_ui;
 mod import_ui;
@@ -97,6 +98,7 @@ actions!(
         SearchAllPages,
         NewPage,
         OpenToday,
+        QuickCapture,
         Undo,
         Redo,
         ToggleTheme,
@@ -232,6 +234,7 @@ pub fn shortcuts() -> Vec<Shortcut> {
         s("ctrl-k",         ToggleSearch,  None, Navigation, "Search pages, blocks and commands"),
         s("ctrl-shift-f",   SearchAllPages, None, Navigation, "Search the text of every page and journal"),
         s("ctrl-j",         OpenToday,     None, Navigation, "Open today's journal"),
+        s("ctrl-shift-c",   QuickCapture,  None, Navigation, "Quick capture to today's journal"),
         s("ctrl-n",         NewPage,       None, Navigation, "New page"),
         s("up",             Up,            ed,   Navigation, "Block above / below (or palette result)"),
         s("down",           Down,          ed,   Navigation, "Block above / below (or palette result)"),
@@ -699,6 +702,8 @@ pub struct NoteSec {
     editor: EditorState,
     /// `Some` while the Ctrl-K search overlay is open.
     search: Option<SearchState>,
+    /// `Some` while the quick-capture box is open (design pass, Feature 3).
+    capture: Option<EditorState>,
     /// `Some` while the "/" block-type menu is open on the edited block.
     slash: Option<SlashState>,
     /// `Some` while the settings panel is open.
@@ -940,6 +945,7 @@ impl NoteSec {
             editing: None,
             editor: EditorState::default(),
             search: None,
+            capture: None,
             slash: None,
             settings: None,
             page_menu: None,
@@ -1018,11 +1024,14 @@ impl NoteSec {
     // --- which editor is active ----------------------------------------------
 
     /// The text editor currently receiving input: the search box while the
-    /// overlay is open, the rename field while renaming a page, otherwise
-    /// the block editor.
+    /// overlay is open, the capture box while it is open, the rename field
+    /// while renaming a page, otherwise the block editor.
     fn active_editor(&self) -> &EditorState {
         if let Some(dialog) = &self.vault.dialog {
             return dialog.field();
+        }
+        if let Some(editor) = &self.capture {
+            return editor;
         }
         match (&self.search, &self.page_menu) {
             (Some(s), _) => &s.query,
@@ -1041,6 +1050,9 @@ impl NoteSec {
         let ai_input = self.ai_overlay_input();
         if self.vault.dialog.is_some() {
             return self.vault.dialog.as_mut().expect("open").field_mut();
+        }
+        if let Some(editor) = &mut self.capture {
+            return editor;
         }
         match (&mut self.search, &mut self.page_menu) {
             (Some(s), _) => &mut s.query,
@@ -1077,6 +1089,7 @@ impl NoteSec {
     /// block): typing there records no undo history.
     fn text_input_open(&self) -> bool {
         self.search.is_some()
+            || self.capture.is_some()
             || self.renaming()
             || self.ai_editor().is_some()
             || self.vault_dialog_open()
@@ -1818,7 +1831,7 @@ impl NoteSec {
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() || self.page_menu.is_some() {
+        if self.search.is_some() || self.capture.is_some() || self.page_menu.is_some() {
             return;
         }
         self.close_slash_as_typing();
@@ -1829,7 +1842,7 @@ impl NoteSec {
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() || self.page_menu.is_some() {
+        if self.search.is_some() || self.capture.is_some() || self.page_menu.is_some() {
             return;
         }
         self.close_slash_as_typing();
@@ -2684,6 +2697,7 @@ impl NoteSec {
     /// page. All are modal, so the tab keys do nothing while one is open.
     fn overlay_open(&self) -> bool {
         self.search.is_some()
+            || self.capture.is_some()
             || self.settings.is_some()
             || self.page_menu.is_some()
             || self.shortcuts_open
@@ -3539,6 +3553,10 @@ impl NoteSec {
             self.confirm_search(window, cx);
             return;
         }
+        if self.capture.is_some() {
+            self.confirm_quick_capture(cx);
+            return;
+        }
         if self.ai_enter(window, cx) {
             return;
         }
@@ -4132,6 +4150,8 @@ impl NoteSec {
             self.close_settings(cx);
         } else if self.search.is_some() {
             self.close_search(cx);
+        } else if self.capture.is_some() {
+            self.close_quick_capture(cx);
         } else if self.slash.is_some() {
             self.dismiss_slash(cx);
         } else if let (Some((range, _)), true) = (self.ref_query(), self.ref_menu_open()) {
@@ -8091,6 +8111,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_move_block_down))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::search_all_pages))
+            .on_action(cx.listener(Self::on_quick_capture))
             .on_action(cx.listener(Self::on_new_page))
             .on_action(cx.listener(Self::on_open_today))
             .on_action(cx.listener(Self::on_undo))
@@ -8153,6 +8174,7 @@ impl Render for NoteSec {
             .children(self.render_voice_pill(cx))
             .children(ask_overlay)
             .children(overlay)
+            .children(self.render_capture_overlay(cx))
             .children(settings_overlay)
             .children(page_menu_overlay)
             .children(shortcuts_overlay)
@@ -8379,6 +8401,51 @@ mod tests {
             assert_eq!(app.editing, None);
         });
         assert_eq!(file(&dir), "- hello world\n");
+    }
+
+    #[gpui::test]
+    fn quick_capture_hotkey_appends_to_todays_journal(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_with_journal(cx, "quick-capture", "- morning notes\n");
+
+        cx.simulate_keystrokes("ctrl-shift-c");
+        view.update(cx, |app, _| {
+            assert!(app.capture.is_some(), "capture box opened");
+        });
+
+        cx.simulate_input("captured thought");
+        cx.simulate_keystrokes("enter");
+
+        view.update(cx, |app, _| {
+            assert!(app.capture.is_none(), "capture box closed");
+            let journal = app
+                .pages
+                .iter()
+                .find(|p| p.is_journal && p.title == today_title())
+                .expect("today's journal");
+            assert!(journal
+                .blocks
+                .iter()
+                .any(|b| b.content == "captured thought"));
+        });
+        let text = std::fs::read_to_string(todays_journal_file(&dir)).unwrap();
+        assert!(text.contains("- captured thought\n"), "{text}");
+    }
+
+    #[gpui::test]
+    fn quick_capture_escape_cancels_without_writing(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_with_journal(cx, "quick-capture-esc", "- morning notes\n");
+
+        cx.simulate_keystrokes("ctrl-shift-c");
+        cx.simulate_input("never mind");
+        cx.simulate_keystrokes("escape");
+
+        view.update(cx, |app, _| {
+            assert!(app.capture.is_none(), "capture box closed");
+        });
+        assert_eq!(
+            std::fs::read_to_string(todays_journal_file(&dir)).unwrap(),
+            "- morning notes\n"
+        );
     }
 
     #[gpui::test]

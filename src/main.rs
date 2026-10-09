@@ -4,6 +4,7 @@ mod app;
 mod assets;
 mod autotag;
 mod backup;
+mod capture;
 mod clipper;
 mod code;
 mod commands;
@@ -38,7 +39,35 @@ use gpui_platform::application;
 use storage::Storage;
 
 fn main() {
-    let root = Storage::default_root();
+    let cli = match capture::parse_cli(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("notesec: {err}");
+            eprintln!("usage: notesec [--notes-dir <dir>] [--capture \"text\"]");
+            std::process::exit(2);
+        }
+    };
+
+    // Quick capture: append the text to today's journal and exit, with no
+    // window. Bind this to a system-wide shortcut (e.g. KDE Settings >
+    // Shortcuts) for capture from anywhere: on Wayland an app cannot grab
+    // a true global hotkey by itself.
+    if let Some(text) = cli.capture {
+        let storage = Storage::open(cli.root).unwrap_or_else(|err| {
+            eprintln!("notesec: cannot open graph: {err}");
+            std::process::exit(1);
+        });
+        match capture::append_to_journal(&storage, &text) {
+            Ok(day) => println!("Captured to {day}"),
+            Err(err) => {
+                eprintln!("notesec: cannot capture: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let root = cli.root;
     let storage = Storage::open(root.clone()).unwrap_or_else(|err| {
         eprintln!("notesec: cannot open graph at {}: {err}", root.display());
         std::process::exit(1);

@@ -47,6 +47,18 @@ Grab the latest from the [releases page](https://github.com/gencayks/notesec/rel
 
 `~/notesec` — plain Markdown under `pages/`, `journals/`, `templates/`. Point it elsewhere with `NOTESEC_DIR`.
 
+## Quick capture
+
+Jot a note from anywhere into today's journal:
+
+```bash
+notesec --capture "call mom tomorrow"
+```
+
+This appends the text as a new block to today's journal and exits without opening a window. Inside the app, `Ctrl+Shift+C` opens a small capture box (`Enter` captures, `Esc` cancels).
+
+Note on global hotkeys: on Wayland an app cannot grab a system-wide hotkey by itself. To capture from anywhere, bind `notesec --capture "..."` (or a small script that prompts for text and passes it) to a system-wide shortcut via e.g. KDE Settings > Shortcuts.
+
 ## License
 
 MIT

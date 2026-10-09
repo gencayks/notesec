@@ -108,6 +108,7 @@ commands! {
     // Pages and navigation
     NewPage => "New page", ["create", "add page"], Nothing;
     OpenToday => "Open today's journal", ["today", "daily", "journal"], Nothing;
+    QuickCapture => "Quick capture", ["capture", "quick", "inbox", "journal"], Nothing;
     OpenAgenda => "Open agenda", ["tasks", "todo", "scheduled", "deadline"], Nothing;
     OpenTrash => "Open trash", ["deleted", "restore", "bin", "recycle", "undelete"], Nothing;
     SearchAllPages => "Search all pages", ["global search", "full text", "find in pages"], Nothing;
