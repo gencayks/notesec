@@ -31,6 +31,8 @@ clipper/       — web clipper: localhost HTTP listener, request checks, HTML �
 app/clipper_ui.rs — the clipper's Settings section, saving clips, the Clipped status (a submodule of app.rs)
 voice/         — voice notes: find and run a recorder, WAV check/repair, whisper.cpp transcription (no GPUI)
 app/voice_ui.rs — recording pill, note and transcript blocks, Play/Transcribe, Settings > Voice notes (a submodule of app.rs)
+whiteboard/    — whiteboards: cards/edges from a page's blocks, edits, view maths, hit testing (no GPUI)
+app/whiteboard_ui.rs — the whiteboard canvas: drawing, mouse/zoom, card editing, commands (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1803,6 +1805,54 @@ that mutate, and data races are essentially impossible.
     input device; no pause; WAV only (no compression); a program that
     ignores SIGINT loses what it hadn't written when killed; editing the
     page the note goes to is closed when it's inserted.
+
+53. **Whiteboards: a canvas page stored as ordinary blocks.** A page
+    whose first block is `type:: whiteboard` shows a canvas instead of
+    the outline. *Storage, no JSON:* each other top-level block is a
+    card, with `x::`, `y::`, `w::`, `h::` and an optional `color::`
+    (yellow, green, blue, red, purple, gray) after its text. A card is
+    text, `[[Page]]` (a page card: its title, which opens it, and the
+    page's first lines) or `((uuid))` (a live block card). Arrows are
+    children of a top-level `edges::` block,
+    `edge:: ((from)) -> ((to))` with an optional `label::`. The ends use
+    the normal `id::` mechanism, so cards keep their ids, and backlinks
+    and the graph count card links with no extra code. *Hand edits:*
+    unreadable or out-of-range coordinates get the card auto-placed
+    (rows of four under the placed cards, not saved until the card is
+    moved). Sizes are clamped, and arrows to missing cards or to
+    themselves are ignored. Nothing panics. *Canvas:* `canvas()` +
+    `PathBuilder` paint the arrows (a line and a filled head, anchored
+    on card borders); cards are absolutely placed divs, only those in
+    view (culling; 500 cards tested). Every press is hit-tested in
+    canvas coordinates (`geom::hit`: handles, cards top-down, the
+    page-card title strip, then arrows within a few px). Moves and
+    resizes are drawn from the drag state and written on release: one
+    undo step and one save each. Drags are tracked by root listeners, so
+    they continue past the canvas edge. Pan: drag empty space, middle
+    button, or Space+drag, or the wheel. Zoom: Ctrl+wheel or pinch
+    around the pointer, 0.1–4×, with Fit and 100% buttons and palette
+    commands. A board's view is per title and in memory. It is fitted
+    on first show, and refitted on the next frame if the first frame
+    had no size. *Editing:* a double-click on empty space makes a card
+    there; a double-click on a card edits it with the outline's block
+    editor (`BlockText`), which loads and saves the text without the
+    card's property lines (`editor_source`/`editor_content`). Enter
+    finishes. Tab, Alt+arrows, block hops and the empty-Backspace delete
+    do nothing in a card, and vim is off there (`vim_applies`). The
+    canvas has the "Whiteboard" key context only when nothing is edited
+    or open: then Delete/Backspace remove the selected card (with its
+    arrows) or arrow, and Esc deselects. Drag the dot on a selected card
+    onto another card to connect them. "Add page" uses the palette: the
+    pick becomes a page or block card. "Open as outline" shows the
+    blocks as usual (per page, in memory). *Export/publish:* an inline
+    SVG (lines, polygons, and each card's block HTML in a
+    `<foreignObject>`), all positioned by attributes, so it passes both
+    CSPs (publish forbids `style=""`), runs nothing and loads nothing.
+    *Limits:* the other split pane shows the outline; no multi-select
+    or copy/paste; the edited card's text isn't scaled with zoom; a
+    card's own text line like `x:: 5` would be read as its coordinate;
+    no curved arrows; no page-menu item (palette command "New
+    whiteboard").
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

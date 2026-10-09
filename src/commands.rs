@@ -124,6 +124,11 @@ commands! {
     StopRecording => "Stop recording", ["voice", "audio", "save", "finish"], Nothing;
     CancelRecording => "Cancel recording", ["voice", "audio", "discard"], Nothing;
     TranscribeVoiceNotes => "Transcribe voice notes on page", ["whisper", "speech", "text", "voice"], Page;
+    NewWhiteboard => "New whiteboard", ["canvas", "board", "diagram", "cards", "mind map", "draw"], Nothing;
+    WhiteboardFit => "Whiteboard: fit all", ["zoom to fit", "canvas", "board"], Page;
+    WhiteboardZoomReset => "Whiteboard: zoom 100%", ["actual size", "canvas", "board", "reset zoom"], Page;
+    WhiteboardAddPage => "Whiteboard: add page or block card\u{2026}", ["canvas", "board", "card", "insert"], Page;
+    ToggleWhiteboardOutline => "Whiteboard: open as outline / canvas", ["canvas", "board", "blocks", "text"], Page;
     ToggleFavorite => "Toggle favorite", ["star", "unstar", "bookmark", "favourite"], Page;
     SortPagesAz => "Sort pages A-Z", ["alphabetical", "order"], Nothing;
     // Editing

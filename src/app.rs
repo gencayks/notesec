@@ -34,9 +34,10 @@ use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
     Bounds, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontStyle, FontWeight, GlobalElementId,
-    HighlightStyle, Hsla, KeyBinding, Keystroke, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ScrollHandle, ShapedLine, SharedString, Style,
-    StyledText, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
+    HighlightStyle, Hsla, KeyBinding, KeyDownEvent, KeyUpEvent, Keystroke, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ScrollHandle, ShapedLine,
+    SharedString, Style, StyledText, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle,
+    Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -49,6 +50,7 @@ mod import_ui;
 mod publish_ui;
 mod vim_ui;
 mod voice_ui;
+mod whiteboard_ui;
 
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace. Palette
@@ -127,6 +129,13 @@ actions!(
         StopRecording,
         CancelRecording,
         TranscribeVoiceNotes,
+        NewWhiteboard,
+        WhiteboardFit,
+        WhiteboardZoomReset,
+        WhiteboardAddPage,
+        ToggleWhiteboardOutline,
+        // Delete / Backspace on a whiteboard canvas (no palette row).
+        WhiteboardDelete,
     ]
 );
 
@@ -261,6 +270,10 @@ pub fn shortcuts() -> Vec<Shortcut> {
         s("escape",         Escape,        Some("PageMenu"),    App, "Close a dialog or menu"),
         s("escape",         Escape,        Some("Shortcuts"),   App, "Close a dialog or menu"),
         s("escape",         Escape,        Some("TrashDialog"), App, "Close a dialog or menu"),
+        // A whiteboard canvas with the keyboard (nothing edited, no dialog).
+        s("delete",         WhiteboardDelete, Some("Whiteboard"), Editing, "Whiteboard: delete the selected card or arrow"),
+        s("backspace",      WhiteboardDelete, Some("Whiteboard"), Editing, "Whiteboard: delete the selected card or arrow"),
+        s("escape",         Escape,        Some("Whiteboard"),  App, "Close a dialog or menu"),
     ]
 }
 
@@ -777,6 +790,8 @@ pub struct NoteSec {
     /// Voice notes: the recording and transcriptions (decision 52,
     /// `voice_ui`).
     voice: voice_ui::VoiceState,
+    /// Whiteboard canvases (decision 53, `whiteboard_ui.rs`).
+    whiteboard: whiteboard_ui::WhiteboardState,
 }
 
 impl NoteSec {
@@ -926,6 +941,7 @@ impl NoteSec {
             import: Default::default(),
             clipper: Default::default(),
             voice: Default::default(),
+            whiteboard: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -1556,6 +1572,7 @@ impl NoteSec {
 
     fn close_search(&mut self, cx: &mut Context<Self>) {
         self.search = None;
+        self.forget_whiteboard_pick();
         self.last_layout = None;
         self.last_bounds = None;
         cx.notify();
@@ -1609,7 +1626,7 @@ impl NoteSec {
         if let Some(ix) = self.editing {
             self.editor.clamp();
             self.editor.marked = None;
-            self.pages[self.selected].blocks[ix].content = self.editor.text.clone();
+            self.pages[self.selected].blocks[ix].content = self.editor_content(ix);
             self.reveal(ix);
         }
         self.save_all_pages();
@@ -1725,7 +1742,12 @@ impl NoteSec {
             Some(s) => (s.insert_after, s.resume, s.templates),
             None => (None, None, None),
         };
+        // "Add page" on a whiteboard: the pick becomes a card there.
+        let board = self.take_whiteboard_pick();
         self.close_search(cx);
+        if board.is_some_and(|b| self.add_picked_card(&b, &hit.target, cx)) {
+            return;
+        }
         match hit.target {
             Target::Page(page) => {
                 let title = self.pages[page].title.clone();
@@ -1854,6 +1876,15 @@ impl NoteSec {
                 Command::ClosePane | Command::FocusOtherPane => self.split.is_some(),
                 Command::RecordVoiceNote => !self.recording(),
                 Command::StopRecording | Command::CancelRecording => self.recording(),
+                Command::WhiteboardFit
+                | Command::WhiteboardZoomReset
+                | Command::WhiteboardAddPage => self.whiteboard_shown(),
+                Command::ToggleWhiteboardOutline => {
+                    page.is_some() && crate::whiteboard::is_whiteboard(&self.pages[self.selected])
+                }
+                Command::InsertTemplate | Command::CollapseAll | Command::ExpandAll => {
+                    !self.whiteboard_shown()
+                }
                 _ => true,
             })
             .collect()
@@ -1908,7 +1939,7 @@ impl NoteSec {
     }
 
     fn on_insert_template(&mut self, _: &InsertTemplate, _: &mut Window, cx: &mut Context<Self>) {
-        if self.current_page().is_some() {
+        if self.current_page().is_some() && !self.whiteboard_shown() {
             self.open_template_picker(self.editing, cx);
         }
     }
@@ -3214,11 +3245,13 @@ impl NoteSec {
     /// block's content actually changed.
     fn sync_content(&mut self) -> bool {
         let Some(ix) = self.editing else { return false };
+        // A whiteboard card keeps its x::/y::/… lines (decision 53).
+        let content = self.editor_content(ix);
         let block = &mut self.pages[self.selected].blocks[ix];
-        if block.content == self.editor.text {
+        if block.content == content {
             return false;
         }
-        block.content = self.editor.text.clone();
+        block.content = content;
         true
     }
 
@@ -3236,7 +3269,7 @@ impl NoteSec {
     /// cursor at the beginning (used for a freshly split block); otherwise at
     /// the end.
     fn load_editor(&mut self, ix: usize, cursor_at_start: bool) {
-        let content = self.pages[self.selected].blocks[ix].content.clone();
+        let content = self.editor_source(ix);
         self.editor = EditorState::new(&content);
         self.slash = None;
         self.selecting = false;
@@ -3344,6 +3377,10 @@ impl NoteSec {
             return;
         }
         let Some(ix) = self.editing else { return };
+        if self.card_editing() {
+            // A whiteboard card has no "next block": Enter finishes it.
+            return self.stop_edit(cx);
+        }
         self.text_history_active = false;
         self.record_edit();
         let rest = self.editor.split_off_at_cursor();
@@ -3374,6 +3411,9 @@ impl NoteSec {
     /// save. The block keeps its index (document order never changes).
     fn restructure(&mut self, cx: &mut Context<Self>, op: impl FnOnce(&mut Page, usize) -> bool) {
         let Some(ix) = self.editing else { return };
+        if self.card_editing() {
+            return; // cards aren't nested
+        }
         self.close_slash_as_typing();
         self.text_history_active = false;
         let before = self.history_state();
@@ -3398,6 +3438,9 @@ impl NoteSec {
     /// Alt+Up / Alt+Down: swap the edited block (and its children) with its
     /// previous / next sibling. Editing continues in the moved block.
     fn move_edited_block(&mut self, up: bool, cx: &mut Context<Self>) {
+        if self.card_editing() {
+            return;
+        }
         let Some(ix) = self.editing else { return };
         if self.search.is_some() {
             return;
@@ -3496,6 +3539,10 @@ impl NoteSec {
                 self.record_state(before);
             }
             cx.notify();
+            return;
+        }
+        if self.card_editing() {
+            // An emptied card stays (Delete on the canvas removes it).
             return;
         }
         // Empty block: delete it (never the last remaining block, and never a
@@ -3651,6 +3698,9 @@ impl NoteSec {
         if self.move_cursor_line(-1, cx) {
             return;
         }
+        if self.card_editing() {
+            return;
+        }
         if let Some(prev) = self.editing.and_then(|ix| self.visible_neighbor(ix, false)) {
             self.move_edit(prev, cx);
         }
@@ -3670,6 +3720,9 @@ impl NoteSec {
             return;
         }
         if self.move_cursor_line(1, cx) {
+            return;
+        }
+        if self.card_editing() {
             return;
         }
         if let Some(next) = self.editing.and_then(|ix| self.visible_neighbor(ix, true)) {
@@ -3896,7 +3949,7 @@ impl NoteSec {
             // First Esc only drops the selection; the next one stops editing.
             self.editor.clear_selection();
             cx.notify();
-        } else {
+        } else if !self.whiteboard_escape(cx) {
             self.stop_edit(cx);
         }
     }
@@ -7587,11 +7640,13 @@ impl Render for NoteSec {
 
         // The main area: the tab bar, then the page, the graph or the empty
         // state.
+        let whiteboard_shown = self.whiteboard_shown();
         let view: AnyElement = match (&self.mode, &self.graph) {
             (Mode::Graph, Some(graph)) => graph.clone().into_any_element(),
             (Mode::Agenda, _) => self.render_agenda(cx),
             (Mode::Trash, _) => self.render_trash(cx),
             (Mode::Empty, _) => empty_state(cx).into_any_element(),
+            _ if whiteboard_shown => self.render_whiteboard(cx),
             _ => main.into_any_element(),
         };
 
@@ -7808,6 +7863,7 @@ impl Render for NoteSec {
         });
 
         let is_editing = self.editing.is_some() || self.text_input_open();
+        let whiteboard_focused = self.whiteboard_focused();
         let shortcuts_open = self.shortcuts_open;
         let settings_open = self.settings.is_some() && !shortcuts_open;
         let page_menu_open = self.page_menu.is_some() && !is_editing && !shortcuts_open;
@@ -7839,6 +7895,17 @@ impl Render for NoteSec {
                 d.key_context("PageMenu")
             })
             .when(trash_confirm_open, |d| d.key_context("TrashDialog"))
+            .when(whiteboard_focused, |d| d.key_context("Whiteboard"))
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, _| {
+                if e.keystroke.key == "space" {
+                    this.set_whiteboard_space(true);
+                }
+            }))
+            .on_key_up(cx.listener(|this, e: &KeyUpEvent, _, _| {
+                if e.keystroke.key == "space" {
+                    this.set_whiteboard_space(false);
+                }
+            }))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::tab))
             .on_action(cx.listener(Self::shift_tab))
@@ -7860,6 +7927,10 @@ impl Render for NoteSec {
             // so these live on the root rather than the block.
             .on_mouse_move(cx.listener(Self::on_text_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_text_mouse_up))
+            // Whiteboard drags, likewise (written on release).
+            .on_mouse_move(cx.listener(Self::on_board_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_board_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_board_mouse_up))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::bold))
             .on_action(cx.listener(Self::italic))
@@ -7911,6 +7982,12 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_stop_recording))
             .on_action(cx.listener(Self::on_cancel_recording))
             .on_action(cx.listener(Self::on_transcribe_voice_notes))
+            .on_action(cx.listener(Self::on_new_whiteboard))
+            .on_action(cx.listener(Self::on_whiteboard_fit))
+            .on_action(cx.listener(Self::on_whiteboard_zoom_reset))
+            .on_action(cx.listener(Self::on_whiteboard_add_page))
+            .on_action(cx.listener(Self::on_toggle_whiteboard_outline))
+            .on_action(cx.listener(Self::on_whiteboard_delete))
             .child(sidebar)
             .child(content)
             .children(status_toast)
@@ -12474,11 +12551,22 @@ mod tests {
                 })
                 .collect()
         });
-        // All but the ones for a recording in progress (decision 52).
+        // All but the ones for a recording in progress (decision 52) and
+        // the ones for a whiteboard on screen (decision 53).
         let all: Vec<Command> = Command::ALL
             .iter()
             .copied()
-            .filter(|c| !matches!(c, Command::StopRecording | Command::CancelRecording))
+            .filter(|c| {
+                !matches!(
+                    c,
+                    Command::StopRecording
+                        | Command::CancelRecording
+                        | Command::WhiteboardFit
+                        | Command::WhiteboardZoomReset
+                        | Command::WhiteboardAddPage
+                        | Command::ToggleWhiteboardOutline
+                )
+            })
             .collect();
         assert_eq!(commands, all);
         // Every row is rendered (the list scrolls; arrows reach the last).
@@ -16156,6 +16244,474 @@ printf '[00:00:00.000 --> 00:00:01.000]   Buy milk [[and]] eggs.\n[00:00:01.000 
         cx.run_until_parked();
         let check = view.update(cx, |app, _| app.voice.check.clone()).unwrap();
         assert!(check.unwrap_err().contains("no model"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Whiteboards (decision 53) ---------------------------------------------
+
+    const BOARD: &str = "- type:: whiteboard\n\
+        - Alpha\n  x:: 0\n  y:: 0\n  w:: 200\n  h:: 100\n\
+        - [[Test]]\n  x:: 400\n  y:: 0\n  w:: 200\n  h:: 100\n";
+
+    fn setup_board<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        let (view, cx, dir) = setup_pages(
+            cx,
+            name,
+            &[("Board", BOARD), ("Test", "- first line\n- second\n")],
+            "Board",
+        );
+        // The first frame learns the canvas size; the view is fitted to it.
+        cx.run_until_parked();
+        (view, cx, dir)
+    }
+
+    fn board(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> crate::whiteboard::Board {
+        view.update(cx, |app, _| {
+            crate::whiteboard::parse(&app.pages[app.selected])
+        })
+    }
+
+    fn board_zoom(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> f32 {
+        view.update(cx, |app, _| app.board_view().zoom)
+    }
+
+    fn board_file(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("pages/Board.md")).unwrap()
+    }
+
+    fn mouse_drag(
+        cx: &mut VisualTestContext,
+        button: MouseButton,
+        from: Point<Pixels>,
+        to: Point<Pixels>,
+    ) {
+        cx.simulate_mouse_down(from, button, Modifiers::none());
+        let mid = point((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
+        cx.simulate_mouse_move(mid, Some(button), Modifiers::none());
+        cx.simulate_mouse_move(to, Some(button), Modifiers::none());
+        cx.simulate_mouse_up(to, button, Modifiers::none());
+    }
+
+    fn double_click(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 2,
+        });
+    }
+
+    /// A spot on the canvas with no card: its bottom left corner.
+    fn empty_spot(cx: &mut VisualTestContext) -> Point<Pixels> {
+        let canvas = bounds_of(cx, "whiteboard");
+        point(
+            canvas.origin.x + px(60.),
+            canvas.origin.y + canvas.size.height - px(60.),
+        )
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1.0
+    }
+
+    #[gpui::test]
+    fn whiteboard_cards_move_and_resize_in_one_undo_step_each(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-move");
+        assert!(has(cx, "whiteboard") && has(cx, "wb-card-0") && has(cx, "wb-card-1"));
+        assert!(!has(cx, "block-0"), "the canvas, not the outline");
+        let zoom = board_zoom(&view, cx);
+        let undo = view.update(cx, |app, _| app.undo_stack.len());
+
+        let from = bounds_of(cx, "wb-card-0").center();
+        mouse_drag(cx, MouseButton::Left, from, from + point(px(50.), px(30.)));
+        let r = board(&view, cx).cards[0].rect;
+        assert!(
+            near(r.x, (50.0 / zoom).round()) && near(r.y, (30.0 / zoom).round()),
+            "{r:?}"
+        );
+        assert!(
+            board_file(&dir).contains(&format!("x:: {}\n", r.x)),
+            "saved on release"
+        );
+        assert_eq!(
+            view.update(cx, |app, _| app.undo_stack.len()),
+            undo + 1,
+            "one step"
+        );
+
+        let handle = bounds_of(cx, "wb-resize").center();
+        mouse_drag(
+            cx,
+            MouseButton::Left,
+            handle,
+            handle + point(px(40.), px(20.)),
+        );
+        let r2 = board(&view, cx).cards[0].rect;
+        assert!(
+            near(r2.w, 200.0 + 40.0 / zoom) && near(r2.h, 100.0 + 20.0 / zoom),
+            "{r2:?}"
+        );
+        assert_eq!((r2.x, r2.y), (r.x, r.y));
+        assert_eq!(view.update(cx, |app, _| app.undo_stack.len()), undo + 2);
+
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(board(&view, cx).cards[0].rect, r);
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(
+            board(&view, cx).cards[0].rect,
+            crate::whiteboard::geom::Rect::new(0., 0., 200., 100.)
+        );
+        assert!(board_file(&dir).contains("- Alpha\n  x:: 0\n  y:: 0\n"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_double_click_creates_and_edits_cards(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-create");
+        let blocks = view.update(cx, |app, _| app.pages[app.selected].blocks.len());
+        let spot = empty_spot(cx);
+        double_click(cx, spot);
+        assert_eq!(board(&view, cx).cards.len(), 3);
+        assert!(has(cx, "wb-card-editor"), "the new card is being edited");
+        cx.simulate_input("Hello [[Test]]");
+        cx.simulate_keystrokes("enter");
+        let card = board(&view, cx).cards[2].clone();
+        assert_eq!(card.text, "Hello [[Test]]", "Enter finishes the card");
+        assert!(card.placed);
+        assert_eq!(view.update(cx, |app, _| app.editing), None);
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].blocks.len()),
+            blocks + 1
+        );
+        // The card is where the double-click was.
+        let at = view.update(cx, |app, _| {
+            let local = app.local(spot).unwrap();
+            app.board_view().to_world(local)
+        });
+        assert!(card.rect.contains(at), "{:?} {at:?}", card.rect);
+        assert!(board_file(&dir).contains("- Hello [[Test]]\n  x:: "));
+
+        // Double-click on a card edits its text alone; its place stays.
+        let before = board(&view, cx).cards[0].rect;
+        let at = bounds_of(cx, "wb-card-0").center();
+        double_click(cx, at);
+        assert_eq!(view.update(cx, |app, _| app.editor.text.clone()), "Alpha");
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("escape");
+        let alpha = board(&view, cx).cards[0].clone();
+        assert_eq!((alpha.text.as_str(), alpha.rect), ("Alpha!", before));
+
+        // Delete removes the selected card; undo brings it back.
+        click_on(cx, "wb-card-2");
+        cx.simulate_keystrokes("delete");
+        assert_eq!(board(&view, cx).cards.len(), 2);
+        assert!(!board_file(&dir).contains("Hello"));
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(board(&view, cx).cards.len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_cards_connect_and_arrows_delete(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-connect");
+        let a = bounds_of(cx, "wb-card-0");
+        let b = bounds_of(cx, "wb-card-1");
+        cx.simulate_click(a.center(), Modifiers::none());
+        let handle = bounds_of(cx, "wb-connect").center();
+        mouse_drag(cx, MouseButton::Left, handle, b.center());
+        let g = board(&view, cx);
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(
+            (g.edges[0].from, g.edges[0].to),
+            (g.cards[0].id, g.cards[1].id)
+        );
+        let saved = board_file(&dir);
+        assert!(
+            saved.contains(&format!(
+                "edge:: (({})) -> (({}))",
+                g.cards[0].id, g.cards[1].id
+            )),
+            "{saved}"
+        );
+        assert!(
+            saved.contains(&format!("id:: {}", g.cards[0].id)),
+            "ids kept for the refs"
+        );
+        let edge = g.edges[0].id;
+        assert_eq!(
+            view.update(cx, |app, _| app.whiteboard.selected),
+            Some(whiteboard_ui::Selection::Edge(edge))
+        );
+
+        // Backspace deletes the selected arrow.
+        cx.simulate_keystrokes("backspace");
+        assert!(board(&view, cx).edges.is_empty());
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(board(&view, cx).edges.len(), 1);
+
+        // Clicking the arrow selects it.
+        let spot = empty_spot(cx);
+        cx.simulate_click(spot, Modifiers::none());
+        assert_eq!(view.update(cx, |app, _| app.whiteboard.selected), None);
+        let mid = point((a.right() + b.left()) / 2.0, a.center().y);
+        cx.simulate_click(mid, Modifiers::none());
+        assert_eq!(
+            view.update(cx, |app, _| app.whiteboard.selected),
+            Some(whiteboard_ui::Selection::Edge(edge))
+        );
+        cx.simulate_keystrokes("delete");
+        assert!(board(&view, cx).edges.is_empty());
+
+        // Deleting a card takes its arrows along.
+        cx.simulate_keystrokes("ctrl-z");
+        cx.simulate_click(a.center(), Modifiers::none());
+        cx.simulate_keystrokes("delete");
+        let g = board(&view, cx);
+        assert_eq!((g.cards.len(), g.edges.len()), (1, 0));
+        assert!(!board_file(&dir).contains("edge::"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_zooms_around_the_pointer_and_pans(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-zoom");
+        let at = bounds_of(cx, "whiteboard").center();
+        let world = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| {
+                app.board_view().to_world(app.local(at).unwrap())
+            })
+        };
+        let (z0, w0) = (board_zoom(&view, cx), world(&view, cx));
+        let ctrl = Modifiers {
+            control: true,
+            ..Modifiers::none()
+        };
+        cx.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(0.), px(100.))),
+            modifiers: ctrl,
+            touch_phase: TouchPhase::Moved,
+        });
+        let (z1, w1) = (board_zoom(&view, cx), world(&view, cx));
+        assert!(z1 > z0 * 1.5, "{z0} -> {z1}");
+        assert!(
+            (w1.x - w0.x).abs() < 0.5 && (w1.y - w0.y).abs() < 0.5,
+            "the point stays put"
+        );
+        for _ in 0..20 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Lines(point(0., 10.)),
+                modifiers: ctrl,
+                touch_phase: TouchPhase::Moved,
+            });
+        }
+        assert_eq!(board_zoom(&view, cx), crate::whiteboard::geom::MAX_ZOOM);
+        cx.simulate_event(gpui::PinchEvent {
+            position: at,
+            delta: -0.5,
+            modifiers: Modifiers::none(),
+            phase: TouchPhase::Moved,
+        });
+        assert_eq!(
+            board_zoom(&view, cx),
+            crate::whiteboard::geom::MAX_ZOOM / 2.0
+        );
+
+        click_on(cx, "wb-zoom-reset");
+        assert_eq!(board_zoom(&view, cx), 1.0);
+        click_on(cx, "wb-fit");
+        assert!(
+            has(cx, "wb-card-0") && has(cx, "wb-card-1"),
+            "fit shows every card"
+        );
+        let canvas = bounds_of(cx, "whiteboard");
+        for card in ["wb-card-0", "wb-card-1"] {
+            let b = bounds_of(cx, card);
+            assert!(
+                b.left() >= canvas.left() && b.right() <= canvas.right(),
+                "{card} in view"
+            );
+        }
+
+        // Plain wheel and a middle-button drag pan.
+        let o = view.update(cx, |app, _| app.board_view().offset);
+        cx.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(10.), px(-20.))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        let o2 = view.update(cx, |app, _| app.board_view().offset);
+        assert_eq!((o2.x - o.x, o2.y - o.y), (10.0, -20.0));
+        mouse_drag(cx, MouseButton::Middle, at, at + point(px(30.), px(40.)));
+        let o3 = view.update(cx, |app, _| app.board_view().offset);
+        assert!(near(o3.x - o2.x, 30.0) && near(o3.y - o2.y, 40.0));
+        // Panning the empty canvas with the left button, too.
+        let spot = empty_spot(cx);
+        mouse_drag(cx, MouseButton::Left, spot, spot + point(px(-15.), px(5.)));
+        let o4 = view.update(cx, |app, _| app.board_view().offset);
+        assert!(near(o4.x - o3.x, -15.0) && near(o4.y - o3.y, 5.0));
+        assert_eq!(board_file(&dir), BOARD, "viewing changes nothing on disk");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_first_view_is_refitted_to_the_real_canvas(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-refit");
+        // Drawn before the canvas had a size; the next frame fits it.
+        let ran = cx.update(|window, cx| window.simulate_next_frame(cx));
+        assert!(ran >= 1);
+        cx.run_until_parked();
+        let canvas = bounds_of(cx, "whiteboard");
+        let fitted = view.update(cx, |app, _| {
+            let g = crate::whiteboard::parse(&app.pages[app.selected]);
+            crate::whiteboard::geom::Viewport::fit(
+                &g.rects(),
+                f32::from(canvas.size.width),
+                f32::from(canvas.size.height),
+            )
+        });
+        assert_eq!(view.update(cx, |app, _| app.board_view()), fitted);
+        let (a, b) = (bounds_of(cx, "wb-card-0"), bounds_of(cx, "wb-card-1"));
+        let middle = (a.left() + b.right()) / 2.0;
+        assert!(
+            (f32::from(middle - canvas.center().x)).abs() < 1.0,
+            "centred"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_page_cards_open_their_page(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-page-card");
+        assert!(has(cx, "wb-card-1-title"));
+        click_on(cx, "wb-card-1-title");
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].title.clone()),
+            "Test"
+        );
+        assert!(has(cx, "block-0") && !has(cx, "whiteboard"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_add_page_uses_the_palette(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-add-page");
+        click_on(cx, "wb-add-page");
+        assert!(view.update(cx, |app, _| app.search.is_some()));
+        cx.simulate_input("Test");
+        cx.simulate_keystrokes("enter");
+        let g = board(&view, cx);
+        assert_eq!(g.cards.len(), 3);
+        assert_eq!(
+            g.cards[2].kind,
+            crate::whiteboard::CardKind::Page("Test".into())
+        );
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].title.clone()),
+            "Board"
+        );
+        // An ordinary palette pick afterwards just opens the page.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("Test");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            view.update(cx, |app, _| app.pages[app.selected].title.clone()),
+            "Test"
+        );
+        cx.simulate_keystrokes("ctrl-z");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_keys_never_reach_the_outline_or_vim(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-keys");
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        let page = |view: &Entity<NoteSec>, cx: &mut VisualTestContext| {
+            view.update(cx, |app, _| app.pages[app.selected].to_markdown())
+        };
+        let before = page(&view, cx);
+        let spot = empty_spot(cx);
+        cx.simulate_click(spot, Modifiers::none());
+        assert!(view.update(cx, |app, _| app.whiteboard_focused()));
+        cx.simulate_keystrokes("d d o enter tab shift-tab delete backspace alt-up");
+        assert_eq!(
+            page(&view, cx),
+            before,
+            "no outline or vim edits on the canvas"
+        );
+
+        // Editing a card: plain typing, no blocks split, indented or moved.
+        let at = bounds_of(cx, "wb-card-0").center();
+        double_click(cx, at);
+        assert!(view.update(cx, |app, _| app.card_editing() && !app.vim_applies()));
+        cx.simulate_keystrokes("tab alt-down down up");
+        assert!(
+            view.update(cx, |app, _| app.editing == Some(1)),
+            "still on the card"
+        );
+        cx.simulate_input("dd");
+        cx.simulate_keystrokes("enter");
+        let after = view.update(cx, |app, _| app.pages[app.selected].clone());
+        assert_eq!(after.blocks.len(), 3);
+        assert!(after.blocks.iter().all(|b| b.parent_id.is_none()));
+        assert_eq!(board(&view, cx).cards[0].text, "Alphadd");
+
+        // Delete only acts on the canvas: not while the palette has the keys.
+        click_on(cx, "wb-card-0");
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_keystrokes("delete backspace");
+        assert_eq!(board(&view, cx).cards.len(), 2);
+        cx.simulate_keystrokes("escape");
+        assert!(view.update(cx, |app, _| app.whiteboard.selected.is_some()));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            view.update(cx, |app, _| app.whiteboard.selected),
+            None,
+            "Esc deselects"
+        );
+        cx.simulate_keystrokes("delete");
+        assert_eq!(
+            board(&view, cx).cards.len(),
+            2,
+            "nothing selected, nothing deleted"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn whiteboard_opens_as_outline_and_new_ones_are_made(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_board(cx, "wb-outline");
+        click_on(cx, "wb-outline");
+        assert!(has(cx, "block-1") && !has(cx, "whiteboard"));
+        // As an outline the card's properties are ordinary text.
+        click_block(cx, 1);
+        assert!(view.update(cx, |app, _| app.editor.text.contains("x:: 0")));
+        cx.simulate_keystrokes("escape");
+        cx.dispatch_action(ToggleWhiteboardOutline);
+        assert!(has(cx, "whiteboard"));
+
+        cx.dispatch_action(NewWhiteboard);
+        cx.dispatch_action(NewWhiteboard);
+        let (title, board) = view.update(cx, |app, _| {
+            let page = &app.pages[app.selected];
+            (page.title.clone(), crate::whiteboard::is_whiteboard(page))
+        });
+        assert_eq!(title, "Whiteboard 1");
+        assert!(board && has(cx, "whiteboard"));
+        let saved = std::fs::read_to_string(dir.join("pages/Whiteboard.md")).unwrap();
+        assert!(saved.starts_with("- type:: whiteboard"), "{saved}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

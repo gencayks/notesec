@@ -90,6 +90,14 @@ img { max-width: 100%; max-height: 480px; display: block; margin: 4px 0; border-
 .embed-title { color: var(--muted); font-size: 0.85em; }
 .embed-note { color: var(--muted); font-style: italic; font-size: 0.9em; }
 @media print { body { background: none; } main { max-width: none; padding: 0; } }
+.whiteboard { overflow-x: auto; margin: 1rem 0; }
+.whiteboard svg { max-width: 100%; height: auto; }
+.whiteboard .card-box { fill: var(--bg); stroke: var(--border); }
+.whiteboard .edge { stroke: var(--muted); stroke-width: 1.5; }
+.whiteboard .arrow { fill: var(--muted); }
+.whiteboard .edge-label { fill: var(--muted); font-size: 12px; text-anchor: middle; }
+.whiteboard .card { padding: 8px; overflow: hidden; height: 100%; box-sizing: border-box;
+  font-size: 14px; color: #1f2328; }
 "#;
 
 /// Resolves a `((block reference))` to the content of the block it names
@@ -155,6 +163,18 @@ pub fn page_html_with_embeds(
         stylesheet: None,
         show_paths: true,
     };
+    if crate::whiteboard::is_whiteboard(page) {
+        // The drawing replaces the outline (decision 53).
+        let board = crate::whiteboard::parse(page);
+        let svg = board_svg(&board, &options, &|text| text.to_string());
+        return document_with_board(
+            &page.title,
+            page.is_journal,
+            Some(svg),
+            Vec::new(),
+            &options,
+        );
+    }
     let rows = page
         .blocks
         .iter()
@@ -175,6 +195,18 @@ pub fn page_html_with_embeds(
 pub fn document(
     title: &str,
     is_journal: bool,
+    rows: Vec<(usize, &str, Vec<Resolved>)>,
+    options: &Options,
+) -> String {
+    document_with_board(title, is_journal, None, rows, options)
+}
+
+/// [`document`], with a whiteboard's drawing (`board_svg`) after the
+/// title, before the rows.
+pub fn document_with_board(
+    title: &str,
+    is_journal: bool,
+    board: Option<String>,
     rows: Vec<(usize, &str, Vec<Resolved>)>,
     options: &Options,
 ) -> String {
@@ -206,12 +238,89 @@ pub fn document(
     out.push_str(&format!(
         "<main class=\"{class}\">\n<h1 class=\"page-title\">{title}</h1>\n"
     ));
-    outline_html(&mut out, "<ul class=\"outline\">", rows, ctx);
+    let has_board = board.is_some();
+    if let Some(board) = board {
+        out.push_str(&board);
+    }
+    // A whiteboard's export is its board alone.
+    if !has_board || !rows.is_empty() {
+        outline_html(&mut out, "<ul class=\"outline\">", rows, ctx);
+    }
     out.push_str("</main>\n</body>\n</html>\n");
     out
 }
 
 type Ctx<'a> = Options<'a>;
+
+/// A whiteboard (decision 53) as an inline SVG: arrows as lines and
+/// triangles, each card a box with its text rendered like a block inside
+/// a `<foreignObject>`. Everything is placed by SVG attributes, not CSS,
+/// so it shows under both documents' CSPs (`style-src 'self'` blocks
+/// `style=""`), and inline SVG loads nothing. `clean` prepares a card's
+/// text (publish strips properties).
+pub fn board_svg(
+    board: &crate::whiteboard::Board,
+    ctx: &Ctx,
+    clean: &dyn Fn(&str) -> String,
+) -> String {
+    use crate::whiteboard::geom::{arrowhead, edge_line, Rect};
+    const MARGIN: f32 = 20.0;
+    let mut out = String::from("<div class=\"whiteboard\">");
+    let Some(all) = Rect::union(&board.rects()) else {
+        out.push_str("<p class=\"image-missing\">Empty whiteboard</p></div>\n");
+        return out;
+    };
+    let (x0, y0) = (all.x - MARGIN, all.y - MARGIN);
+    let (w, h) = (all.w + 2.0 * MARGIN, all.h + 2.0 * MARGIN);
+    out.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{x0:.1} {y0:.1} {w:.1} {h:.1}\" \
+         width=\"{w:.0}\" height=\"{h:.0}\" role=\"img\" aria-label=\"Whiteboard\">\n"
+    ));
+    for edge in &board.edges {
+        let Some((a, b)) = edge_line(board, edge.from, edge.to) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "<line class=\"edge\" x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\"/>\n",
+            a.x, a.y, b.x, b.y
+        ));
+        let head = arrowhead(a, b);
+        let points: Vec<String> = head
+            .iter()
+            .map(|p| format!("{:.1},{:.1}", p.x, p.y))
+            .collect();
+        out.push_str(&format!(
+            "<polygon class=\"arrow\" points=\"{}\"/>\n",
+            points.join(" ")
+        ));
+        if let Some(label) = &edge.label {
+            out.push_str(&format!(
+                "<text class=\"edge-label\" x=\"{:.1}\" y=\"{:.1}\">{}</text>\n",
+                (a.x + b.x) / 2.0,
+                (a.y + b.y) / 2.0 - 4.0,
+                escape(label)
+            ));
+        }
+    }
+    for card in &board.cards {
+        let r = card.rect;
+        let fill = card
+            .color
+            .and_then(|name| crate::whiteboard::COLORS.iter().find(|(n, _)| *n == name))
+            .map(|(_, rgb)| format!(" fill=\"#{rgb:06x}\""))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "<rect class=\"card-box\" x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"6\"{fill}/>\n\
+             <foreignObject x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\">\
+             <div xmlns=\"http://www.w3.org/1999/xhtml\" class=\"card\">",
+            r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h
+        ));
+        block_html(&mut out, &clean(&card.text), ctx);
+        out.push_str("</div></foreignObject>\n");
+    }
+    out.push_str("</svg></div>\n");
+    out
+}
 
 /// Blocks (depth, content, resolved embeds) as nested `<ul>`s, one `<li>`
 /// per block, children in a `<ul>` inside their parent's `<li>`. `open` is

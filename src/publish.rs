@@ -458,6 +458,20 @@ pub fn build(
     let mut files = Vec::new();
     for (p, name) in &names {
         let page = &pages[*p];
+        if crate::whiteboard::is_whiteboard(page) {
+            // The drawing, not the outline (decision 53).
+            let board = crate::whiteboard::parse(page);
+            let svg = export::board_svg(&board, &options, &|t| strip_properties(t));
+            let html = export::document_with_board(
+                &page.title,
+                page.is_journal,
+                Some(svg),
+                Vec::new(),
+                &options,
+            );
+            files.push((format!("{name}.html"), html.into_bytes()));
+            continue;
+        }
         let contents: Vec<String> = page
             .blocks
             .iter()

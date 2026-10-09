@@ -69,6 +69,8 @@ impl NoteSec {
             && self.page_menu.is_none()
             && self.trash_confirm.is_none()
             && !self.import_dialog_open()
+            // Typing in a whiteboard card is plain typing (decision 53).
+            && !self.card_editing()
     }
 
     /// Vim takes every key (Normal, Visual, or the `:` line): nothing is
