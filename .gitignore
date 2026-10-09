@@ -1,2 +1,5 @@
 /target
 *.log
+dist/
+*.AppImage
+*.tar.gz

@@ -7,10 +7,10 @@ license = "MIT"
 repository = "https://github.com/gencayks/notesec"
 
 [dependencies]
-# GPUI is not published in a stable form, so for now we point at a local clone of
-# the Zed repo. (Absolute path: Cargo does not expand `~`.)
-gpui = { path = "/home/kazo/gpui-playground/crates/gpui" }
-gpui_platform = { path = "/home/kazo/gpui-playground/crates/gpui_platform", features = ["wayland", "x11"] }
+# GPUI is not on crates.io in a stable form, so we pin the Zed monorepo
+# (which hosts the gpui crates) to a tested revision.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "72d073d" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "72d073d", features = ["wayland", "x11"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 dirs = "6"
@@ -39,7 +39,7 @@ async-process = { git = "https://github.com/zed-industries/async-process.git", r
 
 [dev-dependencies]
 # test-support enables the headless TestAppContext used by the UI tests.
-gpui = { path = "/home/kazo/gpui-playground/crates/gpui", features = ["test-support"] }
-gpui_platform = { path = "/home/kazo/gpui-playground/crates/gpui_platform", features = ["test-support"] }
-gpui_wgpu = { path = "/home/kazo/gpui-playground/crates/gpui_wgpu" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "72d073d", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "72d073d", features = ["test-support"] }
+gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "72d073d" }
 wat = "1.261.0"
