@@ -429,6 +429,74 @@ pub fn chat_model(endpoint: &Endpoint, configured: &str) -> Result<String, AiErr
         .ok_or(AiError::NoModel)
 }
 
+/// The embedding model to use: the configured embedding model, else the
+/// configured chat model, else (both empty) the first embedding-looking
+/// model the server lists, else its first model. Only the *model* falls
+/// back; the endpoint (and so the provider) is the one given.
+pub fn embedding_model(
+    endpoint: &Endpoint,
+    embedding: &str,
+    chat: &str,
+) -> Result<String, AiError> {
+    for configured in [embedding, chat] {
+        if !configured.trim().is_empty() {
+            return Ok(configured.trim().to_string());
+        }
+    }
+    let models = list_models(endpoint)?;
+    models
+        .iter()
+        .find(|id| is_embedding_model(id))
+        .or(models.first())
+        .cloned()
+        .ok_or(AiError::NoModel)
+}
+
+/// How many texts one `/embeddings` request carries.
+pub const EMBED_BATCH: usize = 32;
+
+/// Embed `inputs` with `model` (`POST /embeddings`, one request; callers
+/// batch with `EMBED_BATCH`). The vectors come back in input order.
+pub fn embed(
+    endpoint: &Endpoint,
+    model: &str,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>, AiError> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let body = json!({ "model": model, "input": inputs });
+    let value = read_json(post_json(endpoint, "/embeddings", &body)?, endpoint.url())?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AiError::BadResponse("no embeddings in the reply".into()))?;
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
+    for (pos, item) in data.iter().enumerate() {
+        let ix = item
+            .get("index")
+            .and_then(Value::as_u64)
+            .map_or(pos, |i| i as usize);
+        let vector: Option<Vec<f32>> = item.get("embedding").and_then(Value::as_array).map(|v| {
+            v.iter()
+                .filter_map(Value::as_f64)
+                .map(|x| x as f32)
+                .collect()
+        });
+        if let (Some(slot), Some(vector)) = (out.get_mut(ix), vector) {
+            *slot = Some(vector);
+        }
+    }
+    let vectors: Option<Vec<Vec<f32>>> = out.into_iter().collect();
+    match vectors {
+        Some(v) if v.iter().all(|x| !x.is_empty()) => Ok(v),
+        _ => Err(AiError::BadResponse(format!(
+            "expected {} embeddings in the reply",
+            inputs.len()
+        ))),
+    }
+}
+
 /// A streamed chat completion: `next` gives the answer piece by piece.
 pub struct ChatStream {
     body: Option<BufReader<ureq::BodyReader<'static>>>,
@@ -716,12 +784,25 @@ pub mod test_server {
     /// Serve `responses` on a free loopback port; the endpoint is
     /// `http://127.0.0.1:<port>/v1`.
     pub fn serve(responses: Vec<String>) -> (Endpoint, Requests) {
+        let count = responses.len();
+        let queue = Mutex::new(responses.into_iter());
+        serve_fn(count, move |_, _| {
+            queue.lock().unwrap().next().unwrap_or_default()
+        })
+    }
+
+    /// Like `serve`, but each of the next `count` responses is computed
+    /// from the request line and body.
+    pub fn serve_fn(
+        count: usize,
+        respond: impl Fn(&str, &str) -> String + Send + 'static,
+    ) -> (Endpoint, Requests) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests: Requests = Arc::default();
         let seen = requests.clone();
         thread::spawn(move || {
-            for response in responses {
+            for _ in 0..count {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
@@ -745,11 +826,11 @@ pub mod test_server {
                 }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap_or(());
-                seen.lock().unwrap().push((
-                    first.trim().to_string(),
-                    authorization,
-                    String::from_utf8_lossy(&body).into(),
-                ));
+                let body = String::from_utf8_lossy(&body).to_string();
+                let response = respond(first.trim(), &body);
+                seen.lock()
+                    .unwrap()
+                    .push((first.trim().to_string(), authorization, body));
                 let _ = stream.write_all(response.as_bytes());
             }
         });
@@ -759,6 +840,40 @@ pub mod test_server {
             local: true,
         };
         (endpoint, requests)
+    }
+
+    /// A fake embedding model: one dimension per word of `vocabulary`
+    /// (1 if the lowercased text contains it) plus a small constant one,
+    /// so texts sharing words are similar.
+    pub fn fake_embedding(text: &str, vocabulary: &[&str]) -> Vec<f32> {
+        let text = text.to_lowercase();
+        let mut v: Vec<f32> = vocabulary
+            .iter()
+            .map(|w| if text.contains(w) { 1.0 } else { 0.0 })
+            .collect();
+        v.push(0.05);
+        v
+    }
+
+    /// A `/embeddings` reply for the request `body` with `fake_embedding`.
+    pub fn embeddings_reply(body: &str, vocabulary: &[&str]) -> String {
+        let request: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let data: Vec<serde_json::Value> = request["input"]
+            .as_array()
+            .map(|inputs| {
+                inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, text)| {
+                        serde_json::json!({
+                            "index": i,
+                            "embedding": fake_embedding(text.as_str().unwrap_or(""), vocabulary),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        json(200, &serde_json::json!({ "data": data }).to_string())
     }
 
     /// An endpoint where nothing listens.
@@ -917,6 +1032,39 @@ mod tests {
         let none = r#"{"data":[{"id":"nomic-embed-text"}]}"#;
         let (ep, _) = serve(vec![json(200, none)]);
         assert_eq!(chat_model(&ep, ""), Err(AiError::NoModel));
+    }
+
+    #[test]
+    fn embeds_in_input_order_and_picks_an_embedding_model() {
+        let reply =
+            r#"{"data":[{"index":1,"embedding":[0.0,1.0]},{"index":0,"embedding":[1.0,0.5]}]}"#;
+        let (ep, requests) = serve(vec![json(200, reply), json(200, r#"{"data":[]}"#)]);
+        let vectors = embed(&ep, "e", &["a".into(), "b".into()]).unwrap();
+        assert_eq!(vectors, vec![vec![1.0, 0.5], vec![0.0, 1.0]]);
+        assert!(matches!(
+            embed(&ep, "e", &["a".into()]),
+            Err(AiError::BadResponse(_))
+        ));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].0, "POST /v1/embeddings HTTP/1.1");
+        let body: Value = serde_json::from_str(&requests[0].2).unwrap();
+        assert_eq!(body["model"], "e");
+        assert_eq!(body["input"], json!(["a", "b"]));
+        drop(requests);
+
+        assert_eq!(embedding_model(&ep, " emb ", "chat").unwrap(), "emb");
+        assert_eq!(
+            embedding_model(&ep, "", "chat").unwrap(),
+            "chat",
+            "model fallback"
+        );
+        let models = r#"{"data":[{"id":"qwen"},{"id":"nomic-embed-text"}]}"#;
+        let (ep, _) = serve(vec![
+            json(200, models),
+            json(200, r#"{"data":[{"id":"qwen"}]}"#),
+        ]);
+        assert_eq!(embedding_model(&ep, "", "").unwrap(), "nomic-embed-text");
+        assert_eq!(embedding_model(&ep, "", "").unwrap(), "qwen");
     }
 
     #[test]

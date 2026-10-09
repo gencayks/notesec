@@ -14,6 +14,7 @@ mod graph_view;
 mod hotkeys;
 mod model;
 mod search;
+mod semantic;
 mod state;
 mod storage;
 mod table;

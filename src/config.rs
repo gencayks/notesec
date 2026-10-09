@@ -9,9 +9,10 @@
 //! ai_provider = "local"    # "local" (default), "api" or "off"; never falls back
 //! ai_endpoint = "http://localhost:1234/v1"  # Local: loopback http only
 //! ai_model = ""            # Local chat model; empty picks the server's first one
-//! ai_embedding_model = ""  # embedding model; empty uses the chat model
+//! ai_embedding_model = ""  # Local embedding model; empty: the chat model (decision 43)
 //! ai_api_base = "https://api.openai.com/v1"  # API key mode: https base URL
 //! ai_api_model = ""        # API key mode: model id (required by most providers)
+//! ai_api_embedding_model = ""  # API key mode embeddings; empty: ai_api_model
 //! ```
 //!
 //! The API key itself is NOT stored here: it lives in `state.toml` as
@@ -71,12 +72,16 @@ pub struct Config {
     /// Local mode: the chat model's id; empty means the server's first
     /// chat model.
     pub ai_model: String,
-    /// The embedding model's id; empty means use the chat model.
+    /// Local mode: the embedding model's id (semantic search, decision
+    /// 43); empty means use the chat model.
     pub ai_embedding_model: String,
     /// API key mode: the provider's https base URL.
     pub ai_api_base: String,
     /// API key mode: the model id.
     pub ai_api_model: String,
+    /// API key mode: the embedding model's id; empty means `ai_api_model`.
+    /// Separate from Local's: model names differ between servers.
+    pub ai_api_embedding_model: String,
 }
 
 /// OpenAI's API, the most common OpenAI-compatible base URL.
@@ -95,6 +100,7 @@ impl Default for Config {
             ai_embedding_model: String::new(),
             ai_api_base: DEFAULT_API_BASE.to_string(),
             ai_api_model: String::new(),
+            ai_api_embedding_model: String::new(),
         }
     }
 }
@@ -145,6 +151,7 @@ impl Config {
             &mut self.ai_embedding_model,
             &mut self.ai_api_base,
             &mut self.ai_api_model,
+            &mut self.ai_api_embedding_model,
         ] {
             *field = field.trim().to_string();
         }
@@ -215,6 +222,7 @@ mod tests {
             ai_embedding_model: "nomic-embed-text".into(),
             ai_api_base: "https://api.x.ai/v1".into(),
             ai_api_model: "grok-4".into(),
+            ai_api_embedding_model: "text-embedding-3-small".into(),
         };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), config);

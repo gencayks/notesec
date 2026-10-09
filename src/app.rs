@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 /// Settings > AI and the Ask my notes panel (decision 42).
 mod ai_ui;
-use ai_ui::{AiSettings, AskState};
+use ai_ui::{AiSettings, AskState, SemanticState};
 
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace. Palette
@@ -114,8 +114,9 @@ actions!(
         ToggleGraphJournals,
         ShowShortcuts,
         CustomizeShortcuts,
-        // AI (decision 42), no default keys.
+        // AI (decisions 42-46), no default keys.
         AskMyNotes,
+        SemanticSearch,
     ]
 );
 
@@ -667,6 +668,8 @@ pub struct NoteSec {
     shortcuts_open: bool,
     /// The Ask my notes panel and its session history (decision 42).
     ask: AskState,
+    /// The Semantic search overlay and the embedding cache (decision 43).
+    semantic: SemanticState,
     /// The pages in the trash, newest first (`Storage::list_trash`). Read
     /// at startup, when the trash tab is focused and after every change.
     trash: Vec<TrashEntry>,
@@ -846,6 +849,7 @@ impl NoteSec {
             page_menu: None,
             shortcuts_open: false,
             ask: AskState::default(),
+            semantic: SemanticState::default(),
             trash,
             trash_confirm: None,
             trash_error: None,
@@ -915,7 +919,7 @@ impl NoteSec {
     }
 
     fn active_editor_mut(&mut self) -> &mut EditorState {
-        let ask_active = self.ask_input_active();
+        let ai_input = self.ai_overlay_input();
         match (&mut self.search, &mut self.page_menu) {
             (Some(s), _) => &mut s.query,
             (
@@ -925,8 +929,13 @@ impl NoteSec {
                     ..
                 }),
             ) => editor,
-            _ => ai_ui::ai_editor_mut(&mut self.settings, &mut self.ask, ask_active)
-                .unwrap_or(&mut self.editor),
+            _ => ai_ui::ai_editor_mut(
+                &mut self.settings,
+                &mut self.ask,
+                &mut self.semantic,
+                ai_input,
+            )
+            .unwrap_or(&mut self.editor),
         }
     }
 
@@ -3279,7 +3288,7 @@ impl NoteSec {
             self.confirm_search(window, cx);
             return;
         }
-        if self.ai_enter(cx) {
+        if self.ai_enter(window, cx) {
             return;
         }
         if let Some(state) = &self.slash {
@@ -3589,6 +3598,9 @@ impl NoteSec {
             self.move_search_selection(-1, cx);
             return;
         }
+        if self.ai_move_selection(-1, cx) {
+            return;
+        }
         if self.slash.is_some() {
             self.move_slash_selection(-1, cx);
             return;
@@ -3608,6 +3620,9 @@ impl NoteSec {
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
         if self.search.is_some() {
             self.move_search_selection(1, cx);
+            return;
+        }
+        if self.ai_move_selection(1, cx) {
             return;
         }
         if self.slash.is_some() {
@@ -7660,7 +7675,7 @@ impl Render for NoteSec {
 
         let shortcuts_overlay = self.shortcuts_open.then(|| self.render_shortcuts(cx));
 
-        let ask_overlay = self.ask.open.then(|| self.render_ask(cx));
+        let ask_overlay = self.render_ai_overlay(cx);
 
         let trash_confirm_overlay = self
             .trash_confirm
@@ -7793,6 +7808,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_toggle_graph_journals))
             .on_action(cx.listener(Self::on_show_shortcuts))
             .on_action(cx.listener(Self::on_ask_my_notes))
+            .on_action(cx.listener(Self::on_semantic_search))
             .child(sidebar)
             .child(content)
             .children(status_toast)

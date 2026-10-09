@@ -1422,6 +1422,70 @@ that mutate, and data races are essentially impossible.
     "Chat" / "Embeddings" buttons that set the model of the active mode.
     In Off mode the panel and a status message say how to turn AI on,
     with an "Open Settings > AI" button.
+43. **Semantic search: block embeddings cached in the graph, ranked by
+    cosine.** *Command*: "Semantic search" (`SemanticSearch`; meaning,
+    similar, embeddings, ai search, find by meaning; `Needs::Nothing`, no
+    default key) opens an overlay like the palette (`semantic-panel`,
+    code in `src/app/ai_ui/semantic_ui.rs`). Enter on a new query runs
+    the search off the UI thread; Enter on the same query (or a click)
+    opens the highlighted result's block like a block reference; Up /
+    Down move the highlight (one hook in `up` / `down`); Esc or the
+    backdrop close it, keeping the last results. No debounce: every run
+    costs an embedding request, and with a slow local model typing would
+    queue requests. *Provider and model*: the active mode's endpoint
+    only (decision 42; no provider fallback). The embedding model is the
+    mode's embedding setting (`ai_embedding_model` for Local, new
+    `ai_api_embedding_model` for API key mode, since model names differ
+    between servers), else the mode's chat model, else (both empty) the
+    first embedding-looking model the server lists, else its first
+    model (`ai::embedding_model`). Only the *model* falls back.
+    "Check connection"'s Embeddings button sets the active mode's field.
+    *Embedding*: every non-empty block as `"<page title>\n<text>"` (the
+    title gives short blocks context), cut to 2000 characters, sent to
+    `POST {base}/embeddings` in batches of `EMBED_BATCH` (32) through the
+    same ureq agent policy (no proxy and no redirects in Local mode, the
+    bearer key in API mode); vectors are matched to inputs by `index`.
+    One background step per batch, so the overlay shows "Indexing
+    notes… n/m blocks" between them. *Cache*: `<graph>/.notesec/
+    embeddings.json` (`semantic::Cache`): `{version, key: {provider,
+    base, model}, vectors: {fnv1a64(text): [f32]}}`. Keying by a hash of
+    the embedded text, not the block id (ids are regenerated on load),
+    means an edit re-embeds only the changed block, identical texts share
+    a vector, and renaming a page re-embeds its blocks (the title is part
+    of the text). A different key (provider, base URL or model) drops
+    every vector, because vectors from different models can't be
+    compared. After a full run, vectors of texts that are gone are
+    pruned. The file is written atomically (`write_atomic`) after each
+    run, and also when a batch fails, so the next run continues where
+    it stopped. It stays in memory between runs. FNV-1a is hand-written
+    because std's hasher isn't stable across Rust releases. JSON floats
+    cost about 10 bytes each (about 10 MB for 1000 blocks at 768
+    dimensions); a binary format can come later if that matters.
+    *Where it lives and why*: notes are only read from `pages/` and
+    `journals/`, so nothing under `.notesec/` is ever loaded as a page,
+    found by global search, exported or trashed. For git auto-backup
+    (decision 39), `Cache::save` writes `.notesec/.gitignore` containing
+    `*`; git honours nested ignore files, so the folder (including that
+    file) is never committed, and `backup::IGNORED` stays as Coder 2
+    left it. Writing the cache doesn't go through `Storage`, so it
+    doesn't bump the change counter or start a backup either. The
+    embeddings are derived from the notes and stay in the graph folder.
+    *Ranking*: cosine similarity of the query's vector with every
+    block's (`semantic::rank_blocks`; 0 for mismatched dimensions). Pages
+    are ranked by their best block (`rank_pages`), top 30, each row
+    showing that block's snippet and the similarity as a percentage.
+    *Ask my notes* (decision 42) now finds its sources by meaning when
+    the active mode has an embedding model *set*. It indexes new blocks
+    first, with progress in the turn's note, then takes the top 8 blocks.
+    Without that setting it keeps keyword retrieval, so a question never
+    sends a likely-doomed embedding request to a chat-only model. If the
+    embedding request fails, the turn falls back to keyword retrieval and
+    says so ("Sources found by keywords: semantic retrieval failed
+    (…)"). That fallback is a choice of *retrieval method* on the same
+    provider; the chat request still goes to the same server.
+    *Saved searches (feature 5)*: `SemanticState.query` holds the
+    query the results are for, and `NoteSec::run_semantic(query)` re-runs
+    it, so a smart folder can store `{kind: semantic, query}` and call it.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

@@ -13,6 +13,12 @@ use super::*;
 use crate::ai::{self, AiError, AiProvider, Endpoint};
 use crate::config::DEFAULT_API_BASE;
 
+/// Semantic search (decision 43): its overlay and the indexing pipeline
+/// Ask my notes shares.
+mod semantic_ui;
+use semantic_ui::Progress;
+pub(super) use semantic_ui::SemanticState;
+
 /// A text field of Settings > AI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AiField {
@@ -20,7 +26,7 @@ pub(super) enum AiField {
     Endpoint,
     /// Local mode: chat model id.
     Model,
-    /// Both modes: embedding model id (used by semantic search, decision 43).
+    /// Local mode: embedding model id (semantic search, decision 43).
     EmbeddingModel,
     /// API key mode: base URL.
     ApiBase,
@@ -28,6 +34,8 @@ pub(super) enum AiField {
     ApiKey,
     /// API key mode: chat model id.
     ApiModel,
+    /// API key mode: embedding model id (decision 43).
+    ApiEmbeddingModel,
 }
 
 impl AiField {
@@ -39,6 +47,7 @@ impl AiField {
             AiField::ApiBase => "api-base",
             AiField::ApiKey => "api-key",
             AiField::ApiModel => "api-model",
+            AiField::ApiEmbeddingModel => "api-embedding-model",
         }
     }
 
@@ -50,6 +59,7 @@ impl AiField {
             AiField::ApiBase => "API base URL",
             AiField::ApiKey => "API key",
             AiField::ApiModel => "Chat model",
+            AiField::ApiEmbeddingModel => "Embedding model",
         }
     }
 
@@ -62,6 +72,7 @@ impl AiField {
             AiField::ApiBase => DEFAULT_API_BASE,
             AiField::ApiKey => "Not set",
             AiField::ApiModel => "e.g. gpt-4o-mini, grok-4, claude-sonnet-4",
+            AiField::ApiEmbeddingModel => "Empty: use the chat model",
         }
     }
 }
@@ -96,6 +107,8 @@ pub(super) struct AskTurn {
     pub(super) error: Option<String>,
     /// The answer is complete (or failed).
     pub(super) done: bool,
+    /// How the sources were found, or indexing progress (decision 43).
+    pub(super) note: Option<String>,
 }
 
 impl AskTurn {
@@ -115,13 +128,21 @@ pub(super) struct AskState {
     pub(super) task: Option<Task<()>>,
 }
 
+/// Which AI overlay's input has the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AiInput {
+    Ask,
+    Semantic,
+}
+
 /// The AI editor that has the keyboard, if any, from the parts of
 /// `NoteSec` it lives in (split so `active_editor_mut` can fall back to the
 /// block editor without a borrow conflict).
 pub(super) fn ai_editor_mut<'a>(
     settings: &'a mut Option<SettingsState>,
     ask: &'a mut AskState,
-    ask_active: bool,
+    semantic: &'a mut SemanticState,
+    input: Option<AiInput>,
 ) -> Option<&'a mut EditorState> {
     if let Some(SettingsState {
         ai: AiSettings {
@@ -133,7 +154,11 @@ pub(super) fn ai_editor_mut<'a>(
     {
         return Some(editor);
     }
-    ask_active.then_some(&mut ask.input)
+    match input {
+        Some(AiInput::Ask) => Some(&mut ask.input),
+        Some(AiInput::Semantic) => Some(&mut semantic.input),
+        None => None,
+    }
 }
 
 /// Longest snippet of a source shown in the panel.
@@ -142,15 +167,39 @@ const SNIPPET_CHARS: usize = 160;
 impl NoteSec {
     // --- hooks used by app.rs -------------------------------------------------
 
-    /// The Ask panel's input has the keyboard: it is open and no dialog,
-    /// palette or menu covers it.
+    /// The open AI overlay (Ask or Semantic search; never both) whose
+    /// input has the keyboard: no dialog, palette or menu covers it.
+    pub(super) fn ai_overlay_input(&self) -> Option<AiInput> {
+        let covered = self.settings.is_some()
+            || self.search.is_some()
+            || self.page_menu.is_some()
+            || self.shortcuts_open
+            || self.trash_confirm.is_some();
+        if covered {
+            None
+        } else if self.ask.open {
+            Some(AiInput::Ask)
+        } else if self.semantic.open {
+            Some(AiInput::Semantic)
+        } else {
+            None
+        }
+    }
+
+    /// The Ask panel's input has the keyboard.
     pub(super) fn ask_input_active(&self) -> bool {
-        self.ask.open
-            && self.settings.is_none()
-            && self.search.is_none()
-            && self.page_menu.is_none()
-            && !self.shortcuts_open
-            && self.trash_confirm.is_none()
+        self.ai_overlay_input() == Some(AiInput::Ask)
+    }
+
+    /// The open AI overlay, if any (`app.rs` adds it under the palette).
+    pub(super) fn render_ai_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.ask.open {
+            Some(self.render_ask(cx))
+        } else if self.semantic.open {
+            Some(self.render_semantic(cx))
+        } else {
+            None
+        }
     }
 
     /// A Settings > AI field is being edited.
@@ -163,21 +212,34 @@ impl NoteSec {
         if let Some((_, editor)) = self.settings.as_ref().and_then(|s| s.ai.field.as_ref()) {
             return Some(editor);
         }
-        self.ask_input_active().then_some(&self.ask.input)
+        match self.ai_overlay_input()? {
+            AiInput::Ask => Some(&self.ask.input),
+            AiInput::Semantic => Some(&self.semantic.input),
+        }
     }
 
     /// Enter in an AI field: save the Settings field, or ask the question.
     /// Returns whether it was handled.
-    pub(super) fn ai_enter(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(super) fn ai_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.ai_settings_editing() {
             self.commit_ai_field(cx);
             return true;
         }
-        if self.ask_input_active() {
-            self.ask_question(cx);
-            return true;
+        match self.ai_overlay_input() {
+            Some(AiInput::Ask) => self.ask_question(cx),
+            Some(AiInput::Semantic) => self.semantic_enter(window, cx),
+            None => return false,
         }
-        false
+        true
+    }
+
+    /// Up / Down in the semantic search results. Returns whether handled.
+    pub(super) fn ai_move_selection(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        if self.ai_overlay_input() != Some(AiInput::Semantic) {
+            return false;
+        }
+        self.move_semantic_selection(delta, cx);
+        true
     }
 
     /// Esc: cancel the Settings field being edited (the panel stays), or
@@ -190,11 +252,12 @@ impl NoteSec {
             cx.notify();
             return true;
         }
-        if self.ask_input_active() {
-            self.close_ask(cx);
-            return true;
+        match self.ai_overlay_input() {
+            Some(AiInput::Ask) => self.close_ask(cx),
+            Some(AiInput::Semantic) => self.close_semantic(cx),
+            None => return false,
         }
-        false
+        true
     }
 
     // --- settings -----------------------------------------------------------------
@@ -218,6 +281,15 @@ impl NoteSec {
         }
     }
 
+    /// The embedding model setting of the active provider (empty: use the
+    /// chat model, decision 43).
+    fn ai_embedding_setting(&self) -> String {
+        match self.config.ai_provider {
+            AiProvider::Api => self.config.ai_api_embedding_model.clone(),
+            _ => self.config.ai_embedding_model.clone(),
+        }
+    }
+
     fn ai_field_value(&self, field: AiField) -> String {
         match field {
             AiField::Endpoint => self.config.ai_endpoint.clone(),
@@ -226,6 +298,7 @@ impl NoteSec {
             AiField::ApiBase => self.config.ai_api_base.clone(),
             AiField::ApiKey => self.state.ai_api_key.clone(),
             AiField::ApiModel => self.config.ai_api_model.clone(),
+            AiField::ApiEmbeddingModel => self.config.ai_api_embedding_model.clone(),
         }
     }
 
@@ -292,6 +365,7 @@ impl NoteSec {
                     }
                     AiField::ApiBase => config.ai_api_base = text,
                     AiField::ApiModel => config.ai_api_model = text,
+                    AiField::ApiEmbeddingModel => config.ai_api_embedding_model = text,
                     AiField::ApiKey => {}
                 }
                 self.save_config();
@@ -357,7 +431,9 @@ impl NoteSec {
 
     /// A listed model's "Chat" / "Embeddings" button.
     fn use_ai_model(&mut self, model: String, embeddings: bool, cx: &mut Context<Self>) {
-        if embeddings {
+        if embeddings && self.config.ai_provider == AiProvider::Api {
+            self.config.ai_api_embedding_model = model;
+        } else if embeddings {
             self.config.ai_embedding_model = model;
         } else if self.config.ai_provider == AiProvider::Api {
             self.config.ai_api_model = model;
@@ -384,6 +460,7 @@ impl NoteSec {
         self.page_menu = None;
         self.shortcuts_open = false;
         self.trash_confirm = None;
+        self.semantic.open = false;
         self.ask.open = true;
         if self.config.ai_provider == AiProvider::Off {
             let status = Status {
@@ -403,16 +480,20 @@ impl NoteSec {
         cx.notify();
     }
 
-    /// Enter in the panel: retrieve the best blocks, then stream the
-    /// model's answer into a new turn. A question while an answer is still
-    /// streaming waits (Enter does nothing).
+    /// Enter in the panel: find the best blocks, then stream the model's
+    /// answer into a new turn. A question while an answer is still
+    /// streaming waits (Enter does nothing). With an embedding model set
+    /// for the active mode, blocks are found by meaning (decision 43,
+    /// indexing what's new first); without one, or if that fails, by
+    /// keywords (`ai::retrieve`). That is a choice of retrieval method on
+    /// the same provider, never a switch of provider.
     pub(super) fn ask_question(&mut self, cx: &mut Context<Self>) {
         let question = self.ask.input.text.trim().to_string();
         if question.is_empty() || self.ask.turns.last().is_some_and(|t| !t.done) {
             return;
         }
         self.ask.input = EditorState::default();
-        let sources: Vec<AskSource> = ai::retrieve(&self.pages, &question, ai::ASK_SOURCES)
+        let lexical: Vec<AskSource> = ai::retrieve(&self.pages, &question, ai::ASK_SOURCES)
             .into_iter()
             .map(|(p, b)| AskSource {
                 title: self.pages[p].title.clone(),
@@ -420,29 +501,73 @@ impl NoteSec {
                 text: self.pages[p].blocks[b].content.clone(),
             })
             .collect();
-        let pairs: Vec<(String, String)> = sources
-            .iter()
-            .map(|s| (s.title.clone(), s.text.clone()))
-            .collect();
-        let messages = ai::ask_messages(&question, &pairs);
         let endpoint = self.ai_endpoint();
         let model = self.ai_chat_model();
+        let semantic = !self.ai_embedding_setting().is_empty();
         self.ask.turns.push(AskTurn {
-            question,
+            question: question.clone(),
             answer: String::new(),
-            sources,
+            sources: if semantic {
+                Vec::new()
+            } else {
+                lexical.clone()
+            },
             error: None,
             done: false,
+            note: None,
         });
         let ix = self.ask.turns.len() - 1;
         let endpoint = match endpoint {
             Ok(endpoint) => endpoint,
             Err(err) => {
+                self.ask.turns[ix].sources = lexical;
                 self.finish_turn(ix, Some(err), cx);
                 return;
             }
         };
+        let job = semantic.then(|| self.semantic_job(endpoint.clone(), question.clone()));
         self.ask.task = Some(cx.spawn(async move |this, cx| {
+            if let Some(job) = job {
+                let found = semantic_ui::run_job(&this, cx, job, Progress::Ask(ix)).await;
+                let ok = this.update(cx, |this, cx| {
+                    let (sources, note) = match found {
+                        Ok(hits) => (
+                            hits.into_iter()
+                                .take(ai::ASK_SOURCES)
+                                .map(|hit| AskSource {
+                                    title: hit.title,
+                                    block: hit.block,
+                                    text: hit.content,
+                                })
+                                .collect(),
+                            "Sources found by meaning (embeddings)".to_string(),
+                        ),
+                        Err(err) => (
+                            lexical,
+                            format!("Sources found by keywords: semantic retrieval failed ({err})"),
+                        ),
+                    };
+                    if let Some(turn) = this.ask.turns.get_mut(ix) {
+                        turn.sources = sources;
+                        turn.note = Some(note);
+                    }
+                    cx.notify();
+                });
+                if ok.is_err() {
+                    return;
+                }
+            }
+            let Ok(pairs) = this.update(cx, |this, _| {
+                this.ask.turns.get(ix).map_or(Vec::new(), |turn| {
+                    turn.sources
+                        .iter()
+                        .map(|s| (s.title.clone(), s.text.clone()))
+                        .collect::<Vec<_>>()
+                })
+            }) else {
+                return;
+            };
+            let messages = ai::ask_messages(&question, &pairs);
             let started = cx
                 .background_spawn(async move {
                     let model = ai::chat_model(&endpoint, &model)?;
@@ -698,7 +823,7 @@ impl NoteSec {
                             .child("The key is stored in plaintext in state.toml in your graph folder. If git auto-backup is on, it is also committed to the graph's local git repository."),
                     )
                     .child(field(AiField::ApiModel, cx))
-                    .child(field(AiField::EmbeddingModel, cx));
+                    .child(field(AiField::ApiEmbeddingModel, cx));
             }
         }
 
@@ -738,7 +863,7 @@ impl NoteSec {
                 }
                 Some(Ok(models)) => {
                     let chat = self.ai_chat_model();
-                    let embed = self.config.ai_embedding_model.clone();
+                    let embed = self.ai_embedding_setting();
                     body = body.child(
                         div()
                             .debug_selector(|| "ai-check-ok".to_string())
@@ -907,6 +1032,14 @@ impl NoteSec {
                             .font_weight(FontWeight::BOLD)
                             .child(turn.question.clone()),
                     )
+                    .when_some(turn.note.clone(), |d, note| {
+                        d.child(
+                            div()
+                                .debug_selector(move || format!("ask-note-{t}"))
+                                .text_color(theme.muted)
+                                .child(note),
+                        )
+                    })
                     .when(thinking, |d| {
                         d.child(div().text_color(theme.muted).child("Thinking\u{2026}"))
                     })
@@ -1072,7 +1205,7 @@ mod tests {
 
     /// A window on a graph with `pages` (the first is selected), `config`
     /// and `state_toml` in place before it opens.
-    fn setup<'a>(
+    pub(super) fn setup<'a>(
         cx: &'a mut TestAppContext,
         name: &str,
         pages: &[(&str, &str)],
@@ -1098,7 +1231,7 @@ mod tests {
         (view, cx, dir)
     }
 
-    fn local(url: &str) -> Config {
+    pub(super) fn local(url: &str) -> Config {
         Config {
             ai_provider: AiProvider::Local,
             ai_endpoint: url.to_string(),
@@ -1107,7 +1240,7 @@ mod tests {
         }
     }
 
-    fn has(cx: &mut VisualTestContext, selector: &str) -> bool {
+    pub(super) fn has(cx: &mut VisualTestContext, selector: &str) -> bool {
         let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
         cx.debug_bounds(selector).is_some()
     }
@@ -1118,24 +1251,24 @@ mod tests {
         cx.simulate_click(bounds.center(), Modifiers::none());
     }
 
-    fn open_ask(cx: &mut VisualTestContext) {
+    pub(super) fn open_ask(cx: &mut VisualTestContext) {
         cx.simulate_keystrokes("ctrl-k");
         cx.simulate_input("ask my notes");
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
     }
 
-    fn ask(cx: &mut VisualTestContext, question: &str) {
+    pub(super) fn ask(cx: &mut VisualTestContext, question: &str) {
         cx.simulate_input(question);
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
     }
 
-    fn turns(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<AskTurn> {
+    pub(super) fn turns(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<AskTurn> {
         view.update(cx, |app, _| app.ask.turns.clone())
     }
 
-    const PAGES: &[(&str, &str)] = &[
+    pub(super) const PAGES: &[(&str, &str)] = &[
         ("Test", "- hello\n- weather today\n"),
         ("Rust", "- ownership rules every value\n- the book\n"),
         ("Diary", "- read about rust today\n"),
