@@ -8,6 +8,7 @@ use super::*;
 use crate::semantic::{self, Cache, CacheKey, Item};
 use gpui::{AsyncApp, WeakEntity};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// How many pages a semantic search lists.
 pub(in crate::app) const SEMANTIC_RESULTS: usize = 30;
@@ -38,8 +39,16 @@ pub(in crate::app) struct SemanticState {
     pub(in crate::app) progress: Option<(usize, usize)>,
     pub(in crate::app) error: Option<String>,
     /// The embedding cache, kept between runs (None: read it from the
-    /// graph on the next run, or a run has it).
-    pub(in crate::app) cache: Option<Cache>,
+    /// graph on the next run, or a run has it). Shared, so "Related"
+    /// (decision 44) can read it off the UI thread without a copy; a run
+    /// takes it back (copying only if a Related computation still holds
+    /// it).
+    pub(in crate::app) cache: Option<Arc<Cache>>,
+    /// Bumped whenever a cache is put back (after a run, or read from the
+    /// graph): Related recomputes when it changes.
+    pub(in crate::app) generation: u64,
+    /// Related has looked for a cache in the graph this session.
+    pub(in crate::app) disk_checked: bool,
     pub(in crate::app) task: Option<Task<()>>,
 }
 
@@ -60,9 +69,19 @@ pub(in crate::app) struct SemanticJob {
 pub(in crate::app) enum Progress {
     Search,
     Ask(usize),
+    /// "Index notes" in the Related section (decision 44).
+    Related,
 }
 
 impl NoteSec {
+    /// The provider name a cache is keyed by.
+    pub(in crate::app) fn cache_key_provider(&self) -> &'static str {
+        match self.config.ai_provider {
+            AiProvider::Api => "api",
+            _ => "local",
+        }
+    }
+
     pub(in crate::app) fn semantic_job(
         &mut self,
         endpoint: Endpoint,
@@ -70,16 +89,13 @@ impl NoteSec {
     ) -> SemanticJob {
         SemanticJob {
             endpoint,
-            key_provider: match self.config.ai_provider {
-                AiProvider::Api => "api",
-                _ => "local",
-            },
+            key_provider: self.cache_key_provider(),
             embedding: self.ai_embedding_setting(),
             chat: self.ai_chat_model(),
             root: self.storage.root().to_path_buf(),
             items: semantic::items(&self.pages),
             query,
-            cache: self.semantic.cache.take(),
+            cache: self.semantic.cache.take().map(Arc::unwrap_or_clone),
         }
     }
 
@@ -91,14 +107,23 @@ impl NoteSec {
                     turn.note = Some(format!("Indexing notes\u{2026} {done}/{total} blocks"));
                 }
             }
+            Progress::Related => self.related.progress = Some((done, total)),
         }
         cx.notify();
+    }
+
+    /// Put a cache back after a run or a read from the graph.
+    pub(in crate::app) fn put_cache(&mut self, cache: Arc<Cache>) {
+        self.semantic.cache = Some(cache);
+        self.semantic.generation += 1;
+        self.semantic.disk_checked = true;
     }
 }
 
 /// Index what isn't embedded yet, embed `job.query`, and rank pages by
-/// their best block. The cache goes back to `SemanticState` (and to disk)
-/// even when a batch fails, so the next run continues where this stopped.
+/// their best block (an empty query only indexes). The cache goes back to
+/// `SemanticState` (and to disk) even when a batch fails, so the next run
+/// continues where this stopped.
 pub(in crate::app) async fn run_job(
     this: &WeakEntity<NoteSec>,
     cx: &mut AsyncApp,
@@ -116,19 +141,27 @@ pub(in crate::app) async fn run_job(
         cache,
     } = job;
     let (ep, root2) = (endpoint.clone(), root.clone());
-    let prepared = cx
+    let (model, mut cache) = cx
         .background_spawn(async move {
-            let model = ai::embedding_model(&ep, &embedding, &chat)?;
             let mut cache = cache.unwrap_or_else(|| Cache::load(&root2));
-            cache.use_key(&CacheKey {
-                provider: key_provider.to_string(),
-                base: ep.url().to_string(),
-                model: model.clone(),
-            });
-            Ok::<_, AiError>((model, cache))
+            let model = ai::embedding_model(&ep, &embedding, &chat);
+            if let Ok(model) = &model {
+                cache.use_key(&CacheKey {
+                    provider: key_provider.to_string(),
+                    base: ep.url().to_string(),
+                    model: model.clone(),
+                });
+            }
+            (model, cache)
         })
         .await;
-    let (model, mut cache) = prepared?;
+    let model = match model {
+        Ok(model) => model,
+        Err(err) => {
+            let _ = this.update(cx, |this, _| this.put_cache(Arc::new(cache)));
+            return Err(err);
+        }
+    };
     let missing: Vec<(String, String)> = cache
         .missing(&items)
         .into_iter()
@@ -158,7 +191,7 @@ pub(in crate::app) async fn run_job(
                         cache
                     })
                     .await;
-                let _ = this.update(cx, |this, _| this.semantic.cache = Some(cache));
+                let _ = this.update(cx, |this, _| this.put_cache(Arc::new(cache)));
                 return Err(err);
             }
         }
@@ -166,15 +199,20 @@ pub(in crate::app) async fn run_job(
         let _ = this.update(cx, |this, cx| this.report(progress, done, total, cx));
     }
     let items2 = items.clone();
-    let (cache, query_vector) = cx
+    let cache = cx
         .background_spawn(async move {
             cache.prune(&items2);
             save_cache(&cache, &root);
-            let query = ai::embed(&endpoint, &model, &[query]);
-            (cache, query)
+            Arc::new(cache)
         })
         .await;
-    let query_vector = query_vector?
+    let _ = this.update(cx, |this, _| this.put_cache(cache.clone()));
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query_vector = cx
+        .background_spawn(async move { ai::embed(&endpoint, &model, &[query]) })
+        .await?
         .into_iter()
         .next()
         .ok_or_else(|| AiError::BadResponse("no embedding for the query".into()))?;
@@ -187,7 +225,6 @@ pub(in crate::app) async fn run_job(
             score,
         })
         .collect();
-    let _ = this.update(cx, |this, _| this.semantic.cache = Some(cache));
     Ok(hits)
 }
 

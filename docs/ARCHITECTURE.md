@@ -1486,6 +1486,75 @@ that mutate, and data races are essentially impossible.
     *Saved searches (feature 5)*: `SemanticState.query` holds the
     query the results are for, and `NoteSec::run_semantic(query)` re-runs
     it, so a smart folder can store `{kind: semantic, query}` and call it.
+44. **Auto-tagging and Related pages: tags as `#tag` references on a
+    `tags::` line; Related from the embedding cache only.** *Tags in
+    notesec* are the existing `#tag` / `#[[multi word]]` references
+    (decision 7's parser): they create pages, show in "Linked from", the
+    graph and `{{query #tag}}`. There is no separate tag store, so a
+    suggestion is applied as text: `tags:: #rust, #[[reading list]]` in
+    the page's first block, the page-property block `alias::` already
+    uses (decision 36). `autotag::apply_tags` appends to an existing
+    `tags::` line, else adds the line after the first block's last
+    `key:: value` line (so aliases stay in the first block), else inserts
+    a new first block. `tag_markup` writes `#name` only when that parses
+    back as the whole tag, else `#[[name]]`. Applying is one undo step
+    (`record_state` with the state from before, like every edit) and is
+    saved with `save_page`, which also creates the tag's page, as typing
+    it would. *Suggesting*: "Suggest tags" (`SuggestTags`; auto tag,
+    tagging, ai tags, keywords, label; `Needs::Page`, no default key), or
+    the small "Suggest tags" button in the page's AI row, sends the
+    active mode's chat model (never another provider; decision 42) the
+    page's text (up to 4000 characters) and the vault's tags, most used
+    first (`model::tag_counts`, up to 150), asking it to prefer those
+    and to reply with a JSON array (`autotag::tag_messages`). It goes
+    through `ai::complete`, which is `chat_stream` read to the end, so
+    streaming and non-streaming servers both work.
+    `autotag::parse_reply` accepts a JSON array anywhere in the reply
+    (including inside a code fence), a `{"tags": [...]}` object, or a
+    plain list separated by commas, semicolons or lines with a label like
+    "Tags:" dropped. `normalise` drops list markers, quotes, `#`,
+    `[[ ]]` and trailing dots, collapses spaces, and rejects empty, long
+    (over 40 characters or 4 words), numeric or markup-breaking names. A
+    name matching a vault tag takes the vault's spelling. Names the page
+    already has are dropped: any `#tag` or `[[link]]` on it, its title
+    and its aliases. At most 6 are offered. They show as chips under
+    the title (`tag-chip-{i}`, "+ #name"); a click adds that one, "Add
+    all" adds the rest, × dismisses. The request runs off the UI thread;
+    the per-frame hook `sync_page_ai` drops the suggestions, and with
+    them the task (which cancels it), as soon as their page isn't the
+    one shown. Off and an unreachable server show their usual wording in
+    the chip row and change nothing. *Related* sits just above "Linked
+    from" (`render_page_ai`, focused pane only). Each page's vector is
+    the mean of its blocks' unit vectors from the decision 43 cache
+    (`semantic::page_vectors`). Pages are ranked by cosine against the
+    current page; the top 5 with a positive score are listed with the
+    score as a percentage, and a click opens the page. It never calls
+    the model by itself: rendering only reads the cache, and a page
+    whose blocks aren't embedded shows "This page isn't indexed for
+    similarity yet." with an "Index notes" button. That button runs the
+    semantic search indexing without a query (`run_job` with an empty
+    query, progress in the section). The ranking is computed off the UI
+    thread from an `Arc` of the cache, which `SemanticState` now holds;
+    a run takes it back with `Arc::unwrap_or_clone`, so there is no copy
+    unless a ranking is still reading it. It is recomputed only when the
+    key (page title, `SemanticState.generation`, `Storage::changes`)
+    changes: the generation goes up whenever a cache is put back, and
+    the save count after any edit. The cache is read from the graph once
+    per session, off the UI thread, and only if the file exists.
+    Vectors are only used when the cache key matches the active mode:
+    same provider, same base URL, and the model it would use (the
+    mode's embedding model, else its chat model, else any when neither
+    is set and the server picks). The section is hidden when AI is off,
+    when the endpoint isn't usable (an API key mode without a key), or
+    when there is no embedding model set and no matching cache. The
+    whole AI row is gone in Off mode, so page rendering never waits on
+    or depends on a server. `run_job` now also puts the cache back when
+    picking the model fails, which decision 43's version dropped. *Code*:
+    `src/autotag.rs` (pure), `semantic::page_vectors` / `related_pages`,
+    and `src/app/ai_ui/{tags_ui,related_ui}.rs`. `app.rs` carries the
+    `sync_page_ai` call in `render`, two `.children(...)` lines in
+    `render_page_view` (chips after the title, the AI row before
+    `backlinks_panel`), the action, its listener and two state fields.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

@@ -2,6 +2,7 @@ mod agenda;
 mod ai;
 mod app;
 mod assets;
+mod autotag;
 mod backup;
 mod code;
 mod commands;

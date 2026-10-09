@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 /// Settings > AI and the Ask my notes panel (decision 42).
 mod ai_ui;
-use ai_ui::{AiSettings, AskState, SemanticState};
+use ai_ui::{AiSettings, AskState, RelatedState, SemanticState, TagSuggestState};
 
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace. Palette
@@ -117,6 +117,7 @@ actions!(
         // AI (decisions 42-46), no default keys.
         AskMyNotes,
         SemanticSearch,
+        SuggestTags,
     ]
 );
 
@@ -670,6 +671,9 @@ pub struct NoteSec {
     ask: AskState,
     /// The Semantic search overlay and the embedding cache (decision 43).
     semantic: SemanticState,
+    /// Tag suggestions and Related pages (decision 44).
+    tag_suggest: TagSuggestState,
+    related: RelatedState,
     /// The pages in the trash, newest first (`Storage::list_trash`). Read
     /// at startup, when the trash tab is focused and after every change.
     trash: Vec<TrashEntry>,
@@ -850,6 +854,8 @@ impl NoteSec {
             shortcuts_open: false,
             ask: AskState::default(),
             semantic: SemanticState::default(),
+            tag_suggest: TagSuggestState::default(),
+            related: RelatedState::default(),
             trash,
             trash_confirm: None,
             trash_error: None,
@@ -6492,6 +6498,7 @@ impl NoteSec {
                     .text_color(theme.text)
                     .child(page.title.clone()),
             )
+            .children(self.render_tag_suggestions(page_ix, focused, cx))
             .children(rows)
             // The drop line for "after the last block".
             .when(block_drop == Some(DropGap::End), |d| {
@@ -6557,6 +6564,7 @@ impl NoteSec {
                     .size_0()
                 })
             })
+            .children(self.render_page_ai(page_ix, focused, cx))
             .child(backlinks_panel)
             // Empty space below the blocks: clicking it leaves edit mode.
             .child(
@@ -7137,6 +7145,7 @@ impl Render for NoteSec {
 
         // --- The focused pane's page (decision 40: the other pane, if any,
         // is drawn further down) ---------------------------------------------
+        self.sync_page_ai(cx);
         let page_view = self.render_page_view(
             self.selected,
             true,
@@ -7809,6 +7818,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_show_shortcuts))
             .on_action(cx.listener(Self::on_ask_my_notes))
             .on_action(cx.listener(Self::on_semantic_search))
+            .on_action(cx.listener(Self::on_suggest_tags))
             .child(sidebar)
             .child(content)
             .children(status_toast)

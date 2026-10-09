@@ -213,6 +213,59 @@ pub fn rank_pages(query: &[f32], items: &[Item], cache: &Cache, limit: usize) ->
         .collect()
 }
 
+/// Each page's vector (by page index): the mean of its blocks' unit
+/// vectors, blocks without a cached vector (or of another length) left
+/// out. Pages with no cached block have none.
+pub fn page_vectors(items: &[Item], cache: &Cache) -> BTreeMap<usize, Vec<f32>> {
+    let mut sums: BTreeMap<usize, (Vec<f32>, usize)> = BTreeMap::new();
+    for item in items {
+        let Some(v) = cache.vectors.get(&item.hash) else {
+            continue;
+        };
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            continue;
+        }
+        let (sum, n) = sums
+            .entry(item.page)
+            .or_insert_with(|| (vec![0.0; v.len()], 0));
+        if sum.len() != v.len() {
+            continue;
+        }
+        for (s, x) in sum.iter_mut().zip(v) {
+            *s += x / norm;
+        }
+        *n += 1;
+    }
+    sums.into_iter()
+        .map(|(page, (sum, n))| (page, sum.into_iter().map(|s| s / n as f32).collect()))
+        .collect()
+}
+
+/// The pages most similar to page `page` (by `page_vectors`), best first,
+/// as `(cosine, page index)`, at most `limit`, only positive scores.
+/// Empty when `page` has no cached block.
+pub fn related_pages(
+    page: usize,
+    items: &[Item],
+    cache: &Cache,
+    limit: usize,
+) -> Vec<(f32, usize)> {
+    let vectors = page_vectors(items, cache);
+    let Some(own) = vectors.get(&page) else {
+        return Vec::new();
+    };
+    let mut scored: Vec<(f32, usize)> = vectors
+        .iter()
+        .filter(|(p, _)| **p != page)
+        .map(|(p, v)| (cosine(own, v), *p))
+        .filter(|(score, _)| *score > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.truncate(limit);
+    scored
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +361,34 @@ mod tests {
             .collect();
         assert_eq!(pages, vec![1, 2], "page A by its best block, once");
         assert_eq!(rank_pages(&query, &items, &cache, 1).len(), 1);
+    }
+
+    #[test]
+    fn related_pages_compare_mean_page_vectors() {
+        let pages = vec![
+            Page::from_markdown("A", false, "- x\n- y\n"),
+            Page::from_markdown("B", false, "- near\n"),
+            Page::from_markdown("C", false, "- far\n"),
+            Page::from_markdown("D", false, "- unindexed\n"),
+        ];
+        let items = items(&pages);
+        let mut cache = Cache::default();
+        let set = |cache: &mut Cache, i: usize, v: Vec<f32>| {
+            cache.vectors.insert(items[i].hash.clone(), v);
+        };
+        // A's blocks average to (1, 1, 0) (each unit vector counts once,
+        // however long it is).
+        set(&mut cache, 0, vec![2.0, 0.0, 0.0]);
+        set(&mut cache, 1, vec![0.0, 1.0, 0.0]);
+        set(&mut cache, 2, vec![1.0, 0.9, 0.0]);
+        set(&mut cache, 3, vec![0.0, 0.0, 1.0]);
+        let means = page_vectors(&items, &cache);
+        assert_eq!(means[&0], vec![0.5, 0.5, 0.0]);
+        assert!(!means.contains_key(&3));
+        // C is orthogonal (score 0): left out. D has no vector.
+        let related = related_pages(0, &items, &cache, 5);
+        assert_eq!(related.iter().map(|r| r.1).collect::<Vec<_>>(), vec![1]);
+        assert!(related[0].0 > 0.99);
+        assert!(related_pages(3, &items, &cache, 5).is_empty());
     }
 }

@@ -19,6 +19,12 @@ mod semantic_ui;
 use semantic_ui::Progress;
 pub(super) use semantic_ui::SemanticState;
 
+/// Tag suggestions and Related pages (decision 44).
+mod related_ui;
+mod tags_ui;
+pub(super) use related_ui::RelatedState;
+pub(super) use tags_ui::TagSuggestState;
+
 /// A text field of Settings > AI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AiField {
@@ -1245,7 +1251,7 @@ mod tests {
         cx.debug_bounds(selector).is_some()
     }
 
-    fn click_on(cx: &mut VisualTestContext, selector: &str) {
+    pub(super) fn click_on(cx: &mut VisualTestContext, selector: &str) {
         let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
         let bounds = cx.debug_bounds(selector).expect(selector);
         cx.simulate_click(bounds.center(), Modifiers::none());

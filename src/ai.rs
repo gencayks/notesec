@@ -587,6 +587,17 @@ pub fn chat_stream(
     })
 }
 
+/// A whole chat answer (tag suggestions, decision 44): `chat_stream`
+/// read to the end.
+pub fn complete(endpoint: &Endpoint, model: &str, messages: Value) -> Result<String, AiError> {
+    let mut stream = chat_stream(endpoint, model, messages)?;
+    let mut answer = String::new();
+    while let Some(piece) = stream.next()? {
+        answer.push_str(&piece);
+    }
+    Ok(answer)
+}
+
 // --- Ask my notes -----------------------------------------------------------------
 
 /// How many blocks an answer gets as context.
@@ -1006,6 +1017,18 @@ mod tests {
         let mut answer = chat_stream(&ep, "m", json!([])).unwrap();
         assert_eq!(answer.next().unwrap().as_deref(), Some("All at once."));
         assert_eq!(answer.next().unwrap(), None);
+    }
+
+    #[test]
+    fn complete_reads_the_whole_answer() {
+        let (ep, requests) = serve(vec![
+            stream(&["[\"a\", ", "\"b\"]"]),
+            json(200, r#"{"choices":[{"message":{"content":"x"}}]}"#),
+        ]);
+        let m = json!([{"role": "user", "content": "hi"}]);
+        assert_eq!(complete(&ep, "m", m.clone()).unwrap(), "[\"a\", \"b\"]");
+        assert_eq!(complete(&ep, "m", m).unwrap(), "x");
+        assert!(requests.lock().unwrap()[0].0.contains("/chat/completions"));
     }
 
     #[test]
