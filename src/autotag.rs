@@ -198,7 +198,7 @@ pub fn tag_markup(name: &str) -> String {
 }
 
 /// `key:: value` with a simple key (letters, digits, `-`, `_`).
-fn is_property_line(line: &str) -> bool {
+pub fn is_property_line(line: &str) -> bool {
     line.trim().split_once("::").is_some_and(|(key, _)| {
         !key.is_empty()
             && key

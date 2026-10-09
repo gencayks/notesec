@@ -45,7 +45,9 @@ use uuid::Uuid;
 
 /// Settings > AI and the Ask my notes panel (decision 42).
 mod ai_ui;
+mod mentions_ui;
 use ai_ui::{AiSettings, AskState, RelatedState, SemanticState, TagSuggestState};
+use mentions_ui::MentionsState;
 
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace. Palette
@@ -674,6 +676,8 @@ pub struct NoteSec {
     /// Tag suggestions and Related pages (decision 44).
     tag_suggest: TagSuggestState,
     related: RelatedState,
+    /// "Mentioned in" (decision 45).
+    mentions: MentionsState,
     /// The pages in the trash, newest first (`Storage::list_trash`). Read
     /// at startup, when the trash tab is focused and after every change.
     trash: Vec<TrashEntry>,
@@ -856,6 +860,7 @@ impl NoteSec {
             semantic: SemanticState::default(),
             tag_suggest: TagSuggestState::default(),
             related: RelatedState::default(),
+            mentions: MentionsState::default(),
             trash,
             trash_confirm: None,
             trash_error: None,
@@ -6566,6 +6571,7 @@ impl NoteSec {
             })
             .children(self.render_page_ai(page_ix, focused, cx))
             .child(backlinks_panel)
+            .children(self.render_mentions(page_ix, focused, cx))
             // Empty space below the blocks: clicking it leaves edit mode.
             .child(
                 div()
@@ -7146,6 +7152,7 @@ impl Render for NoteSec {
         // --- The focused pane's page (decision 40: the other pane, if any,
         // is drawn further down) ---------------------------------------------
         self.sync_page_ai(cx);
+        self.sync_mentions(cx);
         let page_view = self.render_page_view(
             self.selected,
             true,

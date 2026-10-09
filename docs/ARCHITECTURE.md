@@ -1555,6 +1555,58 @@ that mutate, and data races are essentially impossible.
     `sync_page_ai` call in `render`, two `.children(...)` lines in
     `render_page_view` (chips after the title, the AI row before
     `backlinks_panel`), the action, its listener and two state fields.
+45. **Unlinked mentions: "Mentioned in" below "Linked from", plain text
+    matching, one-click links.** Every page has a "Mentioned in" section
+    just below "Linked from" (`src/app/mentions_ui.rs`; focused pane
+    only, like Related). It lists blocks on other pages whose text names
+    the page without linking it, grouped by page, each with a snippet
+    (around 150 characters, on one line) with the mention highlighted and
+    a "Link" button; a page with more than one mention also gets "Link
+    all". The section starts folded and shows "n pages, m mentions";
+    clicking the header unfolds it for the session. It is plain text
+    matching with no AI or network, so it works in every mode, Off
+    included. *Names*: the title and the aliases that resolve to the
+    page (`model::resolve_page`), the same names "Linked from" counts,
+    tried longest first so "Rust lang" beats "Rust" where they overlap.
+    *Matching* (`src/mentions.rs`, pure) ignores case char by char
+    (Unicode `to_lowercase`) and needs word boundaries: when a name
+    starts or ends with a word character (`char::is_alphanumeric` or
+    `_`), the character before or after must not be one. So "Rust" isn't
+    found in "Rusty", "Größe" isn't found in "Größeres", and names like
+    "C++" or the dates that journals use as titles work. These don't
+    count as mentions (`mentions::masked`):
+    - `[[links]]`, which covers the link inside Coder 2's `![[embeds]]`
+    - `#tags` / `#[[tags]]`
+    - `((block refs))`
+    - any `{{macro}}`, such as `{{embed ...}}` and `{{query ...}}`
+    - inline code and fenced code
+    - URLs (`http(s)://`, `file://`, `mailto:`, `www.`) and markdown link
+      targets `](...)`
+    - `key:: value` property lines such as `alias::` and `tags::`
+      (`autotag::is_property_line`)
+    The page itself, and a page with the same title, aren't listed.
+    Neither is a block that already links the page, because "Linked
+    from" shows it and the two lists shouldn't overlap.
+    *Linking* writes `[[matched text]]` when a link to that text
+    resolves to this page, which it does for a title in any case and for
+    an alias that resolves; otherwise it writes `[[Title]]`. notesec has
+    no `[[Title|label]]` form, so the user's wording is kept only where
+    it resolves (`mentions::link_for`). The click is checked against the
+    block as it is now: the mention starting at that offset must still
+    be found, otherwise nothing changes, a status says the mention
+    changed, and the list is redone. It is one undo step (`record_state`
+    with the state from before) and is saved with `Storage::save`. The
+    save bumps the change counter, so "Mentioned in" recomputes, and
+    "Linked from" (computed every frame) shows the block at once.
+    *Cost*: computed off the UI thread from a copy of the pages, once
+    per (page title, `Storage::changes`), so only after a save and
+    never per keystroke. Each block is first checked with a lowercase
+    `contains` for any name, and only blocks that pass are scanned
+    character by character. *Hooks in `app.rs`*: `mod mentions_ui;`, the
+    `mentions` field and its init, `self.sync_mentions(cx)` next to
+    `sync_page_ai` in `render`, and
+    `.children(self.render_mentions(..))` right after
+    `.child(backlinks_panel)`.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
