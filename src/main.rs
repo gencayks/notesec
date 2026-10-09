@@ -13,6 +13,7 @@ mod graph;
 mod graph_view;
 mod hotkeys;
 mod model;
+mod publish;
 mod search;
 mod state;
 mod storage;

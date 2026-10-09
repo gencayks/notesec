@@ -23,6 +23,10 @@
 //! bordered box headed by the source page's title, with the same guards as
 //! the app (`embed::Resolver`): a circular, too deep or missing embed is a
 //! note instead of content.
+//!
+//! [`document`] is the general form, which `publish` (decision 49) also uses:
+//! a stylesheet file instead of the inline one, images as files, and links
+//! to the other published pages as real `<a href>`s.
 
 use uuid::Uuid;
 
@@ -33,10 +37,11 @@ use crate::embed::Resolved;
 use crate::model::{BlockKind, Page, TaskState};
 use crate::table::{parse_table, Align, Table};
 
-/// The stylesheet, inlined into every export. Light by default, dark when
+/// The stylesheet, inlined into every export (a published bundle has it as
+/// `style.css`). Light by default, dark when
 /// the system prefers it; printing (the browser's Print to PDF) drops the
 /// background colours.
-const CSS: &str = r#"
+pub const CSS: &str = r#"
 :root { --bg: #ffffff; --text: #1f2328; --muted: #6e7781; --accent: #0969da;
   --border: #d0d7de; --code-bg: #f6f8fa; --tag-bg: #ddf4ff; --danger: #cf222e; }
 @media (prefers-color-scheme: dark) {
@@ -63,6 +68,8 @@ li { margin: 2px 0; }
 .done > .text { color: var(--muted); text-decoration: line-through; }
 .task + .text, .task + .planning { display: inline; }
 .link { color: var(--accent); }
+a.link, a.tag { text-decoration: none; }
+a.link:hover, a.tag:hover { text-decoration: underline; }
 .tag { color: var(--accent); background: var(--tag-bg); border-radius: 4px; padding: 0 3px; }
 .ref { background: var(--tag-bg); border-bottom: 1px dashed var(--muted); }
 .planning { color: var(--muted); font-size: 0.9em; }
@@ -74,6 +81,7 @@ code { font: 0.9em/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospac
 table { border-collapse: collapse; margin: 4px 0; }
 th, td { border: 1px solid var(--border); padding: 4px 8px; }
 th { background: var(--code-bg); }
+.left { text-align: left; } .center { text-align: center; } .right { text-align: right; }
 img { max-width: 100%; max-height: 480px; display: block; margin: 4px 0; border-radius: 4px; }
 .image-missing { display: inline-block; color: var(--muted); border: 1px dashed var(--border);
   border-radius: 4px; padding: 2px 8px; font-size: 0.9em; }
@@ -90,6 +98,35 @@ pub type ResolveRef<'a> = &'a dyn Fn(Uuid) -> Option<String>;
 
 /// The bytes of the image an `![alt](target)` points at (`None`: missing).
 pub type LoadImage<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
+
+/// Where an image's bytes are, as [`Options::image`] answers it.
+pub enum ImageSrc {
+    /// Embedded as a `data:` URI.
+    Bytes(Vec<u8>),
+    /// A URL relative to the document (`assets/x.png`).
+    Url(String),
+    /// Not found: a note instead.
+    Missing,
+    /// There, but not to be shown (publish: outside the graph, or not
+    /// an image the app can clean): a note instead.
+    Withheld,
+}
+
+/// How [`document`] renders: where references, images and links go.
+pub struct Options<'a> {
+    pub resolve_ref: ResolveRef<'a>,
+    /// The image an `![alt](target)` shows (web images and non-images are
+    /// a note before this is asked).
+    pub image: &'a dyn Fn(&str) -> ImageSrc,
+    /// The `href` for a link or tag to the page named so (`None`: a styled
+    /// span, as in an export).
+    pub href: &'a dyn Fn(&str) -> Option<String>,
+    /// A stylesheet file to link instead of the inline `<style>`.
+    pub stylesheet: Option<&'a str>,
+    /// Notes about missing images show the target as written (else only
+    /// its file name, so no local path is published).
+    pub show_paths: bool,
+}
 
 /// The embeds in one of the exported page's blocks, resolved (see
 /// `embed::Resolver::resolve`; nested embeds come resolved inside).
@@ -110,29 +147,14 @@ pub fn page_html_with_embeds(
     resolve_embeds: ResolveEmbeds,
     load_image: LoadImage,
 ) -> String {
-    let ctx = Ctx {
+    let image = |target: &str| load_image(target).map_or(ImageSrc::Missing, ImageSrc::Bytes);
+    let options = Options {
         resolve_ref,
-        load_image,
+        image: &image,
+        href: &|_| None,
+        stylesheet: None,
+        show_paths: true,
     };
-    let title = escape(&page.title);
-    let mut out = String::new();
-    out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
-    out.push_str(
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
-         img-src data:; style-src 'unsafe-inline'\">\n\
-         <meta name=\"generator\" content=\"notesec\">\n",
-    );
-    out.push_str(&format!("<title>{title}</title>\n<style>{CSS}</style>\n"));
-    out.push_str("</head>\n<body>\n");
-    let class = if page.is_journal {
-        "page journal"
-    } else {
-        "page"
-    };
-    out.push_str(&format!(
-        "<main class=\"{class}\">\n<h1 class=\"page-title\">{title}</h1>\n"
-    ));
     let rows = page
         .blocks
         .iter()
@@ -145,15 +167,51 @@ pub fn page_html_with_embeds(
             )
         })
         .collect();
-    outline_html(&mut out, "<ul class=\"outline\">", rows, &ctx);
+    document(&page.title, page.is_journal, rows, &options)
+}
+
+/// The whole HTML document for a page titled `title` whose blocks are
+/// `rows` (depth, content, resolved embeds), rendered as `options` say.
+pub fn document(
+    title: &str,
+    is_journal: bool,
+    rows: Vec<(usize, &str, Vec<Resolved>)>,
+    options: &Options,
+) -> String {
+    let ctx = options;
+    let title = escape(title);
+    let mut out = String::new();
+    out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    // No scripts, nothing from elsewhere: only the stylesheet and images
+    // the document itself carries (inline) or sits next to (`'self'`).
+    let csp = if ctx.stylesheet.is_some() {
+        "default-src 'none'; img-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'"
+    } else {
+        "default-src 'none'; img-src data:; style-src 'unsafe-inline'"
+    };
+    out.push_str(&format!(
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\n\
+         <meta name=\"generator\" content=\"notesec\">\n"
+    ));
+    match ctx.stylesheet {
+        Some(href) => out.push_str(&format!(
+            "<title>{title}</title>\n<link rel=\"stylesheet\" href=\"{}\">\n",
+            escape(href)
+        )),
+        None => out.push_str(&format!("<title>{title}</title>\n<style>{CSS}</style>\n")),
+    }
+    out.push_str("</head>\n<body>\n");
+    let class = if is_journal { "page journal" } else { "page" };
+    out.push_str(&format!(
+        "<main class=\"{class}\">\n<h1 class=\"page-title\">{title}</h1>\n"
+    ));
+    outline_html(&mut out, "<ul class=\"outline\">", rows, ctx);
     out.push_str("</main>\n</body>\n</html>\n");
     out
 }
 
-struct Ctx<'a> {
-    resolve_ref: ResolveRef<'a>,
-    load_image: LoadImage<'a>,
-}
+type Ctx<'a> = Options<'a>;
 
 /// Blocks (depth, content, resolved embeds) as nested `<ul>`s, one `<li>`
 /// per block, children in a `<ul>` inside their parent's `<li>`. `open` is
@@ -371,11 +429,23 @@ fn inline_html(out: &mut String, text: &str, block: bool, ctx: &Ctx) {
                 .find(|l| l.range.start <= range.start && range.end <= l.range.end)
                 .map_or(String::new(), |l| l.target.clone());
             let class = if format.tag { "tag" } else { "link" };
-            out.push_str(&format!(
-                "<span class=\"{class}\" data-page=\"{}\">",
-                escape(&target)
-            ));
-            close.push("</span>");
+            match (ctx.href)(&target) {
+                Some(href) => {
+                    out.push_str(&format!(
+                        "<a class=\"{class}\" href=\"{}\" data-page=\"{}\">",
+                        escape(&href),
+                        escape(&target)
+                    ));
+                    close.push("</a>");
+                }
+                None => {
+                    out.push_str(&format!(
+                        "<span class=\"{class}\" data-page=\"{}\">",
+                        escape(&target)
+                    ));
+                    close.push("</span>");
+                }
+            }
         }
         if format.block_ref {
             out.push_str("<span class=\"ref\">");
@@ -419,7 +489,7 @@ fn table_html(out: &mut String, table: &Table, ctx: &Ctx) {
                 Align::Center => "center",
                 Align::Right => "right",
             };
-            out.push_str(&format!("<{cell} style=\"text-align: {align}\">"));
+            out.push_str(&format!("<{cell} class=\"{align}\">"));
             inline_html(out, text, false, ctx);
             out.push_str(&format!("</{cell}>"));
         }
@@ -434,12 +504,18 @@ fn table_html(out: &mut String, table: &Table, ctx: &Ctx) {
     out.push_str("</table>");
 }
 
-/// An image as a `data:` URI, or a note saying why it isn't embedded.
+/// An image as a `data:` URI or a file next to the document, or a note
+/// saying why it isn't shown.
 fn image_html(out: &mut String, alt: &str, target: &str, ctx: &Ctx) {
     let missing = |out: &mut String, why: &str| {
+        let shown = if ctx.show_paths || target.contains("://") {
+            target
+        } else {
+            target.rsplit(['/', '\\']).next().unwrap_or(target)
+        };
         out.push_str(&format!(
             "<span class=\"image-missing\">{why}: {}</span>",
-            escape(target)
+            escape(shown)
         ));
     };
     if target.contains("://") {
@@ -449,13 +525,19 @@ fn image_html(out: &mut String, alt: &str, target: &str, ctx: &Ctx) {
     let Some(mime) = image_mime(target) else {
         return missing(out, "Not an image");
     };
-    match (ctx.load_image)(target) {
-        Some(bytes) => out.push_str(&format!(
+    match (ctx.image)(target) {
+        ImageSrc::Bytes(bytes) => out.push_str(&format!(
             "<img src=\"data:{mime};base64,{}\" alt=\"{}\">",
             base64(&bytes),
             escape(alt)
         )),
-        None => missing(out, "Image not found"),
+        ImageSrc::Url(url) => out.push_str(&format!(
+            "<img src=\"{}\" alt=\"{}\">",
+            escape(&url),
+            escape(alt)
+        )),
+        ImageSrc::Missing => missing(out, "Image not found"),
+        ImageSrc::Withheld => missing(out, "Image not published"),
     }
 }
 
@@ -714,10 +796,10 @@ mod tests {
              <code>fn main() { a &amp;&amp; b }</code></pre><div class=\"text\">after</div>"
         ));
         assert!(html.contains(
-            "<table><thead><tr><th style=\"text-align: left\">Name</th>\
-             <th style=\"text-align: right\">Qty</th></tr></thead><tbody><tr>\
-             <td style=\"text-align: left\"><strong>tea</strong></td>\
-             <td style=\"text-align: right\">2</td></tr></tbody></table>"
+            "<table><thead><tr><th class=\"left\">Name</th>\
+             <th class=\"right\">Qty</th></tr></thead><tbody><tr>\
+             <td class=\"left\"><strong>tea</strong></td>\
+             <td class=\"right\">2</td></tr></tbody></table>"
         ));
         // Links inside code are code.
         assert!(!self::html("- ```\n  [[x]] #y\n  ```\n").contains("data-page"));

@@ -32,9 +32,9 @@ pub const BACKUP_AFTER: Duration = Duration::from_secs(5);
 pub const MESSAGE: &str = "notesec autosave";
 
 /// Lines `prepare` makes sure the graph's `.gitignore` has: the trash
-/// (deleted pages), exports (re-creatable HTML) and the temp files of
-/// atomic saves.
-pub const IGNORED: [&str; 3] = [".trash/", "exports/", ".*.tmp"];
+/// (deleted pages), exports and published bundles (re-creatable HTML,
+/// decision 49) and the temp files of atomic saves.
+pub const IGNORED: [&str; 4] = [".trash/", "exports/", "published/", ".*.tmp"];
 
 /// The identity used when git has none configured, so a commit never fails
 /// for lack of `user.name` / `user.email`.
@@ -370,7 +370,7 @@ mod tests {
         assert!(dir.join(".git").is_dir());
         assert_eq!(
             fs::read_to_string(dir.join(".gitignore")).unwrap(),
-            "# notesec: not backed up\n.trash/\nexports/\n.*.tmp\n"
+            "# notesec: not backed up\n.trash/\nexports/\npublished/\n.*.tmp\n"
         );
         // Again: the same repository, nothing added twice.
         let again = prepare(&isolated_git(), &dir).unwrap();
@@ -393,7 +393,7 @@ mod tests {
         assert!(merge_gitignore(&dir).unwrap());
         assert_eq!(
             fs::read_to_string(dir.join(".gitignore")).unwrap(),
-            "*.bak\n/.trash\n# mine\n# notesec: not backed up\nexports/\n.*.tmp\n"
+            "*.bak\n/.trash\n# mine\n# notesec: not backed up\nexports/\npublished/\n.*.tmp\n"
         );
         assert!(!merge_gitignore(&dir).unwrap(), "complete: left alone");
         let _ = fs::remove_dir_all(dir);
@@ -465,6 +465,9 @@ mod tests {
         fs::write(dir.join(".trash/123/pages/Old.md"), "- old\n").unwrap();
         fs::create_dir_all(dir.join("exports")).unwrap();
         fs::write(dir.join("exports/A.html"), "<p>").unwrap();
+        fs::create_dir_all(dir.join("published/a/assets")).unwrap();
+        fs::write(dir.join("published/a/index.html"), "<p>").unwrap();
+        fs::write(dir.join("published/a/assets/x.png"), "png").unwrap();
         fs::write(dir.join("pages/.A.md.tmp"), "- half").unwrap();
         assert_eq!(commit(&git, &dir).unwrap(), None);
         fs::write(dir.join("pages/A.md"), "- a\n").unwrap();

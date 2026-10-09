@@ -9,6 +9,7 @@
 //! <graph>/.trash/<millis>/pages/<title>.md        (deleted pages, see below)
 //! <graph>/.trash/<millis>/journals/YYYY_MM_DD.md
 //! <graph>/exports/<page file name>.html          (Export page to HTML)
+//! <graph>/published/<slug>/index.html, ...      (Publish page, see publish.rs)
 //! ```
 //!
 //! The markdown files are the source of truth; nothing is cached elsewhere.

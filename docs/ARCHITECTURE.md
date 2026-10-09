@@ -23,6 +23,8 @@ embed.rs       — live embeds: parse ![[page]] / block embeds, resolve (NO ui c
 app/embed_ui.rs — the reading view's embed boxes (a submodule of app.rs)
 vim.rs         — vim mode's pure state machine: modes, motions, operators, counts, register, `:` line (NO ui code)
 app/vim_ui.rs  — vim keys into the editor, block-level effects, mode pill, Settings row (a submodule of app.rs)
+publish.rs     — publish a page as a static site folder: render, privacy, slugs, bundle files (no GPUI)
+app/publish_ui.rs — the Publish commands and the status buttons (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1116,7 +1118,8 @@ that mutate, and data races are essentially impossible.
     picks up edits made while the app was closed): `backup::prepare`
     finds the repository (`rev-parse --show-toplevel`) or runs `git init`
     in the graph folder, then appends to the graph's `.gitignore` the
-    lines it lacks among `.trash/`, `exports/` and `.*.tmp` (the temp
+    lines it lacks among `.trash/`, `exports/`, `published/` (decision
+    49) and `.*.tmp` (the temp
     files of atomic saves) under a `# notesec: not backed up` comment.
     The user's own lines are never changed or reordered, and `/.trash`
     or `.trash` counts as present. Then everything is committed at once.
@@ -1432,6 +1435,88 @@ that mutate, and data races are essentially impossible.
     "Not an editor command: …" as an error status. *Indicator:* a pill at
     the bottom left shows the mode and pending keys (`NORMAL  2d`) or the
     `:` line being typed. Split panes share the one editor, so one vim.
+
+49. **Publish: a page as a self-contained static site in `published/`.**
+    The app doesn't host anything: "Publish page" (`PublishPage`) writes
+    a folder the user puts on any static host (GitHub Pages, Netlify
+    Drop, `python3 -m http.server`), and that folder is the "link". Like
+    Export, both commands need a page on screen (hidden on the graph,
+    trash and agenda tabs) and have no default key. *Layout*
+    (`publish.rs`): `<graph>/published/<slug>/` holds `index.html` (the
+    page), `<slug>.html` per linked page, `style.css` (the export's
+    stylesheet), `assets/<name>` (each image the pages show, once, cleaned
+    of metadata; real files rather than the export's base64: lighter and
+    cacheable on a host), `README.txt` (how to host it) and `.notesec-bundle` (the
+    manifest: the page's title and the files the app wrote). *Rendering*
+    is the HTML exporter (`export::document`, which `page_html_with_embeds`
+    now calls too): the same outline, embeds inline (decision 47), block
+    references resolved, no scripts, nothing from elsewhere. The CSP is
+    `default-src 'none'; img-src 'self'; style-src 'self'` (checked in
+    Chrome: the stylesheet and images load from disk and over http), so
+    table alignment became classes instead of inline `style=` (in exports
+    too). *Linked pages:* "Publish page with linked pages"
+    (`PublishPageWithLinks`) adds the pages the page links to one hop away
+    (`[[links]]` and `#tags` in its own blocks): existing, not journals
+    (a diary is published only on purpose, as the page itself), not
+    private. Links between published pages become relative
+    `<a href="beta.html">` (and back to `index.html`); links to anything
+    else stay styled text, as in an export. A linked page named "Index"
+    gets `index-2.html`. *Private pages:* `public:: false` or
+    `private:: true` among a page's properties (its first block, keys and
+    values in any case) means never published: publishing it is refused
+    with an error status (nothing written); it is left out as a linked
+    page; an embed of it (or of a block on it) shows "Private page, not
+    published"; a block reference to one of its blocks stays `((uuid))`.
+    *Properties:* every `key:: value` line (outside code) is left out of
+    the published pages: `alias::`, `tags::`, `public::` are metadata,
+    and a block holding only properties (the page properties) disappears
+    unless it has children. `id::` lines never reach a block's content.
+    *Privacy:* the bundle contains only the files above. `state.toml`
+    (with the AI key), `config.toml`, `.trash` and the pages' markdown
+    are never read for it; images are copied only from inside the graph,
+    not from hidden folders (`.trash`), `exports/` or `published/` (else
+    "Image not published"), and an image's note shows only its file name,
+    never a local path. *Image metadata* (`publish::clean_image`): every
+    image is decoded and re-encoded from its pixels, so no EXIF (camera,
+    time, GPS position), XMP, IPTC, ICC profile or text chunk survives;
+    the `image` crate's encoders write metadata only when given it
+    (`set_exif_metadata` / `set_icc_profile`, never called), checked in
+    its 0.25 source. The format is read from the bytes. An EXIF
+    orientation (`ImageDecoder::orientation`) is applied to the pixels
+    first (`DynamicImage::apply_orientation`), so photos stand the right
+    way up without the tag. Per format: JPEG stays JPEG at quality 90;
+    PNG stays PNG, lossless; WebP stays WebP, re-encoded lossless (the
+    crate has no lossy WebP encoder, so files can grow; an animated WebP
+    keeps its first frame); an animated GIF stays a GIF (frames and
+    delays kept, looping forever), a one-frame GIF becomes PNG; BMP and
+    TIFF become PNG (TIFF tags carry EXIF and browsers mostly can't show
+    TIFF). A renamed file (`scan.bmp` → `assets/scan.png`) is referenced
+    by its new name. A file that doesn't decode is not published (note
+    "Image not published"): copying it could carry the very metadata
+    this removes. SVG never gets here (the exporter shows it as "Not an
+    image": it could carry scripts). *Off the UI thread:* publishing
+    (rendering, re-encoding photos, writing) runs on a background thread
+    over a copy of the pages, with "Publishing “Page”…" meanwhile; a
+    second publish while one runs is refused with a status. *Slug:*
+    lowercase ASCII from the title (accents folded, `ß` → `ss`, other
+    runs → one hyphen, at most 60 bytes; "page" when nothing is left,
+    e.g. a title in another script), made unique among the published
+    folders with `-2`, `-3`. A page finds its own folder again through
+    the manifest's title, so republishing reuses it; a folder without our
+    manifest (or another page's) is never written into. Renaming a page
+    publishes to a new folder; the old one stays until deleted.
+    *Republishing* rewrites the bundle's files and deletes those the
+    previous manifest listed that aren't needed any more (a removed
+    image, a page no longer linked), and an emptied `assets/`. Files the
+    user added (a `CNAME`) stay. Paths are checked: a manifest entry with
+    `..` or an absolute path is ignored, a folder inside the bundle that
+    is a symbolic link is never written through or deleted from, and a
+    file that is a link is replaced, not written through. *Afterwards*
+    the status says "Published “Page” (and N linked pages) to <folder>"
+    with "Open folder" (`App::open_with_system`) and "Copy path" buttons,
+    shown while that status is. `published/` is not backed up (decision
+    39's `IGNORED`) and never loaded as pages (only `pages/` and
+    `journals/` are).
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

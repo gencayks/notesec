@@ -44,6 +44,7 @@ use std::rc::Rc;
 use uuid::Uuid;
 
 mod embed_ui;
+mod publish_ui;
 mod vim_ui;
 
 // Actions are named, typed commands that key bindings map onto. The macro
@@ -96,6 +97,8 @@ actions!(
         OpenAgenda,
         OpenTrash,
         ExportHtml,
+        PublishPage,
+        PublishPageWithLinks,
         ToggleGitBackup,
         SplitRight,
         ClosePane,
@@ -751,6 +754,8 @@ pub struct NoteSec {
     /// Vim mode's state (decision 48, `vim.rs`): used while
     /// `config.vim_mode` is on and a block is being edited.
     vim: crate::vim::Vim,
+    /// The last publish (decision 49, `publish_ui`).
+    publish: publish_ui::PublishState,
 }
 
 impl NoteSec {
@@ -896,6 +901,7 @@ impl NoteSec {
             _backup_subscriptions: backup_subscriptions,
             _key_capture: key_capture,
             vim: Default::default(),
+            publish: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -7699,6 +7705,7 @@ impl Render for NoteSec {
 
         // The status message: a small box at the bottom right, over the
         // page but under any dialog.
+        let publish_actions = self.render_publish_actions(cx);
         let status_toast = self.status.as_ref().map(|status| {
             div()
                 .debug_selector(|| "status-toast".to_string())
@@ -7723,6 +7730,7 @@ impl Render for NoteSec {
                 })
                 .shadow_md()
                 .child(status.text.clone())
+                .children(publish_actions)
         });
 
         let is_editing = self.editing.is_some() || self.text_input_open();
@@ -7820,6 +7828,8 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_toggle_graph_journals))
             .on_action(cx.listener(Self::on_show_shortcuts))
             .on_action(cx.listener(Self::on_toggle_vim_mode))
+            .on_action(cx.listener(Self::on_publish_page))
+            .on_action(cx.listener(Self::on_publish_page_with_links))
             .child(sidebar)
             .child(content)
             .children(status_toast)
@@ -15071,6 +15081,167 @@ mod tests {
         click_block(cx, 0);
         cx.simulate_keystrokes("ctrl-g");
         view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- publish (decision 49) -------------------------------------------------
+
+    /// Every file under `dir`, relative, sorted.
+    fn files_under(dir: &std::path::Path) -> Vec<String> {
+        fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else {
+                    out.push(p.strip_prefix(base).unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    const PUBLISH_SECRET: &str = "sk-test-NOTESEC-PUBLISH-0123456789";
+
+    #[gpui::test]
+    fn publish_writes_a_self_contained_bundle_without_secrets(cx: &mut TestAppContext) {
+        let pages = [
+            (
+                "Test",
+                "- see [[Alpha]] and [[Private]]\n- ![pic](../assets/p.png)\n- ![[Alpha]]\n",
+            ),
+            ("Alpha", "- quoted text\n"),
+            ("Private", "public:: false\n\n- dear diary\n"),
+        ];
+        let (view, cx, dir) = setup_pages(cx, "publish", &pages, "Test");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(dir.join("assets/p.png"), png.into_inner()).unwrap();
+        // Secrets the graph folder holds: never published.
+        let key_line = format!("ai_api_key = \"{PUBLISH_SECRET}\"\n");
+        std::fs::write(dir.join("state.toml"), &key_line).unwrap();
+        std::fs::write(dir.join("config.toml"), format!("# {PUBLISH_SECRET}\n")).unwrap();
+        std::fs::create_dir_all(dir.join(".trash/1/pages")).unwrap();
+        std::fs::write(
+            dir.join(".trash/1/pages/Gone.md"),
+            format!("- {PUBLISH_SECRET}\n"),
+        )
+        .unwrap();
+
+        let loaded = view.update(cx, |app, _| app.pages.len());
+        // The block being edited is saved first.
+        click_block(cx, 0);
+        run_in_palette(cx, "publish page with linked pages");
+        view.update(cx, |app, _| assert!(app.editing.is_none()));
+        cx.run_until_parked();
+        let bundle = dir.join("published/test");
+        assert_eq!(
+            files_under(&bundle),
+            [
+                ".notesec-bundle",
+                "README.txt",
+                "alpha.html",
+                "assets/p.png",
+                "index.html",
+                "style.css"
+            ]
+        );
+        for file in files_under(&bundle) {
+            let bytes = std::fs::read(bundle.join(&file)).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(PUBLISH_SECRET), "{file}");
+            assert!(!text.contains("dear diary"), "{file}");
+        }
+        // The test is only meaningful if the key was there all along.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state.toml")).unwrap(),
+            key_line
+        );
+        let index = std::fs::read_to_string(bundle.join("index.html")).unwrap();
+        assert!(index.contains("<a class=\"link\" href=\"alpha.html\" data-page=\"Alpha\">"));
+        assert!(index.contains("<span class=\"link\" data-page=\"Private\">"));
+        assert!(index.contains("<img src=\"assets/p.png\" alt=\"pic\">"));
+        assert!(index.contains("data-page=\"Alpha\">Alpha</div><ul class=\"embed-outline\">"));
+
+        // The status says where, with the folder's buttons.
+        assert_eq!(
+            status_text(&view, cx),
+            Some(format!(
+                "Published \u{201c}Test\u{201d} and 1 linked page to {}",
+                bundle.display()
+            ))
+        );
+        click_on(cx, "publish-open-folder");
+        view.update(cx, |app, _| {
+            assert_eq!(app.publish.opened, [bundle.clone()])
+        });
+        click_on(cx, "publish-copy-path");
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied, Some(bundle.display().to_string()));
+
+        // Published files are never read as pages, now or on the next start.
+        view.update(cx, |app, _| assert_eq!(app.pages.len(), loaded));
+        assert_eq!(Storage::open(dir.clone()).unwrap().load_all().len(), loaded);
+        // Another status message: the buttons go with the publish status.
+        view.update(cx, |app, cx| {
+            app.show_status(
+                Status {
+                    text: "something else".into(),
+                    error: false,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(has(cx, "status-toast") && !has(cx, "publish-open-folder"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn publish_refuses_private_pages_and_needs_a_page(cx: &mut TestAppContext) {
+        let pages = [
+            ("Secret", "private:: true\n\n- plans\n"),
+            ("Open", "- hi\n"),
+        ];
+        let (view, cx, dir) = setup_pages(cx, "publish-private", &pages, "Secret");
+        let offered = view.update(cx, |app, _| app.available_commands());
+        assert!(offered.contains(&Command::PublishPage));
+        assert!(offered.contains(&Command::PublishPageWithLinks));
+        cx.dispatch_action(PublishPage);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.error);
+        assert!(
+            status.text.contains("\u{201c}Secret\u{201d} is private"),
+            "{}",
+            status.text
+        );
+        assert!(!dir.join("published").exists());
+        assert!(!has(cx, "publish-open-folder"));
+
+        // On the graph or trash tab there is no page: no command, and the
+        // actions do nothing.
+        for tab in ["graph", "trash"] {
+            match tab {
+                "graph" => cx.simulate_keystrokes("ctrl-g"),
+                _ => click_on(cx, "sidebar-trash"),
+            }
+            let offered = view.update(cx, |app, _| app.available_commands());
+            assert!(!offered.contains(&Command::PublishPage), "{tab}");
+            assert!(!offered.contains(&Command::PublishPageWithLinks), "{tab}");
+            cx.simulate_keystrokes("ctrl-k");
+            cx.simulate_input("publish page");
+            assert!(!has(cx, "command-PublishPage"));
+            cx.simulate_keystrokes("escape");
+            cx.dispatch_action(PublishPage);
+            cx.dispatch_action(PublishPageWithLinks);
+            assert!(!dir.join("published").exists());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }
