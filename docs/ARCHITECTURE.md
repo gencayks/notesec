@@ -27,6 +27,8 @@ publish.rs     — publish a page as a static site folder: render, privacy, slug
 app/publish_ui.rs — the Publish commands and the status buttons (a submodule of app.rs)
 import/        — import Obsidian, Logseq and Notion exports: walk, convert, plan, apply; CSV reader (no GPUI)
 app/import_ui.rs — the Import commands, folder picker, name-clash dialog (a submodule of app.rs)
+clipper/       — web clipper: localhost HTTP listener, request checks, HTML → outline, token (no GPUI)
+app/clipper_ui.rs — the clipper's Settings section, saving clips, the Clipped status (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1540,7 +1542,11 @@ that mutate, and data races are essentially impossible.
     name; a taken journal day comes in as the page "2026-10-09
     (imported)"), **Skip them** (links to them then reach the existing
     page), or **Cancel** (nothing written). No dialog when nothing
-    clashes. A file that exists on disk anyway is skipped, never
+    clashes. The dialog is modal like the others: vim keys, typing and
+    the tab keys don't reach the page behind it (`vim_applies`,
+    `overlay_open`, the text input handler), Escape cancels, and a block
+    opened while the export was being read is closed (saved) when it
+    appears. A file that exists on disk anyway is skipped, never
     replaced; pages are written atomically (`write_atomic`). *Titles:*
     a note's file name, flat; a folder only shows when two notes share
     a name ("Work/Plan" next to "Plan"; the nearest the root keeps the
@@ -1631,6 +1637,84 @@ that mutate, and data races are essentially impossible.
     title format isn't in `config.edn` or the common ones are linked as
     plain pages; a code line starting with `- ` inside a block can read
     back as a bullet (the outline format's known limit).
+
+51. **Web clipper: a localhost endpoint that saves pages from the browser.**
+    Off by default (`web_clipper` in `config.toml`); Settings > Web
+    clipper turns it on and off (the listener starts and stops at once),
+    shows the port (`clipper_port`, default 27183; −, +, Default, or any
+    1024-65535 in the file), the token masked with Copy and Regenerate,
+    the state ("Listening on 127.0.0.1:27183", or why not) and "Copy
+    bookmarklet". The request format, the bookmarklet's source, an
+    extension and the threat model are in `docs/WEB_CLIPPER.md`. *Split:*
+    `clipper/` has no GPUI: `http.rs` (an HTTP/1.1 reader with limits,
+    form and JSON bodies, responses), `server.rs` (listener and checks),
+    `html.rs` (HTML → outline rows) and `mod.rs` (token, titles, the
+    page, the bookmarklet); `app/clipper_ui.rs` is the app side. No new
+    crate: `std::net`, a hand-written HTTP parser and JSON reader, and the
+    `uuid` crate's v4 ids (the OS random source) for the token.
+    *Listener:* `TcpListener` on `127.0.0.1:<port>` only, non-blocking,
+    polled every 50 ms so `stop` (also on drop) closes the port promptly
+    and cleanly; each connection gets its own thread (at most 4 at once,
+    more get 503), one request, then `Connection: close`. A port in use
+    is an error status and a red line in Settings, never a panic.
+    *Checks, in order:* head at most 16 KB / 64 headers (431), HTTP/1.0
+    or 1.1 (505); `Host` exactly `127.0.0.1:<port>` or `localhost:<port>`
+    (403: DNS rebinding); path `/clip` (404); POST or OPTIONS (405);
+    `Content-Type` form or JSON (415); a token header, if sent, must
+    match before the body is read (403); no `Transfer-Encoding` (501:
+    clients send `Content-Length`; chunked parsing is surface we don't
+    need), `Content-Length` required (411) and at most 5 MB (413); the
+    whole request within 15 s (408); the token (header or `token` field)
+    compared in constant time (403); 30 clips a minute (429). Only then
+    is the HTML converted (on the connection's thread). *Hand-off:* the
+    clip goes to the app through a `std::sync::mpsc` channel with a reply
+    channel; GPUI has no channel a foreground task can await (its
+    `PriorityQueueReceiver` blocks), so while the clipper is on the UI
+    thread drains it every 200 ms (`background_executor().timer`). The
+    page is written there with `Storage::save` like any new page, so git
+    backup and the indexes see it; the connection waits up to 10 s for
+    the answer. *Page:* the request's title cleaned (`clipper::clip_title`:
+    one line, `[]` → `()`, `/` → `-`, no leading dot, then the import's
+    `clean_title`) and made unique with " (2)"; first block
+    `source:: <url>` (http/https only), `clipped:: [[<today>]]`,
+    `tags:: #clipped` (decision 44's form); then the content. *Inbox:*
+    "Clipped [[Title]]" is added at the end of today's journal (created
+    if needed; an empty first block is used). That puts new clips where
+    the day's notes are and lists them by date, with no special page to
+    maintain; `#clipped` lists them all. Saving a clip stops editing and,
+    like an import, clears undo history (a snapshot from before would
+    drop the page). The status says "Clipped “Title”" with Open.
+    *Conversion* (`clipper/html.rs`): a tokenizer that never looks inside
+    raw-text elements, then one pass that keeps headings (nesting what
+    follows, as the import does), paragraphs, nested lists, quotes, code
+    blocks, table rows, links (http/https/mailto after removing control
+    characters, relative ones resolved against the page's address,
+    `[ ] ( )` and spaces percent-encoded so they can't leave the link),
+    bold, italics and inline code; scripts, styles, frames, forms,
+    objects, SVG, media, templates and `<nav>` go with their content,
+    and no attribute but `href`/`src` is read. Images stay links (never
+    downloaded). Our syntax in the text is defanged with a zero-width
+    space: `[[`, `((`, `{{`, and line starts that would read as a
+    property (`id::` would take over block references), bullet,
+    heading, quote, fence or task; code lines get the line-start part
+    only. Output cap 1 MB / 5,000 blocks, with a note. *Responses:* JSON
+    for JSON requests; for the bookmarklet's form a self-contained page
+    "Saved to NoteSec ✓" (title escaped) whose one script, closing the
+    window, runs under a per-response CSP nonce (`default-src 'none'`).
+    CORS allows any origin without credentials (the token is the key);
+    a preflight asking for Private Network Access gets it. *Bookmarklet:*
+    a top-level form POST into a small new window, not `fetch` (blocked
+    more and more for public pages reaching localhost, and by pages'
+    `connect-src`); it sends the selection's HTML when there is one,
+    else `<article>`, `<main>` or the body. *Secrets:* the token lives in
+    `state.toml` (`clipper_token`) next to `ai_api_key`; publish never
+    reads that file, and sync/export must strip both. Git backup commits
+    `state.toml` locally (never pushes). *Limits:* sites with a strict
+    `form-action` CSP block the bookmarklet (use an extension); iframes
+    and shadow DOM aren't clipped; tables become rows; a "didn't answer
+    in time" 503 may follow a save that did happen; the port can only be
+    typed in `config.toml` beyond the − / + buttons (Settings has no text
+    field for it).
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

@@ -93,8 +93,23 @@ impl NoteSec {
         }));
     }
 
+    /// The clash dialog is up (a modal: vim keys and typing don't reach
+    /// the page behind it).
+    pub(super) fn import_dialog_open(&self) -> bool {
+        self.import.pending.is_some()
+    }
+
+    /// Show the clash dialog for `plan`. A block may have been opened for
+    /// editing while the export was being read: it is closed (saved) first,
+    /// so no key reaches it behind the dialog.
+    pub(super) fn offer_import_clash(&mut self, plan: Plan, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+        self.import.pending = Some(plan);
+        cx.notify();
+    }
+
     /// What the graph has, for clashes and unresolved links.
-    fn import_existing(&self) -> Existing {
+    pub(super) fn import_existing(&self) -> Existing {
         Existing {
             titles: self.pages.iter().map(|p| p.title.clone()).collect(),
             aliases: self.pages.iter().flat_map(page_aliases).collect(),
@@ -129,10 +144,7 @@ impl NoteSec {
                     Ok(plan) if plan.clashes.is_empty() => {
                         this.run_import(plan, OnClash::Rename, cx)
                     }
-                    Ok(plan) => {
-                        this.import.pending = Some(plan);
-                        cx.notify();
-                    }
+                    Ok(plan) => this.offer_import_clash(plan, cx),
                 }
             });
         }));

@@ -6,6 +6,8 @@
 //! font_family = "Inter"   # optional; omit to use the system UI font
 //! git_backup = false      # commit the graph folder to local git (decision 39)
 //! vim_mode = false        # vim keybindings in the block editor (decision 48)
+//! web_clipper = false     # the local web clipper endpoint (decision 51)
+//! clipper_port = 27183    # its port on 127.0.0.1 (1024-65535)
 //! ```
 //!
 //! The file is read once at startup. The app rewrites it when you change the
@@ -54,6 +56,11 @@ pub struct Config {
     /// Vim keybindings in the block editor (`vim.rs`, decision 48). Off
     /// unless the user turns it on.
     pub vim_mode: bool,
+    /// The web clipper (`clipper/`, decision 51): an HTTP endpoint on
+    /// 127.0.0.1. Off unless the user turns it on.
+    pub web_clipper: bool,
+    /// Its port. Out of 1024-65535 reads as the default.
+    pub clipper_port: u16,
 }
 
 impl Default for Config {
@@ -64,6 +71,8 @@ impl Default for Config {
             font_family: None,
             git_backup: false,
             vim_mode: false,
+            web_clipper: false,
+            clipper_port: crate::clipper::DEFAULT_PORT,
         }
     }
 }
@@ -100,6 +109,9 @@ impl Config {
     /// `1e9` must not make the UI unusable).
     fn sanitized(mut self) -> Self {
         self.font_size = self.clamp_size(self.font_size);
+        if self.clipper_port < 1024 {
+            self.clipper_port = crate::clipper::DEFAULT_PORT;
+        }
         // An empty family name means "unset".
         if self
             .font_family
@@ -175,11 +187,25 @@ mod tests {
             font_family: Some("Inter".into()),
             git_backup: true,
             vim_mode: true,
+            web_clipper: true,
+            clipper_port: 31337,
         };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), config);
         // No temp file left behind by the atomic write.
         assert!(!dir.join(".config.toml.tmp").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_privileged_or_zero_clipper_port_reads_as_the_default() {
+        let dir = temp_dir("clipper-port");
+        for bad in ["clipper_port = 0", "clipper_port = 80"] {
+            fs::write(dir.join("config.toml"), bad).unwrap();
+            let config = Config::load(&dir);
+            assert_eq!(config.clipper_port, crate::clipper::DEFAULT_PORT);
+            assert!(!config.web_clipper);
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

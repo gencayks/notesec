@@ -43,6 +43,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use uuid::Uuid;
 
+mod clipper_ui;
 mod embed_ui;
 mod import_ui;
 mod publish_ui;
@@ -454,6 +455,8 @@ enum SettingsSection {
     General,
     /// Every command with its key, rebindable (decision 41).
     Shortcuts,
+    /// The web clipper (decision 51, `clipper_ui`).
+    Clipper,
 }
 
 /// A line under the Shortcuts list.
@@ -762,6 +765,8 @@ pub struct NoteSec {
     publish: publish_ui::PublishState,
     /// The import in progress (decision 50, `import_ui`).
     import: import_ui::ImportState,
+    /// The web clipper's listener (decision 51, `clipper_ui`).
+    clipper: clipper_ui::ClipperState,
 }
 
 impl NoteSec {
@@ -909,12 +914,16 @@ impl NoteSec {
             vim: Default::default(),
             publish: Default::default(),
             import: Default::default(),
+            clipper: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
         if app.config.git_backup {
             // Commits what changed while the app was closed, too.
             app.start_backup(false, cx);
+        }
+        if app.config.web_clipper {
+            app.start_clipper(cx);
         }
         app
     }
@@ -2457,14 +2466,15 @@ impl NoteSec {
     }
 
     /// The Ctrl-K palette, the settings panel, a page menu, the shortcuts
-    /// list or a trash confirmation covers the page. All are modal, so the
-    /// tab keys do nothing while one is open.
+    /// list, a trash confirmation or the import clash dialog covers the
+    /// page. All are modal, so the tab keys do nothing while one is open.
     fn overlay_open(&self) -> bool {
         self.search.is_some()
             || self.settings.is_some()
             || self.page_menu.is_some()
             || self.shortcuts_open
             || self.trash_confirm.is_some()
+            || self.import_dialog_open()
     }
 
     /// Ctrl+W. Ignored while an overlay is open. In the focused right pane
@@ -3851,7 +3861,9 @@ impl NoteSec {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.trash_confirm.is_some() {
+        if self.import_dialog_open() {
+            self.answer_import_clash(None, cx);
+        } else if self.trash_confirm.is_some() {
             self.close_trash_confirm(cx);
         } else if self.page_menu.is_some() {
             // Closes the menu, cancels a rename or a delete.
@@ -4306,7 +4318,7 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.vim_takes_keys() {
+        if self.vim_takes_keys() || self.import_dialog_open() {
             return;
         }
         let range = range_utf16
@@ -4369,7 +4381,7 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.vim_takes_keys() {
+        if self.vim_takes_keys() || self.import_dialog_open() {
             return;
         }
         let range = range_utf16
@@ -4961,10 +4973,21 @@ impl NoteSec {
                 .on_click(cx.listener(|this, _e, _window, cx| {
                     this.show_settings_section(SettingsSection::Shortcuts, cx)
                 })),
+            )
+            .child(
+                button(
+                    "settings-tab-clipper",
+                    "Web clipper".into(),
+                    section == SettingsSection::Clipper,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::Clipper, cx)
+                })),
             );
         let body = match section {
             SettingsSection::General => general.into_any_element(),
             SettingsSection::Shortcuts => self.render_hotkeys(state, cx),
+            SettingsSection::Clipper => self.render_clipper_settings(cx),
         };
 
         div()
@@ -7713,6 +7736,7 @@ impl Render for NoteSec {
         // The status message: a small box at the bottom right, over the
         // page but under any dialog.
         let publish_actions = self.render_publish_actions(cx);
+        let clipper_actions = self.render_clipper_actions(cx);
         let status_toast = self.status.as_ref().map(|status| {
             div()
                 .debug_selector(|| "status-toast".to_string())
@@ -7738,6 +7762,7 @@ impl Render for NoteSec {
                 .shadow_md()
                 .child(status.text.clone())
                 .children(publish_actions)
+                .children(clipper_actions)
         });
 
         let is_editing = self.editing.is_some() || self.text_input_open();
@@ -15425,6 +15450,262 @@ mod tests {
         );
         assert_eq!(view.update(cx, |app, _| app.pages.len()), before);
         let _ = std::fs::remove_file(zip);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn vim_keys_never_reach_a_block_behind_the_import_dialog(cx: &mut TestAppContext) {
+        let pages = [("Test", "- keep me\n- second\n"), ("Home", "- mine\n")];
+        let (view, cx, dir) = setup_pages(cx, "import-vim", &pages, "Test");
+        let vault = obsidian_vault("vim");
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        assert!(has(cx, "import-clash"));
+        // A block in edit mode behind the dialog: the user clicked one while
+        // the export was still being read (too quick to time in a test, so
+        // made directly). Vim keys must not reach it.
+        view.update_in(cx, |app, window, cx| app.start_edit(0, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("d d x p");
+        cx.simulate_input("typed");
+        assert_eq!(block_texts(&view, cx), ["keep me", "second"]);
+        view.update(cx, |app, _| {
+            assert!(!app.vim_applies());
+            assert_eq!(app.vim_label(), None);
+        });
+        // Escape cancels the dialog (nothing imported).
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "import-clash"));
+        assert!(!dir.join("pages/Other.md").exists());
+        view.update(cx, |app, cx| app.stop_edit(cx));
+
+        // Keys can't open a block behind the dialog either.
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        assert!(has(cx, "import-clash"));
+        cx.simulate_keystrokes("enter i o down d d");
+        cx.simulate_input("x");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(block_texts(&view, cx), ["keep me", "second"]);
+        click_on(cx, "import-clash-cancel");
+        // Showing the dialog closes an open block first.
+        let root = dir.clone();
+        view.update_in(cx, |app, window, cx| {
+            app.start_edit(0, window, cx);
+            let existing = app.import_existing();
+            let plan =
+                crate::import::plan(crate::import::Source::Obsidian, &vault, &root, &existing)
+                    .unwrap();
+            app.offer_import_clash(plan, cx);
+            assert_eq!(app.editing, None);
+        });
+        cx.run_until_parked();
+        assert!(has(cx, "import-clash"));
+        click_on(cx, "import-clash-cancel");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Test.md")).unwrap(),
+            "- keep me\n- second\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    /// Send `raw` to the clipper on `port` from another thread while the
+    /// app runs (it saves clips on its UI thread); the whole answer.
+    fn post_clip(cx: &mut VisualTestContext, port: u16, raw: String) -> String {
+        let client = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer);
+            answer
+        });
+        for _ in 0..4000 {
+            if client.is_finished() {
+                break;
+            }
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        client.join().unwrap()
+    }
+
+    fn clip_request(port: u16, content_type: &str, extra: &str, body: &str) -> String {
+        format!(
+            "POST /clip HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {content_type}\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[gpui::test]
+    fn the_web_clipper_saves_posted_pages_as_inbox_pages(cx: &mut TestAppContext) {
+        let pages = [("Test", "- a\n"), ("Article", "- mine\n")];
+        let (view, cx, dir) = setup_pages(cx, "clipper", &pages, "Test");
+        // Off by default: nothing listens.
+        view.update(cx, |app, _| {
+            assert!(!app.config.web_clipper);
+            assert_eq!(app.clipper_listening(), None);
+        });
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-clipper");
+        assert!(has(cx, "settings-clipper"));
+        // Port 0: any free port (the test mustn't take the real one).
+        view.update(cx, |app, _| app.config.clipper_port = 0);
+        click_on(cx, "clipper-on");
+        let (port, token) = view.update(cx, |app, _| {
+            (
+                app.clipper_listening().unwrap(),
+                app.state.clipper_token.clone(),
+            )
+        });
+        assert_ne!(port, 0);
+        assert_eq!(token.len(), 64);
+        assert!(saved_config(&dir).web_clipper);
+        let saved_state = std::fs::read_to_string(dir.join("state.toml")).unwrap();
+        assert!(saved_state.contains(&format!("clipper_token = \"{token}\"")));
+        click_on(cx, "clipper-copy-bookmarklet");
+        let copied = cx.read_from_clipboard().and_then(|i| i.text()).unwrap();
+        assert!(copied.starts_with("javascript:"));
+        assert!(copied.contains(&format!("http://127.0.0.1:{port}/clip")));
+        assert!(copied.contains(&token));
+        cx.simulate_keystrokes("escape");
+
+        // A form post (the bookmarklet's): a taken title gets " (2)".
+        let html = "%3Ch1%3EBig%3C%2Fh1%3E%3Cp%3Etext+%3Ca+href%3D%22javascript%3Ax()%22+onclick%3D%22y()%22%3Elink%3C%2Fa%3E%3C%2Fp%3E%3Cscript%3Eevil()%3C%2Fscript%3E";
+        let body = format!("token={token}&title=Article&url=https%3A%2F%2Fe.com%2Fa&html={html}");
+        let answer = post_clip(
+            cx,
+            port,
+            clip_request(port, "application/x-www-form-urlencoded", "", &body),
+        );
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(answer.contains("Saved to NoteSec"));
+        let today = today_title();
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Article (2)")).unwrap(),
+            format!(
+                "- source:: https://e.com/a\n  clipped:: [[{today}]]\n  tags:: #clipped\n- # Big\n  - text link\n"
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(page_file(&dir, "Article")).unwrap(),
+            "- mine\n"
+        );
+        let journal = dir
+            .join("journals")
+            .join(format!("{}.md", today.replace('-', "_")));
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap(),
+            "- Clipped [[Article (2)]]\n"
+        );
+        assert_eq!(
+            status_text(&view, cx).as_deref(),
+            Some("Clipped \u{201c}Article (2)\u{201d}")
+        );
+        click_on(cx, "clipper-open");
+        view.update(cx, |app, _| {
+            assert_eq!(app.current_page().as_deref(), Some("Article (2)"))
+        });
+
+        // JSON (an extension's), token in the header; the inbox grows.
+        let json =
+            r#"{"title":"From JSON","url":"https://e.com/j","html":"<ul><li>one</li></ul>"}"#;
+        let answer = post_clip(
+            cx,
+            port,
+            clip_request(
+                port,
+                "application/json",
+                &format!("X-NoteSec-Token: {token}\r\n"),
+                json,
+            ),
+        );
+        assert!(
+            answer.ends_with(r#"{"ok":true,"title":"From JSON"}"#),
+            "{answer}"
+        );
+        assert!(page_file(&dir, "From JSON").exists());
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap(),
+            "- Clipped [[Article (2)]]\n- Clipped [[From JSON]]\n"
+        );
+
+        // A wrong token: 403, nothing written.
+        let body = "token=0000&title=Nope&html=x".to_string();
+        let answer = post_clip(
+            cx,
+            port,
+            clip_request(port, "application/x-www-form-urlencoded", "", &body),
+        );
+        assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+        assert!(!page_file(&dir, "Nope").exists());
+        assert!(view.update(cx, |app, _| app.find_page("Nope").is_none()));
+
+        // Regenerate: the old token stops working at once.
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-clipper");
+        click_on(cx, "clipper-regenerate");
+        let (port, new_token) = view.update(cx, |app, _| {
+            (
+                app.clipper_listening().unwrap(),
+                app.state.clipper_token.clone(),
+            )
+        });
+        assert_ne!(new_token, token);
+        let body = format!("token={token}&title=Old&html=x");
+        let answer = post_clip(
+            cx,
+            port,
+            clip_request(port, "application/x-www-form-urlencoded", "", &body),
+        );
+        assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+        assert!(!page_file(&dir, "Old").exists());
+
+        // Off: the port closes.
+        click_on(cx, "clipper-off");
+        assert_eq!(view.update(cx, |app, _| app.clipper_listening()), None);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(!saved_config(&dir).web_clipper);
+        // The port buttons (while off, so nothing binds the real port).
+        click_on(cx, "clipper-port-reset");
+        assert_eq!(
+            saved_config(&dir).clipper_port,
+            crate::clipper::DEFAULT_PORT
+        );
+        click_on(cx, "clipper-port-down");
+        assert_eq!(
+            saved_config(&dir).clipper_port,
+            crate::clipper::DEFAULT_PORT - 1
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_clipper_port_in_use_is_shown_not_a_panic(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "clipper-busy", &[("Test", "- a\n")], "Test");
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        view.update(cx, |app, _| app.config.clipper_port = taken);
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-clipper");
+        click_on(cx, "clipper-on");
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.error);
+        assert!(
+            status.text.contains(&format!("port {taken} is in use")),
+            "{}",
+            status.text
+        );
+        assert!(has(cx, "clipper-status"));
+        assert_eq!(view.update(cx, |app, _| app.clipper_listening()), None);
+        drop(holder);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

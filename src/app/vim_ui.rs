@@ -57,8 +57,9 @@ fn vim_key(keystroke: &Keystroke) -> Key {
 
 impl NoteSec {
     /// Vim is on and the block editor has the keyboard: not the palette,
-    /// the rename field, Settings (and its key capture), a dialog, or any
-    /// other text field (`text_input_open`).
+    /// the rename field, Settings (and its key capture), a dialog (page
+    /// menu, trash, import clash), or any other text field
+    /// (`text_input_open`). Modal overlays always win.
     pub(super) fn vim_applies(&self) -> bool {
         self.config.vim_mode
             && self.editing.is_some()
@@ -67,6 +68,7 @@ impl NoteSec {
             && !self.shortcuts_open
             && self.page_menu.is_none()
             && self.trash_confirm.is_none()
+            && !self.import_dialog_open()
     }
 
     /// Vim takes every key (Normal, Visual, or the `:` line): nothing is

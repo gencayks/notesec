@@ -7,6 +7,8 @@
 //! recent = ["2026-10-08", "Projects"]   # most recent first
 //! page_order = ["Projects", "Inbox"]    # absent: alphabetical
 //!
+//! clipper_token = "3f9c…"               # the web clipper's secret (decision 51)
+//!
 //! [shortcuts]                           # absent: the default keys
 //! SplitRight = "ctrl-alt-s"             # see hotkeys.rs (decision 41)
 //! Quit = ""                             # unbound
@@ -49,6 +51,11 @@ pub struct UiState {
         deserialize_with = "lenient_shortcuts"
     )]
     pub shortcuts: Overrides,
+    /// The web clipper's token (decision 51), made on first use. A secret
+    /// like `ai_api_key`: never published, and to be left out of any
+    /// sync or export of this file.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub clipper_token: String,
 }
 
 /// `[shortcuts]` read so a hand-editing slip there can't cost the rest of
@@ -228,6 +235,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+            clipper_token: "0a1b2c".into(),
         };
         state.save(&dir).unwrap();
         assert_eq!(UiState::load(&dir), state);

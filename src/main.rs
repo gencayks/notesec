@@ -2,6 +2,7 @@ mod agenda;
 mod app;
 mod assets;
 mod backup;
+mod clipper;
 mod code;
 mod commands;
 mod config;
