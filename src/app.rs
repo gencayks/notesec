@@ -53,6 +53,7 @@ use ai_ui::{
 };
 use calendar_ui::CalendarMonth;
 use mentions_ui::MentionsState;
+use sync_ui::SyncUi;
 mod appearance_ui;
 mod calendar_ui;
 mod capture_ui;
@@ -62,6 +63,7 @@ mod import_ui;
 mod kanban_ui;
 mod plugins_ui;
 mod publish_ui;
+mod sync_ui;
 mod vault_ui;
 mod vim_ui;
 mod voice_ui;
@@ -127,6 +129,7 @@ actions!(
         ImportLogseq,
         ImportNotion,
         ToggleGitBackup,
+        SyncNow,
         SplitRight,
         ClosePane,
         FocusOtherPane,
@@ -299,6 +302,7 @@ pub fn shortcuts() -> Vec<Shortcut> {
         s("escape",         Escape,        Some("PageMenu"),    App, "Close a dialog or menu"),
         s("escape",         Escape,        Some("Shortcuts"),   App, "Close a dialog or menu"),
         s("escape",         Escape,        Some("TrashDialog"), App, "Close a dialog or menu"),
+        s("escape",         Escape,        Some("SyncDialog"),  App, "Close a dialog or menu"),
         // A whiteboard canvas with the keyboard (nothing edited, no dialog).
         s("delete",         WhiteboardDelete, Some("Whiteboard"), Editing, "Whiteboard: delete the selected card or arrow"),
         s("backspace",      WhiteboardDelete, Some("Whiteboard"), Editing, "Whiteboard: delete the selected card or arrow"),
@@ -854,6 +858,8 @@ pub struct NoteSec {
     vault: vault_ui::VaultState,
     /// WASM plugins (decision 55, `plugins_ui.rs`).
     plugins: plugins_ui::PluginsState,
+    /// Git sync across machines (roadmap v0.3.0 feature 6, `sync_ui.rs`).
+    sync: SyncUi,
 }
 
 impl NoteSec {
@@ -1028,6 +1034,7 @@ impl NoteSec {
             whiteboard: Default::default(),
             vault: Default::default(),
             plugins: Default::default(),
+            sync: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -1036,6 +1043,7 @@ impl NoteSec {
             // Commits what changed while the app was closed, too.
             app.start_backup(false, cx);
         }
+        app.start_sync(cx);
         if app.config.web_clipper {
             app.start_clipper(cx);
         }
@@ -1052,6 +1060,9 @@ impl NoteSec {
             return dialog.field();
         }
         if let Some(editor) = &self.capture {
+            return editor;
+        }
+        if let Some((_, editor)) = &self.sync.field {
             return editor;
         }
         match (&self.search, &self.page_menu) {
@@ -1073,6 +1084,9 @@ impl NoteSec {
             return self.vault.dialog.as_mut().expect("open").field_mut();
         }
         if let Some(editor) = &mut self.capture {
+            return editor;
+        }
+        if let Some((_, editor)) = &mut self.sync.field {
             return editor;
         }
         match (&mut self.search, &mut self.page_menu) {
@@ -1112,6 +1126,7 @@ impl NoteSec {
     fn text_input_open(&self) -> bool {
         self.search.is_some()
             || self.capture.is_some()
+            || self.sync.field.is_some()
             || self.renaming()
             || self.ai_editor().is_some()
             || self.vault_dialog_open()
@@ -1398,6 +1413,9 @@ impl NoteSec {
                         let text = format!("Git backup failed: {err}");
                         this.show_status(Status { text, error: true }, cx);
                     }
+                } else {
+                    // A new local commit may move the sync status.
+                    this.note_committed_for_sync(cx);
                 }
             });
         }));
@@ -3705,6 +3723,9 @@ impl NoteSec {
             self.confirm_quick_capture(cx);
             return;
         }
+        if self.sync_enter(cx) {
+            return;
+        }
         if self.ai_enter(window, cx) {
             return;
         }
@@ -4287,6 +4308,8 @@ impl NoteSec {
             self.answer_import_clash(None, cx);
         } else if self.trash_confirm.is_some() {
             self.close_trash_confirm(cx);
+        } else if self.sync_escape(cx) {
+            // Cancelled a sync dialog field, or closed the dialog.
         } else if self.page_menu.is_some() {
             // Closes the menu, cancels a rename or a delete.
             self.close_page_menu(cx);
@@ -7084,6 +7107,8 @@ impl Render for NoteSec {
         let saved_searches = self.render_saved_searches(cx);
         // "Record voice note" / "Stop recording" (decision 52).
         let voice_item = self.render_voice_sidebar_item(cx);
+        // Git sync status (roadmap v0.3.0 feature 6).
+        let sync_item = self.render_sync_sidebar_item(cx);
         let sidebar_items = self.pages.iter().enumerate().map(|(ix, page)| {
             let is_selected = self.mode == Mode::Notes && ix == self.selected;
             let is_favorite = self.state.is_favorite(&page.title);
@@ -7473,6 +7498,7 @@ impl Render for NoteSec {
             .child(calendar_item)
             .child(trash_item)
             .child(voice_item)
+            .child(sync_item)
             .when(!favorite_rows.is_empty(), |d| {
                 d.child(section_header("FAVORITES")).children(favorite_rows)
             })
@@ -8254,6 +8280,10 @@ impl Render for NoteSec {
         // "BlockEditor" (below) instead of "Settings".
         let settings_open =
             self.settings.is_some() && !shortcuts_open && !self.ai_settings_editing();
+        // The sync dialog takes over while open, except while one of its
+        // fields is being edited (then it types like any other input).
+        let sync_open =
+            self.sync.dialog && !shortcuts_open && !settings_open && self.sync.field.is_none();
         let page_menu_open = self.page_menu.is_some() && !is_editing && !shortcuts_open;
         let trash_confirm_open = self.trash_confirm.is_some()
             && !is_editing
@@ -8283,6 +8313,7 @@ impl Render for NoteSec {
                 d.key_context("PageMenu")
             })
             .when(trash_confirm_open, |d| d.key_context("TrashDialog"))
+            .when(sync_open, |d| d.key_context("SyncDialog"))
             .when(whiteboard_focused, |d| d.key_context("Whiteboard"))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, _| {
                 if e.keystroke.key == "space" {
@@ -8343,6 +8374,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_reset_font))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_toggle_git_backup))
+            .on_action(cx.listener(Self::on_sync_now))
             .on_action(cx.listener(Self::on_customize_shortcuts))
             .on_action(cx.listener(Self::on_split_right))
             .on_action(cx.listener(Self::on_close_pane))
@@ -8402,6 +8434,7 @@ impl Render for NoteSec {
             .children(self.render_import_dialog(cx))
             .children(self.render_vault_dialog(cx))
             .children(trash_confirm_overlay)
+            .children(self.render_sync_dialog(cx))
     }
 }
 

@@ -167,6 +167,7 @@ commands! {
     // App
     OpenSettings => "Open settings", ["preferences", "theme", "font"], Nothing;
     ToggleGitBackup => "Toggle git auto-backup", ["git", "backup", "version", "history", "autosave"], Nothing;
+    SyncNow => "Sync now", ["sync", "push", "pull", "git", "remote", "machines"], Nothing;
     ToggleVimMode => "Toggle vim mode", ["vim", "vi", "modal editing", "keybindings", "normal mode"], Nothing;
     ShowShortcuts => "Keyboard shortcuts", ["keys", "keymap", "cheatsheet", "help"], Nothing;
     CustomizeShortcuts => "Change keyboard shortcuts", ["customize", "rebind", "hotkeys", "key bindings", "remap"], Nothing;

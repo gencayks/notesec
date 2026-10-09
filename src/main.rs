@@ -25,6 +25,7 @@ mod search;
 mod semantic;
 mod state;
 mod storage;
+mod sync;
 mod table;
 mod tabs;
 mod ui;

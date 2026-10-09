@@ -55,8 +55,11 @@ const REPO_ENV: [&str; 7] = [
     "GIT_NAMESPACE",
 ];
 
-/// One git command at a time: a commit started by the timer and one at
-/// quit must not race for `.git/index.lock`.
+/// One git command at a time: two writers (the backup timer, a sync)
+/// must not race for `.git/index.lock`. The lock lives around every
+/// command (`output`), so readers and writers never overlap; sequences
+/// that must not interleave (a commit's status/add/commit) are still
+/// safe to interleave, since each step only adds committed work.
 static LOCK: Mutex<()> = Mutex::new(());
 
 fn lock() -> std::sync::MutexGuard<'static, ()> {
@@ -140,8 +143,18 @@ impl Git {
         self
     }
 
-    /// Run `git -C <dir> <config...> <args...>` and wait for it.
-    fn output(&self, dir: &Path, config: &[String], args: &[&str]) -> Result<Output, BackupError> {
+    /// Run `git -C <dir> <config...> <args...>` and wait for it. Holds
+    /// the repo lock, so no other git command runs at the same time.
+    /// Never waits for a password: prompts are off, and SSH runs in
+    /// batch mode with a connect timeout (a missing key fails instead of
+    /// asking).
+    pub(crate) fn output(
+        &self,
+        dir: &Path,
+        config: &[String],
+        args: &[&str],
+    ) -> Result<Output, BackupError> {
+        let _lock = lock();
         let mut command = Command::new(&self.program);
         command.arg("-C").arg(dir);
         for setting in config {
@@ -153,6 +166,12 @@ impl Git {
             // Never wait for a password or an editor.
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_EDITOR", "true");
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            command.env(
+                "GIT_SSH_COMMAND",
+                "ssh -o BatchMode=yes -o ConnectTimeout=30",
+            );
+        }
         for var in REPO_ENV {
             command.env_remove(var);
         }
@@ -166,7 +185,13 @@ impl Git {
     }
 
     /// Like `output`, but a failure is an error and stdout is returned.
-    fn run(&self, dir: &Path, config: &[String], args: &[&str]) -> Result<String, BackupError> {
+    /// Shared with `sync`, which runs its fetch/merge/push through it.
+    pub(crate) fn run(
+        &self,
+        dir: &Path,
+        config: &[String],
+        args: &[&str],
+    ) -> Result<String, BackupError> {
         let output = self.output(dir, config, args)?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -176,8 +201,9 @@ impl Git {
     }
 
     /// `-c user.name=... -c user.email=...` for whichever of the two git
-    /// has no value for (none when the user configured both).
-    fn identity(&self, dir: &Path) -> Result<Vec<String>, BackupError> {
+    /// has no value for (none when the user configured both). Shared with
+    /// `sync`, which commits merges the same way.
+    pub(crate) fn identity(&self, dir: &Path) -> Result<Vec<String>, BackupError> {
         let mut config = Vec::new();
         for (key, fallback) in [("user.name", FALLBACK_NAME), ("user.email", FALLBACK_EMAIL)] {
             let output = self.output(dir, &[], &["config", "--get", key])?;
@@ -206,7 +232,6 @@ fn failure(output: &Output, args: &[&str]) -> BackupError {
 /// or `git init` one there; check that repository doesn't ignore the graph;
 /// make sure the graph's `.gitignore` lists `IGNORED` (`merge_gitignore`).
 pub fn prepare(git: &Git, graph: &Path) -> Result<Repo, BackupError> {
-    let _lock = lock();
     let found = git.output(graph, &[], &["rev-parse", "--show-toplevel"])?;
     let repo = if found.status.success() {
         let root = String::from_utf8_lossy(&found.stdout).trim().to_string();
@@ -327,7 +352,6 @@ pub fn merge_gitignore(graph: &Path) -> io::Result<bool> {
 /// nothing to commit (no empty commits). The message is
 /// `notesec autosave: N file(s) changed`.
 pub fn commit(git: &Git, graph: &Path) -> Result<Option<usize>, BackupError> {
-    let _lock = lock();
     let status = git.run(
         graph,
         &[],

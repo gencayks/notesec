@@ -123,6 +123,13 @@ pub struct Config {
     /// Git auto-backup (`backup.rs`): commit the graph folder to a local
     /// git repository after changes. Off unless the user turns it on.
     pub git_backup: bool,
+    /// Git sync (`sync.rs`, roadmap v0.3.0 feature 6): the remote to push
+    /// to and pull from (an SSH URL, an https URL or a local path).
+    /// Empty: sync is not configured.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sync_remote: String,
+    /// Auto-sync every this many minutes (0: only sync on demand).
+    pub sync_interval_minutes: u64,
     /// Which AI backend is active (decision 42): Local (default), API key
     /// or Off. Never changes on its own.
     pub ai_provider: AiProvider,
@@ -179,6 +186,8 @@ impl Default for Config {
             legacy_font_size: None,
             legacy_font_family: None,
             git_backup: false,
+            sync_remote: String::new(),
+            sync_interval_minutes: 0,
             ai_provider: AiProvider::default(),
             ai_endpoint: crate::ai::DEFAULT_ENDPOINT.to_string(),
             ai_model: String::new(),
@@ -331,6 +340,8 @@ mod tests {
             voice_auto_transcribe: true,
             pdf_margin_mm: 24.0,
             plugins: [("word-count".to_string(), "ab12".to_string())].into(),
+            sync_remote: "git@example.org:vault.git".into(),
+            sync_interval_minutes: 30,
         };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), config);
