@@ -19,6 +19,7 @@
 //! whisper_model = ""       # a ggml model file, e.g. ggml-base.bin
 //! whisper_language = "auto"
 //! voice_auto_transcribe = false
+//! pdf_margin_mm = 18.0         # A4 PDF export margin
 //! ```
 //!
 //! The API key itself is NOT stored here: it lives in `state.toml` as
@@ -47,6 +48,7 @@ pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 /// The block editor is monospace, whose glyphs are wider than a proportional
 /// font's at the same size, so it starts a little smaller.
 pub const DEFAULT_MONO_FONT_SIZE: f32 = 14.0;
+pub const DEFAULT_PDF_MARGIN_MM: f32 = 18.0;
 
 /// A font size forced into the usable range. A typo like `font_size = 0` or
 /// `1e9` must not make the UI unusable, and NaN reads as the default.
@@ -159,6 +161,8 @@ pub struct Config {
     pub whisper_language: String,
     /// Transcribe each new voice note when it's recorded.
     pub voice_auto_transcribe: bool,
+    /// A4 PDF export margin, in millimetres.
+    pub pdf_margin_mm: f32,
     /// Enabled plugins: id -> hash of the `plugin.wasm` that was enabled
     /// (decision 55). Plugins not listed, or whose binary changed, are off.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -190,6 +194,7 @@ impl Default for Config {
             whisper_model: String::new(),
             whisper_language: "auto".into(),
             voice_auto_transcribe: false,
+            pdf_margin_mm: DEFAULT_PDF_MARGIN_MM,
             plugins: Default::default(),
         }
     }
@@ -231,6 +236,10 @@ impl Config {
             self.clipper_port = crate::clipper::DEFAULT_PORT;
         }
         self.whisper_language = crate::voice::whisper::language(&self.whisper_language);
+        if !self.pdf_margin_mm.is_finite() {
+            self.pdf_margin_mm = DEFAULT_PDF_MARGIN_MM;
+        }
+        self.pdf_margin_mm = self.pdf_margin_mm.clamp(5.0, 40.0);
         // An empty family name means "unset".
         if self
             .legacy_font_family
@@ -320,6 +329,7 @@ mod tests {
             whisper_model: "/m/ggml-base.bin".into(),
             whisper_language: "de".into(),
             voice_auto_transcribe: true,
+            pdf_margin_mm: 24.0,
             plugins: [("word-count".to_string(), "ab12".to_string())].into(),
         };
         config.save(&dir).unwrap();

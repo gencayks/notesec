@@ -113,6 +113,7 @@ actions!(
         OpenAgenda,
         OpenTrash,
         ExportHtml,
+        ExportPdf,
         PublishPage,
         PublishPageWithLinks,
         ImportObsidian,
@@ -1272,6 +1273,12 @@ impl NoteSec {
         cx.notify();
     }
 
+    fn set_pdf_margin(&mut self, margin_mm: f32, cx: &mut Context<Self>) {
+        self.config.pdf_margin_mm = margin_mm.clamp(5.0, 40.0);
+        self.save_config();
+        cx.notify();
+    }
+
     fn toggle_git_backup(&mut self, cx: &mut Context<Self>) {
         self.set_git_backup(!self.config.git_backup, cx);
     }
@@ -2084,6 +2091,12 @@ impl NoteSec {
     fn on_export_html(&mut self, _: &ExportHtml, _: &mut Window, cx: &mut Context<Self>) {
         if self.current_page().is_some() {
             self.export_html(cx);
+        }
+    }
+
+    fn on_export_pdf(&mut self, _: &ExportPdf, _: &mut Window, cx: &mut Context<Self>) {
+        if self.current_page().is_some() {
+            self.export_pdf(cx);
         }
     }
 
@@ -3344,6 +3357,115 @@ impl NoteSec {
             },
         };
         self.show_status(status, cx);
+    }
+
+    /// "Export page as PDF": render the same self-contained HTML as the HTML
+    /// export, then ask an installed Chromium-family browser to print it.
+    fn export_pdf(&mut self, cx: &mut Context<Self>) {
+        self.stop_edit(cx);
+        let page = &self.pages[self.selected];
+        let pages = &self.pages;
+        let resolve_ref =
+            |id| find_block(pages, id).map(|(p, b)| pages[p].blocks[b].content.clone());
+        let root = self.storage.root();
+        let load_image = |target: &str| {
+            resolve(root, target)
+                .filter(|path| is_image_path(path))
+                .and_then(|path| std::fs::read(path).ok())
+        };
+        let resolver = crate::embed::Resolver::new(pages, None);
+        let host = Some(self.selected);
+        let resolve_embeds = |content: &str| resolver.resolve(content, host);
+        let html = crate::export::page_html_for_pdf(
+            page,
+            &resolve_ref,
+            &resolve_embeds,
+            &load_image,
+            self.config.pdf_margin_mm,
+        );
+        let html_path = match self.storage.write_export(page, &html) {
+            Ok(path) => path,
+            Err(err) => {
+                self.show_status(
+                    Status {
+                        text: format!("PDF export failed: {err}"),
+                        error: true,
+                    },
+                    cx,
+                );
+                return;
+            }
+        };
+        let pdf_path = self.storage.pdf_export_path(page);
+        let browser_candidates = [
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
+        ];
+        let title = page.title.clone();
+        let pdf_display = pdf_path.display().to_string();
+        let temp_pdf = pdf_path.with_extension("pdf.tmp");
+        let _ = std::fs::remove_file(&temp_pdf);
+        let _ = std::fs::remove_file(&pdf_path);
+        self.show_status(
+            Status {
+                text: "Exporting page to PDF...".into(),
+                error: false,
+            },
+            cx,
+        );
+        self.status_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let browser = browser_candidates
+                        .iter()
+                        .find(|candidate| {
+                            std::process::Command::new(candidate)
+                                .arg("--version")
+                                .output()
+                                .is_ok_and(|output| output.status.success())
+                        })
+                        .copied();
+                    let Some(browser) = browser else {
+                        return Err(
+                            "No Chromium browser found. Install Chromium or Google Chrome \
+                             to export pages as PDF."
+                                .to_string(),
+                        );
+                    };
+                    let output = std::process::Command::new(browser)
+                        .args(["--headless", "--disable-gpu", "--no-pdf-header-footer"])
+                        .arg(format!("--print-to-pdf={}", temp_pdf.display()))
+                        .arg(&html_path)
+                        .output()
+                        .map_err(|err| format!("Could not run {browser}: {err}"))?;
+                    if !output.status.success() {
+                        let detail = String::from_utf8_lossy(&output.stderr);
+                        return Err(format!(
+                            "{browser} could not create the PDF{}",
+                            if detail.trim().is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", detail.trim())
+                            }
+                        ));
+                    }
+                    std::fs::rename(&temp_pdf, &pdf_path)
+                        .map_err(|err| format!("Could not save {}: {err}", pdf_path.display()))?;
+                    Ok(())
+                })
+                .await;
+            let status = match result {
+                Ok(()) => Status {
+                    text: format!("Exported {title} to {pdf_display}"),
+                    error: false,
+                },
+                Err(text) => Status { text, error: true },
+            };
+            let _ = this.update(cx, |this, cx| this.show_status(status, cx));
+        }));
     }
 
     /// Show `status` at the bottom right for `STATUS_FOR`.
@@ -5107,6 +5229,31 @@ impl NoteSec {
                         "Local git commits {} s after changes. Never pushes.",
                         backup::BACKUP_AFTER.as_secs()
                     )),
+            )
+            .child(label("PDF export"))
+            .child(div().flex().flex_row().gap_2().children(
+                [12.0_f32, 18.0, 24.0].into_iter().map(|margin| {
+                    let active = (config.pdf_margin_mm - margin).abs() < f32::EPSILON;
+                    button(
+                        match margin as u32 {
+                            12 => "pdf-margin-12",
+                            18 => "pdf-margin-18",
+                            _ => "pdf-margin-24",
+                        },
+                        format!("{margin:.0} mm").into(),
+                        active,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _e, _window, cx| this.set_pdf_margin(margin, cx)),
+                    )
+                    .into_any_element()
+                }),
+            ))
+            .child(
+                div()
+                    .debug_selector(|| "pdf-export-note".to_string())
+                    .text_color(theme.muted)
+                    .child("A4 paper; margins apply to PDF exports."),
             )
             .child(self.render_vim_settings(cx));
 
@@ -8133,6 +8280,7 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_open_agenda))
             .on_action(cx.listener(Self::on_open_trash))
             .on_action(cx.listener(Self::on_export_html))
+            .on_action(cx.listener(Self::on_export_pdf))
             .on_action(cx.listener(Self::on_rename_page))
             .on_action(cx.listener(Self::on_delete_page))
             .on_action(cx.listener(Self::on_copy_page_title))

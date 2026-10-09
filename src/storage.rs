@@ -9,6 +9,7 @@
 //! <graph>/.trash/<millis>/pages/<title>.md        (deleted pages, see below)
 //! <graph>/.trash/<millis>/journals/YYYY_MM_DD.md
 //! <graph>/exports/<page file name>.html          (Export page to HTML)
+//! <graph>/exports/<page file name>.pdf           (Export page to PDF)
 //! <graph>/published/<slug>/index.html, ...      (Publish page, see publish.rs)
 //! <graph>/assets/<file>                          (images, and imported attachments)
 //! ```
@@ -382,6 +383,13 @@ impl Storage {
         fs::create_dir_all(self.root.join(EXPORTS_DIR))?;
         write_atomic(&path, html)?;
         Ok(path)
+    }
+
+    /// Where "Export page as PDF" writes the page.
+    pub fn pdf_export_path(&self, page: &Page) -> PathBuf {
+        let file = self.path_for(page).with_extension("pdf");
+        let name = file.file_name().map(PathBuf::from).unwrap_or_default();
+        self.root.join(EXPORTS_DIR).join(name)
     }
 
     /// The trashed file of `entry`.

@@ -90,6 +90,7 @@ img { max-width: 100%; max-height: 480px; display: block; margin: 4px 0; border-
 .embed-title { color: var(--muted); font-size: 0.85em; }
 .embed-note { color: var(--muted); font-style: italic; font-size: 0.9em; }
 @media print { body { background: none; } main { max-width: none; padding: 0; } }
+@page { size: A4; margin: 18mm; }
 .whiteboard { overflow-x: auto; margin: 1rem 0; }
 .whiteboard svg { max-width: 100%; height: auto; }
 .whiteboard .card-box { fill: var(--bg); stroke: var(--border); }
@@ -175,6 +176,7 @@ pub fn page_html_with_embeds(
             &options,
         );
     }
+
     let rows = page
         .blocks
         .iter()
@@ -188,6 +190,29 @@ pub fn page_html_with_embeds(
         })
         .collect();
     document(&page.title, page.is_journal, rows, &options)
+}
+
+/// Render a page for PDF printing, using A4 paper and the requested margin.
+/// The HTML remains self-contained so a headless browser can print local
+/// images and the same wikilinks and tags as the HTML export.
+pub fn page_html_for_pdf(
+    page: &Page,
+    resolve_ref: ResolveRef,
+    resolve_embeds: ResolveEmbeds,
+    load_image: LoadImage,
+    margin_mm: f32,
+) -> String {
+    let margin_mm = if margin_mm.is_finite() {
+        margin_mm.clamp(5.0, 40.0)
+    } else {
+        18.0
+    };
+    let html = page_html_with_embeds(page, resolve_ref, resolve_embeds, load_image);
+    html.replacen(
+        "@page { size: A4; margin: 18mm; }",
+        &format!("@page {{ size: A4; margin: {margin_mm:.1}mm; }}"),
+        1,
+    )
 }
 
 /// The whole HTML document for a page titled `title` whose blocks are
@@ -862,6 +887,17 @@ mod tests {
             !html.contains("<a "),
             "no links to pages that aren't exported"
         );
+    }
+
+    #[test]
+    fn pdf_html_uses_a4_and_configured_margin() {
+        let page = Page::from_markdown("Test", false, "- [[Other]] #tag\n");
+        let html = page_html_for_pdf(&page, &no_refs, &|_| Vec::new(), &no_images, 24.0);
+        assert!(html.contains("@page { size: A4; margin: 24.0mm; }"));
+        assert!(html.contains("data-page=\"Other\""));
+        assert!(html.contains("class=\"tag\""));
+        let html = page_html_for_pdf(&page, &no_refs, &|_| Vec::new(), &no_images, f32::NAN);
+        assert!(html.contains("@page { size: A4; margin: 18.0mm; }"));
     }
 
     #[test]
