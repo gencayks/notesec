@@ -12,6 +12,7 @@ mod export;
 mod graph;
 mod graph_view;
 mod hotkeys;
+mod import;
 mod model;
 mod publish;
 mod search;

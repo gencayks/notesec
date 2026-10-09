@@ -10,6 +10,7 @@
 //! <graph>/.trash/<millis>/journals/YYYY_MM_DD.md
 //! <graph>/exports/<page file name>.html          (Export page to HTML)
 //! <graph>/published/<slug>/index.html, ...      (Publish page, see publish.rs)
+//! <graph>/assets/<file>                          (images, and imported attachments)
 //! ```
 //!
 //! The markdown files are the source of truth; nothing is cached elsewhere.
@@ -394,16 +395,13 @@ impl Storage {
     }
 
     fn path_for(&self, page: &Page) -> PathBuf {
-        if page.is_journal {
-            // Logseq names journal files with underscores.
-            self.root
-                .join("journals")
-                .join(format!("{}.md", page.title.replace('-', "_")))
-        } else {
-            self.root
-                .join("pages")
-                .join(format!("{}.md", filename_from_title(&page.title)))
-        }
+        page_file(&self.root, &page.title, page.is_journal)
+    }
+
+    /// Count page files written behind `Storage`'s back (an import), so
+    /// git auto-backup notices them.
+    pub fn note_external_change(&self) {
+        self.changed();
     }
 }
 
@@ -455,6 +453,18 @@ pub fn validate_title(title: &str) -> Result<String, String> {
         return Err("The name is too long".into());
     }
     Ok(title.to_string())
+}
+
+/// The file of the page titled `title` in the graph at `root`.
+pub fn page_file(root: &Path, title: &str, is_journal: bool) -> PathBuf {
+    if is_journal {
+        // Logseq names journal files with underscores.
+        root.join("journals")
+            .join(format!("{}.md", title.replace('-', "_")))
+    } else {
+        root.join("pages")
+            .join(format!("{}.md", filename_from_title(title)))
+    }
 }
 
 /// `/` can't appear in a filename; Logseq encodes it as `___`.

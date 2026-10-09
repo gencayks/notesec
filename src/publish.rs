@@ -75,7 +75,7 @@ here yourself are left alone.
 ";
 
 /// One `key:: value` property line: (key, value).
-fn property(line: &str) -> Option<(&str, &str)> {
+pub fn property(line: &str) -> Option<(&str, &str)> {
     let line = line.trim();
     let at = line.find("::")?;
     let key = &line[..at];

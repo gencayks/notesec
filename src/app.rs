@@ -44,6 +44,7 @@ use std::rc::Rc;
 use uuid::Uuid;
 
 mod embed_ui;
+mod import_ui;
 mod publish_ui;
 mod vim_ui;
 
@@ -99,6 +100,9 @@ actions!(
         ExportHtml,
         PublishPage,
         PublishPageWithLinks,
+        ImportObsidian,
+        ImportLogseq,
+        ImportNotion,
         ToggleGitBackup,
         SplitRight,
         ClosePane,
@@ -756,6 +760,8 @@ pub struct NoteSec {
     vim: crate::vim::Vim,
     /// The last publish (decision 49, `publish_ui`).
     publish: publish_ui::PublishState,
+    /// The import in progress (decision 50, `import_ui`).
+    import: import_ui::ImportState,
 }
 
 impl NoteSec {
@@ -902,6 +908,7 @@ impl NoteSec {
             _key_capture: key_capture,
             vim: Default::default(),
             publish: Default::default(),
+            import: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -7830,6 +7837,9 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_toggle_vim_mode))
             .on_action(cx.listener(Self::on_publish_page))
             .on_action(cx.listener(Self::on_publish_page_with_links))
+            .on_action(cx.listener(Self::on_import_obsidian))
+            .on_action(cx.listener(Self::on_import_logseq))
+            .on_action(cx.listener(Self::on_import_notion))
             .child(sidebar)
             .child(content)
             .children(status_toast)
@@ -7838,6 +7848,7 @@ impl Render for NoteSec {
             .children(settings_overlay)
             .children(page_menu_overlay)
             .children(shortcuts_overlay)
+            .children(self.render_import_dialog(cx))
             .children(trash_confirm_overlay)
     }
 }
@@ -15242,6 +15253,178 @@ mod tests {
             cx.dispatch_action(PublishPageWithLinks);
             assert!(!dir.join("published").exists());
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A small Obsidian vault outside the graph, for the import tests.
+    fn obsidian_vault(name: &str) -> PathBuf {
+        let vault =
+            std::env::temp_dir().join(format!("notesec-vault-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&vault);
+        std::fs::create_dir_all(vault.join("Sub")).unwrap();
+        std::fs::create_dir_all(vault.join(".obsidian")).unwrap();
+        std::fs::write(vault.join(".obsidian/app.json"), "{}").unwrap();
+        std::fs::write(
+            vault.join("Home.md"),
+            "---\ntags: [project, big idea]\n---\n# Home\nSee [[Other|the other one]] and ![[pic.png]].\n",
+        )
+        .unwrap();
+        std::fs::write(vault.join("Sub/Other.md"), "Back to [[Home]].\n").unwrap();
+        std::fs::write(vault.join("Sub/pic.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
+        vault
+    }
+
+    fn pick(cx: &mut VisualTestContext, folder: &std::path::Path) {
+        assert!(cx.did_prompt_for_paths());
+        let folder = folder.to_path_buf();
+        cx.simulate_path_prompt_response(move |options| {
+            assert!(options.directories && !options.files && !options.multiple);
+            Some(vec![folder])
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn import_from_obsidian_loads_pages_assets_and_a_log(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "import-obsidian", &[("Test", "- a\n")], "Test");
+        let vault = obsidian_vault("ui");
+        let offered = view.update(cx, |app, _| app.available_commands());
+        for command in [
+            Command::ImportObsidian,
+            Command::ImportLogseq,
+            Command::ImportNotion,
+        ] {
+            assert!(offered.contains(&command), "{command:?}");
+        }
+        run_in_palette(cx, "import from obsidian");
+        pick(cx, &vault);
+
+        assert!(!has(cx, "import-clash"));
+        let status = status_text(&view, cx).unwrap();
+        assert!(
+            status.starts_with("Imported 2 pages and 1 asset from Obsidian"),
+            "{status}"
+        );
+        let (log, home) = view.update(cx, |app, _| {
+            let log = app.current_page().unwrap();
+            let home = app
+                .pages
+                .iter()
+                .find(|p| p.title == "Home")
+                .unwrap()
+                .to_markdown();
+            (log, home)
+        });
+        assert!(log.starts_with("Import from Obsidian "), "{log}");
+        assert!(home.contains("tags:: #project, #[[big idea]]"), "{home}");
+        assert!(
+            home.contains(&format!("imported-from:: [[{log}]]")),
+            "{home}"
+        );
+        assert!(
+            home.contains("See [[Other]] and ![pic.png](../assets/pic.png)."),
+            "{home}"
+        );
+        assert!(view.update(cx, |app, _| app.find_page("Other").is_some()));
+        assert!(dir.join("assets/pic.png").exists());
+        assert!(dir.join("pages/Home.md").exists());
+        // Nothing from the hidden app folder.
+        assert!(view.update(cx, |app, _| app.find_page("app").is_none()));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[gpui::test]
+    fn import_asks_before_renaming_or_skipping_taken_names(cx: &mut TestAppContext) {
+        let pages = [("Test", "- a\n"), ("Home", "- mine\n")];
+        let (view, cx, dir) = setup_pages(cx, "import-clash", &pages, "Test");
+        let vault = obsidian_vault("clash");
+
+        // Cancel: nothing is written.
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        assert!(has(cx, "import-clash"));
+        click_on(cx, "import-clash-cancel");
+        assert!(!has(cx, "import-clash"));
+        assert!(status_text(&view, cx).unwrap().contains("cancelled"));
+        assert!(!dir.join("pages/Other.md").exists());
+        assert!(!dir.join("assets").join("pic.png").exists());
+
+        // Skip: Home stays mine, Other comes in and links to my Home.
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        click_on(cx, "import-clash-skip");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Home.md")).unwrap(),
+            "- mine\n"
+        );
+        let status = status_text(&view, cx).unwrap();
+        assert!(
+            status.contains("Imported 1 page") && status.contains("skipped 1"),
+            "{status}"
+        );
+        assert!(dir.join("pages/Other.md").exists());
+
+        // Rename: both are taken now, and get the suffix; links follow.
+        cx.dispatch_action(ImportObsidian);
+        pick(cx, &vault);
+        assert!(has(cx, "import-clash"));
+        click_on(cx, "import-clash-rename");
+        let status = status_text(&view, cx).unwrap();
+        assert!(
+            status.contains("Imported 2 pages") && status.contains("renamed 2"),
+            "{status}"
+        );
+        let renamed = view.update(cx, |app, _| {
+            app.pages
+                .iter()
+                .find(|p| p.title == "Other (imported)")
+                .map(|p| p.to_markdown())
+        });
+        assert!(renamed.unwrap().contains("Back to [[Home (imported)]]."));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pages/Home.md")).unwrap(),
+            "- mine\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[gpui::test]
+    fn import_refuses_the_graph_itself_and_a_cancelled_picker_does_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx, dir) = setup_pages(cx, "import-refuse", &[("Test", "- a\n")], "Test");
+        let before = view.update(cx, |app, _| app.pages.len());
+        cx.dispatch_action(ImportLogseq);
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert_eq!(view.update(cx, |app, _| app.pages.len()), before);
+
+        cx.dispatch_action(ImportLogseq);
+        pick(cx, &dir.join("pages"));
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(status.error, "{}", status.text);
+        assert!(
+            status.text.contains("outside this graph"),
+            "{}",
+            status.text
+        );
+
+        // A Notion zip: unzip first.
+        let zip = std::env::temp_dir().join(format!("notesec-export-{}.zip", std::process::id()));
+        std::fs::write(&zip, b"PK\x03\x04").unwrap();
+        cx.dispatch_action(ImportNotion);
+        pick(cx, &zip);
+        let status = view.update(cx, |app, _| app.status.clone()).unwrap();
+        assert!(
+            status.error && status.text.contains("unzip"),
+            "{}",
+            status.text
+        );
+        assert_eq!(view.update(cx, |app, _| app.pages.len()), before);
+        let _ = std::fs::remove_file(zip);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

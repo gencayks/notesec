@@ -116,6 +116,9 @@ commands! {
     CopyPageTitle => "Copy page title", ["clipboard", "name"], Page;
     ExportHtml => "Export page to HTML", ["export", "html", "save", "share", "web page"], Page;
     PublishPage => "Publish page", ["publish", "share", "website", "static site", "html", "host"], Page;
+    ImportObsidian => "Import from Obsidian\u{2026}", ["import", "obsidian", "vault", "markdown", "migrate"], Nothing;
+    ImportLogseq => "Import from Logseq\u{2026}", ["import", "logseq", "graph", "migrate"], Nothing;
+    ImportNotion => "Import from Notion\u{2026}", ["import", "notion", "export", "csv", "migrate"], Nothing;
     PublishPageWithLinks => "Publish page with linked pages", ["publish", "share", "website", "static site", "links"], Page;
     ToggleFavorite => "Toggle favorite", ["star", "unstar", "bookmark", "favourite"], Page;
     SortPagesAz => "Sort pages A-Z", ["alphabetical", "order"], Nothing;

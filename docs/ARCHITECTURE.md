@@ -25,6 +25,8 @@ vim.rs         — vim mode's pure state machine: modes, motions, operators, cou
 app/vim_ui.rs  — vim keys into the editor, block-level effects, mode pill, Settings row (a submodule of app.rs)
 publish.rs     — publish a page as a static site folder: render, privacy, slugs, bundle files (no GPUI)
 app/publish_ui.rs — the Publish commands and the status buttons (a submodule of app.rs)
+import/        — import Obsidian, Logseq and Notion exports: walk, convert, plan, apply; CSV reader (no GPUI)
+app/import_ui.rs — the Import commands, folder picker, name-clash dialog (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1517,6 +1519,118 @@ that mutate, and data races are essentially impossible.
     shown while that status is. `published/` is not backed up (decision
     39's `IGNORED`) and never loaded as pages (only `pages/` and
     `journals/` are).
+
+50. **Import: Obsidian vaults, Logseq graphs and Notion exports.**
+    "Import from Obsidian…", "Import from Logseq…" and "Import from
+    Notion…" (`ImportObsidian`, `ImportLogseq`, `ImportNotion`; no key,
+    any tab) ask for a folder (`App::prompt_for_paths`, directories
+    only) and bring its notes into this graph as pages, links kept.
+    *Split:* `import/` is pure (no GPUI) and tested on fixture trees in
+    temp folders: `walk.rs` (which files), `markdown.rs` (paragraphs →
+    blocks, frontmatter → properties, link rewriting), `csv.rs`, one
+    reader per source, and `mod.rs` with the two steps; `app/import_ui.rs`
+    is the commands and the dialog. *Two steps:* `import::plan` reads and
+    converts everything and finds the names already taken, writing
+    nothing; `import::apply` writes. Both run on a background thread
+    ("Reading <folder>…", "Importing N pages from X…"); a second import
+    while one runs is refused with a status. *Never overwrites:* when
+    imported titles are taken (pages or aliases, any case) a dialog asks:
+    **Rename with suffix** (the default button: "T (imported)", then
+    "T (imported 2)"; links among the imported pages follow the new
+    name; a taken journal day comes in as the page "2026-10-09
+    (imported)"), **Skip them** (links to them then reach the existing
+    page), or **Cancel** (nothing written). No dialog when nothing
+    clashes. A file that exists on disk anyway is skipped, never
+    replaced; pages are written atomically (`write_atomic`). *Titles:*
+    a note's file name, flat; a folder only shows when two notes share
+    a name ("Work/Plan" next to "Plan"; the nearest the root keeps the
+    plain name, as Obsidian resolves `[[Plan]]`). Titles are cleaned for
+    our files (no `___` or control characters, at most 150 bytes,
+    "Untitled" when empty) and made unique among the imported ones.
+    *Tags and aliases* go in the first block in the same form as the AI tag
+    suggestions (decision 44): `tags:: #x, #[[y z]]` and `alias:: A, B`,
+    so chips and the tag index see them; each page also gets
+    `imported-from:: [[Import from X <date time>]]` there. *Rollback
+    aid:* that log page lists every page imported, renamed and skipped
+    file with its reason, the number of assets copied and the links to
+    pages that don't exist; its "Linked from" lists the same pages. There
+    is no bulk undo: delete pages from the list (they go to the trash).
+    *Assets* are copied into `<graph>/assets/` (decision 28) under sanitised unique
+    names (`photo-2.png` beside an existing `photo.png`) and links are
+    rewritten to `../assets/<name>` (images as `![…]`, other files as
+    links); only attachments a note uses are copied, except Logseq, whose
+    whole `assets/` folder comes. *Safety:* hidden folders (`.obsidian`,
+    `.trash`, `.git`…), `logseq/`, `bak/`, `node_modules`,
+    `version-files`, `__MACOSX` are skipped; a symbolic link is followed
+    only when it points inside the chosen folder (each folder once);
+    notes over 5 MB, attachments over 50 MB and files that aren't UTF-8
+    are skipped with a reason; at most 50,000 files; the graph itself,
+    a folder inside it or one containing it are refused, as is a file
+    (a `.zip`: "unzip the export first": there is no zip reader among
+    our crates, and we add none). After loading, history is cleared
+    (as after a restore, decision 37) and git backup sees the change.
+    *Block ids are never duplicated:* `apply` collects the ids already
+    in the graph (the loaded pages' saved ids, plus every `id::` in the
+    files of `pages/`, `journals/` and `.trash/`, whose pages can be
+    restored). An imported block whose id is among them gets a fresh
+    uuid, and every `((old))` in the imported pages (also inside
+    `![[((old))]]`) is rewritten to it through a remap table kept for
+    this import only, so the import's own references reach its copy. The
+    graph's pages are not touched: their `((old))` still reach the
+    original. An id that appears twice within the import is kept by the
+    first block (references reach it) and the others get fresh ids. The
+    log page says how many blocks got new ids and how many ids were
+    remapped (importing the same Logseq graph twice with Rename: every
+    `id::` block of the second copy).
+
+    Obsidian (`import/obsidian.rs`):
+
+    | Obsidian | notesec |
+    |---|---|
+    | `Folder/Note.md` | page "Note" ("Folder/Note" on a duplicate name) |
+    | YAML frontmatter `tags`, `aliases`/`alias` | first block `tags:: #a, #[[b c]]`, `alias:: …` |
+    | other frontmatter keys | `key:: value` (lists joined with commas; `title` dropped) |
+    | `# Heading` + paragraphs | a heading block with the paragraphs as children (levels > 3 → `###`) |
+    | lists, `- [ ]` / `- [x]` | nested blocks, `TODO` / `DONE` |
+    | fenced code | one block |
+    | `[[Note]]`, `[[Note\|alias]]`, `[[Note#Heading]]` | `[[Note]]` (label and anchor dropped) |
+    | `![[Note]]` | `![[Note]]` (live embed, decision 47) |
+    | `![[pic.png]]`, `![[pic.png\|300]]`, `[x](file.pdf)` | copied to assets, `![pic.png](../assets/pic.png)` |
+    | `[x](Other%20Note.md)` | `[[Other Note]]` |
+    | `[[#Heading]]` | plain text |
+    | daily note `2026-10-09.md` | journal |
+
+    Logseq (`import/logseq.rs`): needs `pages/` or `journals/`.
+
+    | Logseq | notesec |
+    |---|---|
+    | `pages/a___b.md`, `a%2Fb.md` | page "a/b" |
+    | `journals/2026_10_09.md` (also `-`, `.`, none) | journal 2026-10-09 |
+    | `[[Oct 9th, 2026]]` (the `:journal/page-title-format` of `logseq/config.edn`, or common formats) | `[[2026-10-09]]` |
+    | `((uuid))`, `id:: uuid` | kept: the ids are saved (decision 24), references resolve |
+    | first block of properties | first block; `title::` renames, `tags::` → `#x, #[[y z]]` |
+    | `assets/` | copied (renamed on a clash, links follow) |
+    | whiteboards, `.org` pages | skipped, listed with the reason |
+
+    Notion (`import/notion.rs`): the unzipped "Markdown & CSV" export.
+
+    | Notion | notesec |
+    |---|---|
+    | `Page 0123…cdef.md` (` ` or `-` + 32 hex) | page "Page" (duplicates "Parent/Page") |
+    | `[x](Other%20Page%200123….md)`, `notion.so/…-<id>` | `[[Other Page]]` |
+    | `Page 0123…/image.png` | copied to assets |
+    | database `DB 0123….csv` (`_all.csv` preferred) | page "DB": a table, first column `[[row page]]` |
+    | database row page `Key: value` lines | properties (`Tags` → `tags:: #a, #b`), `# Title` dropped |
+
+    *Not done:* links that don't resolve become `[[name]]` (counted in
+    the summary and listed in the log); labelled links and heading
+    anchors are lost (`[[Page|alias]]` → `[[Page]]`: the app has no
+    labelled links); Obsidian `^block` references, callouts and Dataview
+    stay text; Notion relations and rollups stay text in the table;
+    journals whose
+    title format isn't in `config.edn` or the common ones are linked as
+    plain pages; a code line starting with `- ` inside a block can read
+    back as a bullet (the outline format's known limit).
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
