@@ -796,7 +796,7 @@ impl NoteSec {
                 .and_then(|n| whiteboard::COLORS.iter().find(|(c, _)| *c == n))
                 .map(|(_, rgb)| gpui::rgb(*rgb));
             let text_color = if fill.is_some() {
-                gpui::rgb(0x1f2328)
+                theme.ink
             } else {
                 theme.text
             };

@@ -1,7 +1,7 @@
 //! User settings, stored as `config.toml` in the graph folder.
 //!
 //! ```toml
-//! theme = "dark"          # or "light"
+
 //! font_size = 16.0
 //! font_family = "Inter"   # optional; omit to use the system UI font
 //! git_backup = false      # commit the graph folder to local git (decision 39)
@@ -29,9 +29,14 @@
 //! file can be shared or committed without leaking it.
 //!
 //! The file is read once at startup. The app rewrites it when you change the
-//! theme, font size or font family (in the settings panel, via shortcuts, or
-//! from the Ctrl-K palette), so hand edits to other keys survive only if they
-//! are valid ones we know about.
+//! font size or font family (in the settings panel, via shortcuts, or from the
+//! Ctrl-K palette), so hand edits to other keys survive only if they are valid
+//! ones we know about.
+//!
+//! The colour theme is **not** here: it is chosen in Settings and stored in
+//! `state.toml` (`state.rs`). An old `theme = "dark"` / `"light"` line in this
+//! file is still read once, to carry that choice over, and is dropped the next
+//! time the file is saved.
 
 use crate::ai::AiProvider;
 use crate::storage::write_atomic;
@@ -43,19 +48,43 @@ pub const MIN_FONT_SIZE: f32 = 10.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
 pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 
+/// The built-in colour themes. The chosen one is stored in `state.toml`
+/// (`state.rs`), by the names below.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ThemeKind {
     #[default]
-    Dark,
+    TokyoNight,
+    // Before themes were selectable there was one dark palette (Catppuccin
+    // Mocha) and `theme = "dark"` in `config.toml`; keep reading that.
+    #[serde(alias = "dark")]
+    CatppuccinMocha,
     Light,
 }
 
 impl ThemeKind {
+    /// Every theme, in the order the settings picker lists them.
+    pub const ALL: [ThemeKind; 3] = [
+        ThemeKind::TokyoNight,
+        ThemeKind::CatppuccinMocha,
+        ThemeKind::Light,
+    ];
+
+    /// The name shown in Settings.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeKind::TokyoNight => "Tokyo Night",
+            ThemeKind::CatppuccinMocha => "Catppuccin Mocha",
+            ThemeKind::Light => "Light",
+        }
+    }
+
+    /// What the "Toggle dark/light theme" command and Ctrl+Shift+T do: from
+    /// any dark theme to Light, and from Light back to the default dark one.
     pub fn toggled(self) -> Self {
         match self {
-            ThemeKind::Dark => ThemeKind::Light,
-            ThemeKind::Light => ThemeKind::Dark,
+            ThemeKind::Light => ThemeKind::TokyoNight,
+            ThemeKind::TokyoNight | ThemeKind::CatppuccinMocha => ThemeKind::Light,
         }
     }
 }
@@ -64,7 +93,12 @@ impl ThemeKind {
 // Any key missing from the file falls back to its default.
 #[serde(default)]
 pub struct Config {
-    pub theme: ThemeKind,
+    /// **Legacy, read-only.** The theme used to live here as `theme = "dark"`
+    /// or `"light"`. It is now chosen in Settings and stored in `state.toml`;
+    /// this is read once at startup so an existing choice carries over (see
+    /// `NoteSec::new`), and is never written back.
+    #[serde(rename = "theme", skip_serializing)]
+    pub legacy_theme: Option<ThemeKind>,
     pub font_size: f32,
     /// `None` means "use the system UI font".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,7 +156,7 @@ pub const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
 impl Default for Config {
     fn default() -> Self {
         Config {
-            theme: ThemeKind::default(),
+            legacy_theme: None,
             font_size: DEFAULT_FONT_SIZE,
             font_family: None,
             git_backup: false,
@@ -268,7 +302,8 @@ mod tests {
     fn round_trip() {
         let dir = temp_dir("roundtrip");
         let config = Config {
-            theme: ThemeKind::Light,
+            // Never written, so it must not survive a round trip.
+            legacy_theme: None,
             font_size: 20.0,
             font_family: Some("Inter".into()),
             git_backup: true,
@@ -319,11 +354,31 @@ mod tests {
     }
 
     #[test]
+    fn the_old_theme_key_is_read_but_never_written() {
+        let dir = temp_dir("legacy-theme");
+        // "dark" was the one dark palette, now called Catppuccin Mocha.
+        fs::write(Config::path(&dir), "theme = \"dark\"\nfont_size = 18.0\n").unwrap();
+        let config = Config::load(&dir);
+        assert_eq!(config.legacy_theme, Some(ThemeKind::CatppuccinMocha));
+        assert_eq!(config.font_size, 18.0);
+        // Saving for any other reason drops the key (the app has copied it to
+        // state.toml by then).
+        config.save(&dir).unwrap();
+        let text = fs::read_to_string(Config::path(&dir)).unwrap();
+        assert!(!text.contains("theme"), "unexpected theme key in:\n{text}");
+        assert_eq!(Config::load(&dir).legacy_theme, None);
+        // The new names work in the old place too.
+        fs::write(Config::path(&dir), "theme = \"tokyo-night\"\n").unwrap();
+        assert_eq!(Config::load(&dir).legacy_theme, Some(ThemeKind::TokyoNight));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn partial_files_fill_in_defaults() {
         let dir = temp_dir("partial");
         fs::write(Config::path(&dir), "theme = \"light\"\n").unwrap();
         let c = Config::load(&dir);
-        assert_eq!(c.theme, ThemeKind::Light);
+        assert_eq!(c.legacy_theme, Some(ThemeKind::Light));
         assert_eq!(c.font_size, DEFAULT_FONT_SIZE);
         assert!(!c.git_backup, "backup is off unless turned on");
         assert_eq!(c.ai_endpoint, crate::ai::DEFAULT_ENDPOINT);

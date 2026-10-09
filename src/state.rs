@@ -3,6 +3,7 @@
 //! as `state.toml` in the graph folder.
 //!
 //! ```toml
+//! theme = "tokyo-night"            # or "catppuccin-mocha", "light" (decision 56)
 //! favorites = ["Projects", "Reading list"]
 //! recent = ["2026-10-08", "Projects"]   # most recent first
 //! page_order = ["Projects", "Inbox"]    # absent: alphabetical
@@ -32,6 +33,7 @@
 //! a missing file gives an empty state, and an invalid file gives an empty
 //! state after being copied to `state.toml.bak`.
 
+use crate::config::ThemeKind;
 use crate::hotkeys::Overrides;
 use crate::storage::write_atomic;
 use serde::{Deserialize, Serialize};
@@ -83,6 +85,24 @@ pub struct UiState {
     /// sync or export of this file.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub clipper_token: String,
+    /// The colour theme chosen in Settings (`tokyo-night`, `catppuccin-mocha`
+    /// or `light`). `None` until one is chosen: the default theme then applies,
+    /// or the legacy `theme` key of `config.toml` (see `NoteSec::new`). An
+    /// unknown name reads as `None` rather than invalidating the whole file.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_theme"
+    )]
+    pub theme: Option<ThemeKind>,
+}
+
+/// A theme name, or `None` for anything unrecognised (a typo here must not
+/// cost the favorites, shortcuts and tokens in the same file).
+fn lenient_theme<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ThemeKind>, D::Error> {
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value.try_into().ok())
 }
 
 /// Which search a saved search re-runs.
@@ -188,6 +208,20 @@ impl UiState {
                 }
                 UiState::default()
             }
+        }
+    }
+
+    /// Carry over a theme chosen before themes moved here: `legacy` is the
+    /// `theme` key of `config.toml`. Only used when no theme has been chosen
+    /// since, so it can never override a newer choice. Returns whether this
+    /// changed anything (the caller then saves).
+    pub fn adopt_legacy_theme(&mut self, legacy: Option<ThemeKind>) -> bool {
+        match (self.theme, legacy) {
+            (None, Some(theme)) => {
+                self.theme = Some(theme);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -339,12 +373,79 @@ mod tests {
                 query: "meeting".into(),
             }],
             clipper_token: "0a1b2c".into(),
+            theme: Some(ThemeKind::CatppuccinMocha),
         };
         state.save(&dir).unwrap();
         assert_eq!(UiState::load(&dir), state);
         // No temp file left behind by the atomic write.
         assert!(!dir.join(".state.toml.tmp").exists());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn theme_names_round_trip_and_default_to_none() {
+        let dir = temp_dir("theme");
+        assert_eq!(UiState::load(&dir).theme, None, "no file: not chosen");
+        for (kind, name) in [
+            (ThemeKind::TokyoNight, "tokyo-night"),
+            (ThemeKind::CatppuccinMocha, "catppuccin-mocha"),
+            (ThemeKind::Light, "light"),
+        ] {
+            let state = UiState {
+                theme: Some(kind),
+                ..UiState::default()
+            };
+            state.save(&dir).unwrap();
+            let text = fs::read_to_string(UiState::path(&dir)).unwrap();
+            assert!(text.contains(&format!("theme = \"{name}\"")), "{text}");
+            assert_eq!(UiState::load(&dir).theme, Some(kind));
+        }
+        // Not chosen: the key is not written at all.
+        UiState::default().save(&dir).unwrap();
+        assert!(!fs::read_to_string(UiState::path(&dir))
+            .unwrap()
+            .contains("theme"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_bad_theme_costs_only_the_theme() {
+        let dir = temp_dir("bad-theme");
+        for bad in ["\"purple\"", "5", "[1, 2]", "\"\""] {
+            fs::write(
+                UiState::path(&dir),
+                format!("favorites = [\"A\"]\ntheme = {bad}\n"),
+            )
+            .unwrap();
+            let state = UiState::load(&dir);
+            assert_eq!(state.theme, None, "theme = {bad}");
+            assert_eq!(state.favorites, titles(&["A"]), "theme = {bad}");
+            assert!(
+                !dir.join("state.toml.bak").exists(),
+                "not treated as corrupt"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_theme_is_adopted_only_when_nothing_was_chosen() {
+        let mut state = UiState::default();
+        assert!(state.adopt_legacy_theme(Some(ThemeKind::Light)));
+        assert_eq!(state.theme, Some(ThemeKind::Light));
+
+        // A newer choice is never overridden by the old config value.
+        let mut chosen = UiState {
+            theme: Some(ThemeKind::TokyoNight),
+            ..UiState::default()
+        };
+        assert!(!chosen.adopt_legacy_theme(Some(ThemeKind::Light)));
+        assert_eq!(chosen.theme, Some(ThemeKind::TokyoNight));
+
+        // And no legacy value changes nothing.
+        let mut none = UiState::default();
+        assert!(!none.adopt_legacy_theme(None));
+        assert_eq!(none.theme, None);
     }
 
     #[test]

@@ -26,18 +26,47 @@ pub struct Theme {
     pub selection: Rgba,
     /// Destructive actions (Delete) and error messages.
     pub danger: Rgba,
+    /// The translucent layer that dims the app behind a modal (palette,
+    /// settings, dialogs). Heavier on light themes would look muddy, so each
+    /// theme picks its own strength.
+    pub scrim: Rgba,
+    /// Text drawn on the whiteboard's pastel card fills. Those fills are the
+    /// same in every theme (they are user data), so the text on them must be
+    /// dark in every theme too, unlike `text`.
+    pub ink: Rgba,
 }
 
 impl Theme {
     pub fn from_kind(kind: ThemeKind) -> Self {
         match kind {
-            ThemeKind::Dark => Self::dark(),
+            ThemeKind::TokyoNight => Self::tokyo_night(),
+            ThemeKind::CatppuccinMocha => Self::catppuccin_mocha(),
             ThemeKind::Light => Self::light(),
         }
     }
 
-    /// Catppuccin Mocha-inspired.
-    pub fn dark() -> Self {
+    /// Tokyo Night (the default). The background is the app icon's, so the
+    /// window and the launcher icon read as one thing.
+    pub fn tokyo_night() -> Self {
+        Theme {
+            bg: rgb(0x16161e),
+            sidebar_bg: rgb(0x101015),
+            text: rgb(0xc0caf5),
+            muted: rgb(0x7982a9),
+            accent: rgb(0x7aa2f7),
+            selected_bg: rgb(0x292e42),
+            border: rgb(0x292e42),
+            selection: rgba(0x7aa2f755),
+            danger: rgb(0xf7768e),
+            scrim: rgba(0x0a0a0f99),
+            ink: rgb(0x1f2328),
+        }
+    }
+
+    /// Catppuccin Mocha, the dark alternative. (This is the palette the app
+    /// shipped with before themes were selectable, so anyone who had "dark"
+    /// selected keeps exactly this look.)
+    pub fn catppuccin_mocha() -> Self {
         Theme {
             bg: rgb(0x1e1e2e),
             sidebar_bg: rgb(0x181825),
@@ -48,23 +77,25 @@ impl Theme {
             border: rgb(0x313244),
             selection: rgba(0x89b4fa55),
             danger: rgb(0xf38ba8),
+            scrim: rgba(0x00000073),
+            ink: rgb(0x1f2328),
         }
     }
-}
 
-impl Theme {
-    /// Catppuccin Latte-inspired.
+    /// A clean light theme: paper-white background, near-black text.
     pub fn light() -> Self {
         Theme {
-            bg: rgb(0xeff1f5),
-            sidebar_bg: rgb(0xe6e9ef),
-            text: rgb(0x4c4f69),
-            muted: rgb(0x7c7f93),
-            accent: rgb(0x1e66f5),
-            selected_bg: rgb(0xccd0da),
-            border: rgb(0xccd0da),
-            selection: rgba(0x1e66f540),
-            danger: rgb(0xd20f39),
+            bg: rgb(0xfbfaf7),
+            sidebar_bg: rgb(0xf1efe9),
+            text: rgb(0x24292f),
+            muted: rgb(0x6b727c),
+            accent: rgb(0x2f5fd0),
+            selected_bg: rgb(0xe5e2d9),
+            border: rgb(0xdad6ca),
+            selection: rgba(0x2f5fd038),
+            danger: rgb(0xc62a3c),
+            scrim: rgba(0x2b2b3340),
+            ink: rgb(0x1f2328),
         }
     }
 }
@@ -278,4 +309,120 @@ pub fn favorite_star(theme: &Theme, filled: bool) -> Div {
         .text_color(if filled { theme.accent } else { theme.muted })
         .hover(|d| d.text_color(theme.accent))
         .child(if filled { "★" } else { "☆" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG relative luminance of a colour.
+    fn luminance(c: Rgba) -> f32 {
+        let lin = |v: f32| {
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+    }
+
+    /// WCAG contrast ratio between two colours (1 to 21).
+    fn contrast(a: Rgba, b: Rgba) -> f32 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn from_kind_picks_each_palette() {
+        assert_eq!(
+            Theme::from_kind(ThemeKind::TokyoNight).bg,
+            Theme::tokyo_night().bg
+        );
+        assert_eq!(
+            Theme::from_kind(ThemeKind::CatppuccinMocha).bg,
+            Theme::catppuccin_mocha().bg
+        );
+        assert_eq!(Theme::from_kind(ThemeKind::Light).bg, Theme::light().bg);
+    }
+
+    #[test]
+    fn tokyo_night_uses_the_icon_background_and_the_specified_accent() {
+        let t = Theme::tokyo_night();
+        assert_eq!(t.bg, rgb(0x16161e), "matches assets/notesec.svg");
+        assert_eq!(t.accent, rgb(0x7aa2f7));
+    }
+
+    #[test]
+    fn catppuccin_mocha_is_the_palette_the_old_dark_theme_used() {
+        let t = Theme::catppuccin_mocha();
+        assert_eq!(
+            (t.bg, t.text, t.accent),
+            (rgb(0x1e1e2e), rgb(0xcdd6f4), rgb(0x89b4fa))
+        );
+    }
+
+    #[test]
+    fn the_light_theme_is_paper_white_with_dark_text() {
+        let t = Theme::light();
+        assert!(luminance(t.bg) > 0.9, "paper-white background");
+        assert!(luminance(t.text) < 0.05, "dark text");
+        // And the dark themes are the other way round.
+        for dark in [Theme::tokyo_night(), Theme::catppuccin_mocha()] {
+            assert!(luminance(dark.bg) < 0.05 && luminance(dark.text) > 0.5);
+        }
+    }
+
+    #[test]
+    fn every_theme_is_readable() {
+        for kind in ThemeKind::ALL {
+            let t = Theme::from_kind(kind);
+            let name = kind.label();
+            // Body text: WCAG AAA.
+            assert!(contrast(t.text, t.bg) >= 7.0, "{name}: text on bg");
+            assert!(
+                contrast(t.text, t.sidebar_bg) >= 7.0,
+                "{name}: text on sidebar"
+            );
+            assert!(
+                contrast(t.text, t.selected_bg) >= 5.0,
+                "{name}: text on selection row"
+            );
+            // Secondary text, links and tags (accent), errors.
+            assert!(contrast(t.muted, t.bg) >= 4.0, "{name}: muted on bg");
+            assert!(contrast(t.accent, t.bg) >= 4.5, "{name}: accent on bg");
+            assert!(
+                contrast(t.accent, t.selected_bg) >= 3.5,
+                "{name}: accent on selected row"
+            );
+            assert!(contrast(t.danger, t.bg) >= 3.5, "{name}: danger on bg");
+            // The whiteboard's pastel cards use dark ink in every theme.
+            assert!(
+                contrast(t.ink, rgb(0xffd966)) >= 7.0,
+                "{name}: ink on a yellow card"
+            );
+            // The scrim must actually dim: translucent, not fully clear or opaque.
+            assert!(
+                t.scrim.a > 0.1 && t.scrim.a < 0.9,
+                "{name}: scrim alpha {}",
+                t.scrim.a
+            );
+        }
+    }
+
+    #[test]
+    fn the_themes_are_all_different() {
+        let bgs: Vec<_> = ThemeKind::ALL
+            .iter()
+            .map(|k| Theme::from_kind(*k).bg)
+            .collect();
+        assert!(bgs[0] != bgs[1] && bgs[1] != bgs[2] && bgs[0] != bgs[2]);
+    }
+
+    #[test]
+    fn toggling_goes_between_light_and_the_default_dark() {
+        assert_eq!(ThemeKind::TokyoNight.toggled(), ThemeKind::Light);
+        assert_eq!(ThemeKind::CatppuccinMocha.toggled(), ThemeKind::Light);
+        assert_eq!(ThemeKind::Light.toggled(), ThemeKind::TokyoNight);
+    }
 }

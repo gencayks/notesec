@@ -370,7 +370,7 @@ impl NoteSec {
             .absolute()
             .inset_0()
             .occlude()
-            .bg(gpui::black().opacity(0.45))
+            .bg(theme.scrim)
             .flex()
             .flex_col()
             .items_center()

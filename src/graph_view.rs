@@ -913,7 +913,7 @@ mod tests {
     }
 
     fn new_view(current: &str) -> GraphView {
-        let mut v = GraphView::new(pages(), current.into(), Theme::dark(), 16.0, true);
+        let mut v = GraphView::new(pages(), current.into(), Theme::tokyo_night(), 16.0, true);
         let _ = v.prepare(800.0, 600.0); // fits the camera
         v
     }
@@ -1106,7 +1106,8 @@ mod tests {
         // Normal (animated) mode: a rebuild starts from the old positions and
         // animates from there. (With reduce-motion on, the layout re-settles
         // instantly instead, so positions legitimately shift a little.)
-        let view = cx.new(|_| GraphView::new(pages(), "Hub".into(), Theme::dark(), 16.0, false));
+        let view =
+            cx.new(|_| GraphView::new(pages(), "Hub".into(), Theme::tokyo_night(), 16.0, false));
         view.update(cx, |v, cx| {
             let hub_before = {
                 let n = &v.graph.nodes[v.graph.index_of("Hub").unwrap()];
@@ -1171,7 +1172,7 @@ mod tests {
 
     #[test]
     fn camera_settles_and_animation_stops() {
-        let mut v = GraphView::new(pages(), "Hub".into(), Theme::dark(), 16.0, false);
+        let mut v = GraphView::new(pages(), "Hub".into(), Theme::tokyo_night(), 16.0, false);
         let mut frames = 0;
         loop {
             let (_, animating) = v.prepare(800.0, 600.0);
@@ -1313,10 +1314,10 @@ mod tests {
         });
 
         for (name, theme, hover, zoom) in [
-            ("dark", Theme::dark(), None, None),
+            ("dark", Theme::tokyo_night(), None, None),
             ("light", Theme::light(), None, None),
-            ("hover", Theme::dark(), Some("Projects"), None),
-            ("zoomed", Theme::dark(), None, Some(1.3f32)),
+            ("hover", Theme::tokyo_night(), Some("Projects"), None),
+            ("zoomed", Theme::tokyo_night(), None, Some(1.3f32)),
         ] {
             let current = "notesec".to_string();
             let window = cx

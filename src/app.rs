@@ -864,7 +864,15 @@ impl NoteSec {
             pages.push(welcome);
         }
 
-        let state = UiState::load(storage.root());
+        let mut state = UiState::load(storage.root());
+        // A theme chosen before themes moved to `state.toml` (as `theme = ...`
+        // in `config.toml`) carries over once; config saves then drop that key.
+        if state.adopt_legacy_theme(config.legacy_theme) {
+            if let Err(err) = state.save(storage.root()) {
+                eprintln!("notesec: failed to save state: {err}");
+            }
+        }
+        let theme = Theme::from_kind(state.theme.unwrap_or_default());
         sort_pages(&mut pages, &state.page_order);
         // Open on today's journal.
         let selected = pages
@@ -917,7 +925,7 @@ impl NoteSec {
             storage,
             pages,
             selected,
-            theme: Theme::from_kind(config.theme),
+            theme,
             config,
             state,
             font_family,
@@ -1099,20 +1107,26 @@ impl NoteSec {
         cx.notify();
     }
 
-    /// Switch to theme `kind`, apply it right away and save it.
+    /// The theme in use (the default until one is chosen).
+    fn theme_kind(&self) -> ThemeKind {
+        self.state.theme.unwrap_or_default()
+    }
+
+    /// Switch to theme `kind`, apply it right away and save it to
+    /// `state.toml`.
     fn set_theme(&mut self, kind: ThemeKind, cx: &mut Context<Self>) {
-        if self.config.theme == kind {
+        if self.theme_kind() == kind {
             return;
         }
-        self.config.theme = kind;
+        self.state.theme = Some(kind);
         self.theme = Theme::from_kind(kind);
-        self.save_config();
+        self.save_state();
         self.sync_graph_style(cx);
         cx.notify();
     }
 
     fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        self.set_theme(self.config.theme.toggled(), cx);
+        self.set_theme(self.theme_kind().toggled(), cx);
     }
 
     /// Use font `family` (`None`: the system UI font), apply it right away
@@ -4952,25 +4966,57 @@ impl NoteSec {
         };
         let label = |text: &'static str| div().text_color(theme.muted).child(text);
 
+        // One button per built-in theme, each with a swatch drawn in that
+        // theme's own colours (background, accent dot, text dot).
+        let current_theme = self.theme_kind();
         let theme_row = div()
             .flex()
             .flex_row()
+            // Wrap: three buttons don't fit the panel's width side by side.
+            .flex_wrap()
             .gap_2()
-            .child(
-                button("theme-dark", "Dark".into(), config.theme == ThemeKind::Dark).on_click(
-                    cx.listener(|this, _e, _window, cx| this.set_theme(ThemeKind::Dark, cx)),
-                ),
-            )
-            .child(
-                button(
-                    "theme-light",
-                    "Light".into(),
-                    config.theme == ThemeKind::Light,
-                )
-                .on_click(
-                    cx.listener(|this, _e, _window, cx| this.set_theme(ThemeKind::Light, cx)),
-                ),
-            );
+            .children(ThemeKind::ALL.map(|kind| {
+                let preview = Theme::from_kind(kind);
+                let active = current_theme == kind;
+                let id = match kind {
+                    ThemeKind::TokyoNight => "theme-tokyo-night",
+                    ThemeKind::CatppuccinMocha => "theme-catppuccin-mocha",
+                    ThemeKind::Light => "theme-light",
+                };
+                let swatch = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .w(px(30.0))
+                    .h(px(16.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(preview.border)
+                    .bg(preview.bg)
+                    .child(div().size(px(6.0)).rounded_full().bg(preview.accent))
+                    .child(div().size(px(6.0)).rounded_full().bg(preview.text));
+                div()
+                    .id(id)
+                    .debug_selector(move || id.to_string())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if active { theme.accent } else { theme.border })
+                    .cursor_pointer()
+                    .text_color(if active { theme.accent } else { theme.text })
+                    .when(active, |d| d.bg(theme.selected_bg))
+                    .hover(|d| d.bg(theme.selected_bg))
+                    .child(swatch)
+                    .child(kind.label())
+                    .on_click(cx.listener(move |this, _e, _window, cx| this.set_theme(kind, cx)))
+            }));
 
         // The − / + buttons are dimmed at the limits (clicking them then
         // does nothing, as `adjust_font_size` clamps).
@@ -5201,7 +5247,7 @@ impl NoteSec {
             .absolute()
             .inset_0()
             .occlude()
-            .bg(gpui::black().opacity(0.45))
+            .bg(theme.scrim)
             .flex()
             .flex_col()
             .items_center()
@@ -5566,7 +5612,7 @@ impl NoteSec {
             .absolute()
             .inset_0()
             .occlude()
-            .bg(gpui::black().opacity(0.45))
+            .bg(theme.scrim)
             .flex()
             .flex_col()
             .items_center()
@@ -5869,7 +5915,7 @@ impl NoteSec {
             .absolute()
             .inset_0()
             .occlude()
-            .bg(gpui::black().opacity(0.45))
+            .bg(theme.scrim)
             .flex()
             .flex_col()
             .items_center()
@@ -7601,7 +7647,7 @@ impl Render for NoteSec {
                 .absolute()
                 .inset_0()
                 .occlude()
-                .bg(gpui::black().opacity(0.45))
+                .bg(theme.scrim)
                 .flex()
                 .flex_col()
                 .items_center()
@@ -8853,22 +8899,26 @@ mod tests {
     fn theme_shortcut_toggles_and_persists(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup(cx, "theme-key", "- hi\n");
         let dark = view.update(cx, |app, _| app.theme.bg);
-        assert_eq!(view.update(cx, |app, _| app.config.theme), ThemeKind::Dark);
+        assert_eq!(
+            view.update(cx, |app, _| app.theme_kind()),
+            ThemeKind::TokyoNight,
+            "Tokyo Night is the default"
+        );
 
         cx.simulate_keystrokes("ctrl-shift-t");
         view.update(cx, |app, _| {
-            assert_eq!(app.config.theme, ThemeKind::Light);
+            assert_eq!(app.theme_kind(), ThemeKind::Light);
             assert_ne!(app.theme.bg, dark, "colours actually changed");
         });
         assert_eq!(
-            saved_config(&dir).theme,
-            ThemeKind::Light,
-            "written to config.toml"
+            UiState::load(&dir).theme,
+            Some(ThemeKind::Light),
+            "written to state.toml"
         );
 
         cx.simulate_keystrokes("ctrl-shift-t");
         view.update(cx, |app, _| assert_eq!(app.theme.bg, dark));
-        assert_eq!(saved_config(&dir).theme, ThemeKind::Dark);
+        assert_eq!(UiState::load(&dir).theme, Some(ThemeKind::TokyoNight));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -8920,9 +8970,9 @@ mod tests {
                 app.search.is_none(),
                 "palette closes after running a command"
             );
-            assert_eq!(app.config.theme, ThemeKind::Light);
+            assert_eq!(app.theme_kind(), ThemeKind::Light);
         });
-        assert_eq!(saved_config(&dir).theme, ThemeKind::Light);
+        assert_eq!(UiState::load(&dir).theme, Some(ThemeKind::Light));
 
         cx.simulate_keystrokes("ctrl-k");
         cx.simulate_input("increase font");
@@ -8951,7 +9001,8 @@ mod tests {
             );
         });
         // Changing another setting rewrites the file; the user's font name stays.
-        cx.simulate_keystrokes("ctrl-shift-t");
+        // (A font-size change: themes live in state.toml and don't touch it.)
+        cx.simulate_keystrokes("ctrl-=");
         assert_eq!(
             saved_config(&dir).font_family.as_deref(),
             Some("Definitely Not A Font 12345")
@@ -10808,6 +10859,10 @@ mod tests {
         std::fs::read_to_string(Config::path(dir)).unwrap()
     }
 
+    fn state_text(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(UiState::path(dir)).unwrap()
+    }
+
     #[gpui::test]
     fn gear_and_ctrl_comma_open_settings_and_escape_closes_them(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup(cx, "settings-open", "- hello\n");
@@ -10887,16 +10942,28 @@ mod tests {
 
         click_on(cx, "theme-light");
         view.update(cx, |app, _| {
-            assert_eq!(app.config.theme, ThemeKind::Light);
+            assert_eq!(app.theme_kind(), ThemeKind::Light);
             assert_eq!(app.theme.bg, Theme::light().bg);
         });
-        assert_eq!(saved_config(&dir).theme, ThemeKind::Light);
-        assert!(config_text(&dir).contains("theme = \"light\""));
+        assert_eq!(UiState::load(&dir).theme, Some(ThemeKind::Light));
+        assert!(state_text(&dir).contains("theme = \"light\""));
+        assert!(
+            !Config::path(&dir).exists(),
+            "choosing a theme does not write config.toml"
+        );
         assert!(settings_open(&view, cx), "the panel stays open");
 
-        click_on(cx, "theme-dark");
-        view.update(cx, |app, _| assert_eq!(app.theme.bg, Theme::dark().bg));
-        assert_eq!(saved_config(&dir).theme, ThemeKind::Dark);
+        click_on(cx, "theme-catppuccin-mocha");
+        view.update(cx, |app, _| {
+            assert_eq!(app.theme.bg, Theme::catppuccin_mocha().bg)
+        });
+        assert_eq!(UiState::load(&dir).theme, Some(ThemeKind::CatppuccinMocha));
+
+        click_on(cx, "theme-tokyo-night");
+        view.update(cx, |app, _| {
+            assert_eq!(app.theme.bg, Theme::tokyo_night().bg)
+        });
+        assert_eq!(UiState::load(&dir).theme, Some(ThemeKind::TokyoNight));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10993,7 +11060,7 @@ mod tests {
             .cx
             .add_window_view(|window, cx| NoteSec::new(storage, config, window, cx));
         view2.update(cx2, |app, _| {
-            assert_eq!(app.config.theme, ThemeKind::Light);
+            assert_eq!(app.theme_kind(), ThemeKind::Light);
             assert_eq!(app.theme.bg, Theme::light().bg);
             assert_eq!(app.config.font_size, 20.0);
             assert_eq!(app.config.font_family.as_deref(), Some("Test Serif"));
@@ -11700,12 +11767,287 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Renders the real app with each theme (notes view and Settings) to
+    /// PNGs in `target/shots/`, to check the look by eye. Not a regression
+    /// test: `cargo test --offline render_theme_screenshots -- --ignored`.
+    #[test]
+    #[ignore]
+    fn render_theme_screenshots() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        use std::sync::Arc;
+
+        std::fs::create_dir_all("target/shots").unwrap();
+        let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new("DejaVu Sans"));
+        let mut hcx = HeadlessAppContext::with_platform(text_system, Arc::new(()), || {
+            gpui_platform::current_headless_renderer()
+        });
+
+        for kind in ThemeKind::ALL {
+            let name = format!("{kind:?}").to_lowercase();
+            let dir =
+                std::env::temp_dir().join(format!("notesec-shot-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let storage = Storage::open(dir.clone()).unwrap();
+            let journal = format!("journals/{}.md", today_title().replace('-', "_"));
+            std::fs::write(
+                dir.join(journal),
+                "- # Design pass\n\
+                 - Trying the new **themes**: see [[Projects]] and #design\n\
+                 \x20 - A nested note with `inline code` and a [[Reading list]] link\n\
+                 \x20 - TODO check contrast on #light\n\
+                 \x20 - DONE ship the settings picker\n\
+                 - Plain text, to compare against *italic* and the muted colours\n",
+            )
+            .unwrap();
+            for page in ["Projects", "Reading list", "Ideas", "People"] {
+                std::fs::write(
+                    dir.join(format!("pages/{page}.md")),
+                    "- notes about [[Design pass]]\n",
+                )
+                .unwrap();
+            }
+            UiState {
+                theme: Some(kind),
+                favorites: vec!["Projects".into()],
+                ..UiState::default()
+            }
+            .save(&dir)
+            .unwrap();
+            let config = Config::load(&dir);
+
+            let window = hcx
+                .open_window(size(px(1200.), px(760.)), |window, cx| {
+                    cx.new(|cx| NoteSec::new(storage, config, window, cx))
+                })
+                .unwrap();
+            let view = window.root(&mut hcx).unwrap();
+            for (shot, settings) in [("notes", false), ("settings", true)] {
+                if settings {
+                    hcx.update(|cx| view.update(cx, |app, cx| app.open_settings(cx)));
+                }
+                hcx.update_window(window.into(), |_, window, cx| {
+                    let _ = window.draw(cx);
+                })
+                .unwrap();
+                let image = hcx.capture_screenshot(window.into()).expect("screenshot");
+                image
+                    .save(format!("target/shots/{shot}-{name}.png"))
+                    .unwrap();
+                println!("wrote target/shots/{shot}-{name}.png");
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[gpui::test]
+    fn the_default_theme_is_tokyo_night_and_nothing_is_saved_until_chosen(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "theme-default", "- hi\n");
+        view.update(cx, |app, _| {
+            assert_eq!(app.theme_kind(), ThemeKind::TokyoNight);
+            assert_eq!(app.theme.bg, gpui::rgb(0x16161e));
+            assert_eq!(app.theme.accent, gpui::rgb(0x7aa2f7));
+        });
+        assert_eq!(
+            UiState::load(&dir).theme,
+            None,
+            "not chosen, so not written"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn settings_lists_the_three_themes_and_marks_the_current_one(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "theme-picker", "- hi\n");
+        click_on(cx, "settings-gear");
+        for id in ["theme-tokyo-night", "theme-catppuccin-mocha", "theme-light"] {
+            assert!(has(cx, id), "Settings has a {id} button");
+        }
+        // Clicking a button moves to that theme and the choice sticks.
+        click_on(cx, "theme-catppuccin-mocha");
+        view.update(cx, |app, _| {
+            assert_eq!(app.theme_kind(), ThemeKind::CatppuccinMocha)
+        });
+        click_on(cx, "theme-light");
+        view.update(cx, |app, _| assert_eq!(app.theme_kind(), ThemeKind::Light));
+        // Clicking the one already in use changes nothing (and writes nothing new).
+        let before = state_text(&dir);
+        click_on(cx, "theme-light");
+        assert_eq!(state_text(&dir), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Start a second app over the same graph folder, as a restart would.
+    fn restart<'a>(
+        cx: &'a mut VisualTestContext,
+        dir: &std::path::Path,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext) {
+        let storage = Storage::open(dir.to_path_buf()).unwrap();
+        let config = Config::load(dir);
+        cx.cx
+            .add_window_view(|window, cx| NoteSec::new(storage, config, window, cx))
+    }
+
+    #[gpui::test]
+    fn a_chosen_theme_survives_a_restart(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(cx, "theme-restart", "- hi\n");
+        click_on(cx, "settings-gear");
+        click_on(cx, "theme-catppuccin-mocha");
+
+        let (view2, cx2) = restart(cx, &dir);
+        view2.update(cx2, |app, _| {
+            assert_eq!(app.theme_kind(), ThemeKind::CatppuccinMocha);
+            assert_eq!(app.theme.bg, Theme::catppuccin_mocha().bg);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A graph folder whose `config.toml` still has the old `theme` key.
+    fn legacy_graph(name: &str, config_toml: &str, state_toml: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("notesec-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Storage::open(dir.clone()).unwrap();
+        std::fs::write(Config::path(&dir), config_toml).unwrap();
+        if let Some(state) = state_toml {
+            std::fs::write(UiState::path(&dir), state).unwrap();
+        }
+        dir
+    }
+
+    #[gpui::test]
+    fn an_old_config_theme_carries_over_to_state_toml(cx: &mut TestAppContext) {
+        // "dark" was the one dark palette, now Catppuccin Mocha: same look.
+        let dir = legacy_graph(
+            "theme-legacy-dark",
+            "theme = \"dark\"\nfont_size = 18.0\n",
+            None,
+        );
+        let storage = Storage::open(dir.clone()).unwrap();
+        let config = Config::load(&dir);
+        let (view, cx) = cx.add_window_view(|w, cx| NoteSec::new(storage, config, w, cx));
+        view.update(cx, |app, _| {
+            assert_eq!(app.theme_kind(), ThemeKind::CatppuccinMocha);
+            assert_eq!(
+                app.theme.bg,
+                Theme::catppuccin_mocha().bg,
+                "same look as before"
+            );
+        });
+        assert_eq!(
+            UiState::load(&dir).theme,
+            Some(ThemeKind::CatppuccinMocha),
+            "migrated"
+        );
+
+        // The next config save (any setting) drops the old key; nothing is lost.
+        cx.simulate_keystrokes("ctrl-=");
+        assert!(
+            !config_text(&dir).contains("theme"),
+            "{}",
+            config_text(&dir)
+        );
+        assert!(config_text(&dir).contains("font_size = 19"));
+        let (view2, cx2) = restart(cx, &dir);
+        view2.update(cx2, |app, _| {
+            assert_eq!(app.theme_kind(), ThemeKind::CatppuccinMocha)
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn an_old_light_theme_stays_light(cx: &mut TestAppContext) {
+        let dir = legacy_graph("theme-legacy-light", "theme = \"light\"\n", None);
+        let storage = Storage::open(dir.clone()).unwrap();
+        let config = Config::load(&dir);
+        let (view, cx) = cx.add_window_view(|w, cx| NoteSec::new(storage, config, w, cx));
+        view.update(cx, |app, _| assert_eq!(app.theme_kind(), ThemeKind::Light));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_newer_choice_beats_the_old_config_value(cx: &mut TestAppContext) {
+        let dir = legacy_graph(
+            "theme-legacy-loses",
+            "theme = \"light\"\n",
+            Some("theme = \"tokyo-night\"\n"),
+        );
+        let storage = Storage::open(dir.clone()).unwrap();
+        let config = Config::load(&dir);
+        let (view, cx) = cx.add_window_view(|w, cx| NoteSec::new(storage, config, w, cx));
+        view.update(cx, |app, _| {
+            assert_eq!(app.theme_kind(), ThemeKind::TokyoNight)
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_graph_and_modal_scrims_follow_the_theme(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "theme-scrim", &graph_pages(), "Test");
+        let (graph, _) = open_graph(&view, cx);
+        for kind in ThemeKind::ALL {
+            view.update(cx, |app, cx| app.set_theme(kind, cx));
+            cx.run_until_parked();
+            assert_eq!(
+                graph.update(cx, |g, _| g.theme_bg()),
+                Theme::from_kind(kind).bg,
+                "the open graph recolours with {kind:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The spec: UI colours all come from `Theme`. This scans the UI sources
+    /// (not their tests) for colour literals so one can't sneak back in.
+    #[test]
+    fn ui_sources_contain_no_hardcoded_colours() {
+        const FORBIDDEN: [&str; 9] = [
+            "rgb(0x",
+            "rgba(0x",
+            "hsla(",
+            "opaque_grey(",
+            "gpui::black()",
+            "gpui::white()",
+            "gpui::red()",
+            "gpui::green()",
+            "gpui::blue()",
+        ];
+        fn collect(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(path).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    collect(&p, files);
+                } else if p.extension().is_some_and(|e| e == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![src.join("app.rs"), src.join("graph_view.rs")];
+        collect(&src.join("app"), &mut files);
+        assert!(files.len() > 10, "found the UI sources");
+
+        let mut hits = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            // Test code (after the first `#[cfg(test)]`) may use any colour.
+            let code = text.split("#[cfg(test)]").next().unwrap();
+            for (n, line) in code.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if let Some(bad) = FORBIDDEN.iter().find(|f| line.contains(**f)) {
+                    hits.push(format!("{}:{}: {bad}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(hits.is_empty(), "hardcoded colours:\n{}", hits.join("\n"));
+    }
+
     #[gpui::test]
     fn copy_button_works_in_the_light_theme(cx: &mut TestAppContext) {
         let (view, cx, dir) = setup(cx, "code-copy-light", CODE_PAGE);
         view.update(cx, |app, cx| app.set_theme(ThemeKind::Light, cx));
         cx.run_until_parked();
-        view.update(cx, |app, _| assert_eq!(app.config.theme, ThemeKind::Light));
+        view.update(cx, |app, _| assert_eq!(app.theme_kind(), ThemeKind::Light));
         copy_first_code_block(&view, cx);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -14342,11 +14684,11 @@ mod tests {
         assert_eq!(mode_of(&view, cx), Mode::Notes);
 
         // Capturing a command's own key: nothing runs, no override.
-        let theme = view.update(cx, |app, _| app.config.theme);
+        let theme = view.update(cx, |app, _| app.theme_kind());
         open_hotkeys(&view, cx);
         click_hotkey(&view, cx, Command::ToggleTheme);
         cx.simulate_keystrokes("ctrl-shift-t");
-        assert_eq!(view.update(cx, |app, _| app.config.theme), theme);
+        assert_eq!(view.update(cx, |app, _| app.theme_kind()), theme);
         assert_eq!(capturing(&view, cx), None);
         assert!(!has(cx, "hotkey-modified-ToggleTheme"));
         assert_eq!(

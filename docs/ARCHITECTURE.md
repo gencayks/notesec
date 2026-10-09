@@ -38,7 +38,7 @@ app/vault_ui.rs — the vault commands, masked passphrase dialog, pickers (a sub
 plugins/       — WASM plugins: manifests, wasmi sandbox (fuel, memory cap), TOML in/out (no GPUI)
 app/plugins_ui.rs — Settings > Plugins, palette entries, applying actions, render-hook boxes (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
-config.rs      — config.toml: theme, font size/family
+config.rs      — config.toml: font size/family and the other settings (the theme moved to state.toml, decision 56)
 ```
 
 **The key design rule:** `model`, `storage`, `editor`, `display`, `search` know *nothing* about
@@ -337,17 +337,20 @@ too, and "nothing is focused" is a real bug class.
   ```rust
   pub struct Theme { pub bg: Rgba, pub text: Rgba, pub accent: Rgba, ... }
   ```
-  Every colour in the app comes from here. Dark/light switching = constructing
-  a different `Theme`. If colours were scattered as literals across `app.rs`,
-  theming would be a rewrite; here it's a struct swap.
+  Every colour in the app comes from here. Switching theme = constructing a
+  different `Theme` (`Theme::from_kind`; three are built in, decision 56). If
+  colours were scattered as literals across `app.rs`, theming would be a
+  rewrite; here it's a struct swap. A test (`ui_sources_contain_no_hardcoded_colours`)
+  fails the build if a colour literal appears in the UI sources.
 
 - **`config.rs` — settings as data.**
   ```rust
   #[derive(Serialize, Deserialize)]
-  pub struct Config { pub theme: ThemeKind, pub font_size: f32, ... }
+  pub struct Config { pub font_size: f32, pub font_family: Option<String>, ... }
   ```
   `serde`'s derive macros auto-generate TOML conversion — no hand-written
-  parsing. `#[serde(rename_all = "lowercase")]` maps `Dark` to `"dark"`.
+  parsing. `#[serde(rename_all = "kebab-case")]` maps `ThemeKind::TokyoNight`
+  to `"tokyo-night"`.
   Missing keys fall back to defaults, so old config files never break.
 
 - **`state.rs` — UI state, not settings.** Favorite and recent page titles
@@ -2251,6 +2254,39 @@ that mutate, and data races are essentially impossible.
     *Limits:* no plugin state between calls; one command at a time;
     render hooks on the UI thread; log lines only on stderr; no access
     to other blocks than the current one.
+
+56. **Three built-in themes; the choice lives in `state.toml`.** `ThemeKind`
+    is `TokyoNight` (the default), `CatppuccinMocha` or `Light`, and
+    `Theme::from_kind` turns it into the palette. Tokyo Night's background
+    is `#16161e`, the same as `assets/notesec.svg`, so the window and its
+    launcher icon match; its accent is `#7aa2f7`. Catppuccin Mocha is the
+    palette the app used when it had a single dark theme, so nobody's look
+    changes. Light is paper-white (`#fbfaf7`) with near-black text. Besides
+    the colours that were already there, `Theme` gained `scrim` (the layer
+    that dims the app behind a modal; each theme picks its own strength,
+    gentler on light) and `ink` (dark text for the whiteboard's pastel
+    cards, whose fills are the same in every theme because they are user
+    data). That removed the last colour literals from `src/app/`; a test
+    scans the UI sources (not their tests) so none comes back, and
+    another checks every palette for readable contrast (WCAG: body text
+    7:1, secondary text 4:1, links and tags 4.5:1).
+    *Where it is stored:* `theme = "tokyo-night"` in `state.toml`, **not**
+    `config.toml` (decision 21 kept *settings* there; this follows the
+    design-pass spec, which wants the theme with the other remembered UI
+    state). *Migration:* `config.toml` used to hold `theme = "dark"` or
+    `"light"`. `Config` still reads it (as `legacy_theme`, never written
+    back; `"dark"` is an alias for Catppuccin Mocha) and `NoteSec::new` copies
+    it into `state.toml` once, but only if no theme was chosen there, so an
+    old value can never override a newer choice. The next config save
+    then drops the old key. An unknown theme name in `state.toml` reads as
+    "not chosen" and costs nothing else in the file (the other `state.rs`
+    fields are lenient the same way). *UI:* Settings > General lists the
+    three themes as buttons, each with a swatch in that theme's own colours
+    (the row wraps; three don't fit the panel). Ctrl+Shift+T and the palette's
+    "Toggle dark/light theme" go from any dark theme to Light and from Light
+    to Tokyo Night; picking a specific theme is Settings' job. The open graph
+    view recolours too (`sync_graph_style`). *Limits:* no custom themes yet;
+    Catppuccin users who toggle twice end on Tokyo Night, not back on Mocha.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to
