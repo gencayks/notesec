@@ -33,8 +33,10 @@ pub const MESSAGE: &str = "notesec autosave";
 
 /// Lines `prepare` makes sure the graph's `.gitignore` has: the trash
 /// (deleted pages), exports and published bundles (re-creatable HTML,
-/// decision 49) and the temp files of atomic saves.
-pub const IGNORED: [&str; 4] = [".trash/", "exports/", "published/", ".*.tmp"];
+/// decision 49), the temp files of atomic saves, and `state.toml`, which
+/// holds secrets (the clipper token, an AI key) and is UI state anyway
+/// (decision 54; `untrack_state` drops it from a repo already tracking it).
+pub const IGNORED: [&str; 5] = [".trash/", "exports/", "published/", ".*.tmp", "/state.toml"];
 
 /// The identity used when git has none configured, so a commit never fails
 /// for lack of `user.name` / `user.email`.
@@ -225,7 +227,60 @@ pub fn prepare(git: &Git, graph: &Path) -> Result<Repo, BackupError> {
         return Err(BackupError::Ignored(repo.root));
     }
     merge_gitignore(graph)?;
+    untrack_state(git, graph)?;
     Ok(repo)
+}
+
+/// Stop tracking `state.toml` if an earlier backup committed it: `git rm
+/// --cached` (the file itself stays), and a commit of just that removal.
+/// The commit is built from a temporary index (HEAD minus the file),
+/// because `commit`'s pathspec commit would take the file from disk again,
+/// and anything the user staged stays out of it. Older commits still
+/// contain the file: see docs/ENCRYPTION.md for purging. Returns true if it
+/// was tracked.
+pub fn untrack_state(git: &Git, graph: &Path) -> Result<bool, BackupError> {
+    let tracked = git.output(
+        graph,
+        &[],
+        &["ls-files", "--error-unmatch", "--", "state.toml"],
+    )?;
+    if !tracked.status.success() {
+        return Ok(false);
+    }
+    git.run(
+        graph,
+        &[],
+        &["rm", "--cached", "--quiet", "--", "state.toml"],
+    )?;
+    let in_head = git.output(graph, &[], &["cat-file", "-e", "HEAD:./state.toml"])?;
+    if !in_head.status.success() {
+        return Ok(true); // staged but never committed: nothing to record
+    }
+    let git_dir = git.run(graph, &[], &["rev-parse", "--absolute-git-dir"])?;
+    let index =
+        PathBuf::from(git_dir.trim()).join(format!("notesec-untrack-{}", std::process::id()));
+    let mut scratch = git.clone();
+    scratch
+        .envs
+        .push(("GIT_INDEX_FILE".into(), index.clone().into_os_string()));
+    let identity = git.identity(graph)?;
+    let result = (|| {
+        scratch.run(graph, &[], &["read-tree", "HEAD"])?;
+        scratch.run(
+            graph,
+            &[],
+            &["rm", "--cached", "--quiet", "--", "state.toml"],
+        )?;
+        let message = format!("{MESSAGE}: stop tracking state.toml");
+        scratch.run(
+            graph,
+            &identity,
+            &["commit", "--quiet", "--message", &message],
+        )
+    })();
+    let _ = fs::remove_file(&index);
+    result?;
+    Ok(true)
 }
 
 /// Add the `IGNORED` lines missing from `<graph>/.gitignore` at its end
@@ -370,7 +425,7 @@ mod tests {
         assert!(dir.join(".git").is_dir());
         assert_eq!(
             fs::read_to_string(dir.join(".gitignore")).unwrap(),
-            "# notesec: not backed up\n.trash/\nexports/\npublished/\n.*.tmp\n"
+            "# notesec: not backed up\n.trash/\nexports/\npublished/\n.*.tmp\n/state.toml\n"
         );
         // Again: the same repository, nothing added twice.
         let again = prepare(&isolated_git(), &dir).unwrap();
@@ -387,13 +442,55 @@ mod tests {
     }
 
     #[test]
+    fn state_toml_stops_being_backed_up() {
+        if !git_available() {
+            return;
+        }
+        let dir = temp_graph("untrack-state");
+        let git = isolated_git();
+        // An older version committed state.toml (with its secrets).
+        git.run(&dir, &[], &["init", "--quiet"]).unwrap();
+        fs::write(dir.join("state.toml"), "clipper_token = \"0a1b2c\"\n").unwrap();
+        fs::write(dir.join("pages/A.md"), "- a\n").unwrap();
+        commit(&git, &dir).unwrap();
+        assert!(committed_files(&dir).contains(&"state.toml".to_string()));
+
+        // Something the user staged elsewhere stays out of it.
+        fs::write(dir.join("staged.txt"), "mine").unwrap();
+        git.run(&dir, &[], &["add", "staged.txt"]).unwrap();
+        prepare(&git, &dir).unwrap();
+        assert!(dir.join("state.toml").exists(), "the file itself stays");
+        let files = committed_files(&dir);
+        assert!(!files.contains(&"state.toml".to_string()), "{files:?}");
+        assert!(!files.contains(&"staged.txt".to_string()));
+        assert_eq!(log(&dir)[0], format!("{MESSAGE}: stop tracking state.toml"));
+        commit(&git, &dir).unwrap();
+        assert!(!committed_files(&dir).contains(&"state.toml".to_string()));
+        // Changes to it are no longer picked up; nothing to untrack again.
+        fs::write(dir.join("state.toml"), "clipper_token = \"new\"\n").unwrap();
+        assert_eq!(commit(&git, &dir).unwrap(), None);
+        assert!(!untrack_state(&git, &dir).unwrap());
+        // The old commit still has it: purging history is the user's call.
+        let old = run_git(&dir, &["show", "HEAD~2:state.toml"]);
+        assert!(old.contains("0a1b2c"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn committed_files(dir: &Path) -> Vec<String> {
+        run_git(dir, &["ls-tree", "-r", "--name-only", "HEAD"])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
     fn an_existing_gitignore_is_kept_and_completed() {
         let dir = temp_graph("gitignore");
         fs::write(dir.join(".gitignore"), "*.bak\n/.trash\n# mine").unwrap();
         assert!(merge_gitignore(&dir).unwrap());
         assert_eq!(
             fs::read_to_string(dir.join(".gitignore")).unwrap(),
-            "*.bak\n/.trash\n# mine\n# notesec: not backed up\nexports/\npublished/\n.*.tmp\n"
+            "*.bak\n/.trash\n# mine\n# notesec: not backed up\nexports/\npublished/\n.*.tmp\n/state.toml\n"
         );
         assert!(!merge_gitignore(&dir).unwrap(), "complete: left alone");
         let _ = fs::remove_dir_all(dir);

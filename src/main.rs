@@ -22,6 +22,7 @@ mod storage;
 mod table;
 mod tabs;
 mod ui;
+mod vault;
 mod vim;
 mod voice;
 mod whiteboard;

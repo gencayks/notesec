@@ -33,6 +33,8 @@ voice/         — voice notes: find and run a recorder, WAV check/repair, whisp
 app/voice_ui.rs — recording pill, note and transcript blocks, Play/Transcribe, Settings > Voice notes (a submodule of app.rs)
 whiteboard/    — whiteboards: cards/edges from a page's blocks, edits, view maths, hit testing (no GPUI)
 app/whiteboard_ui.rs — the whiteboard canvas: drawing, mouse/zoom, card editing, commands (a submodule of app.rs)
+vault/         — encrypted vault export/import: archive, Argon2id + chunked XChaCha20-Poly1305 (no GPUI)
+app/vault_ui.rs — the vault commands, masked passphrase dialog, pickers (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1853,6 +1855,46 @@ that mutate, and data races are essentially impossible.
     card's own text line like `x:: 5` would be read as its coordinate;
     no curved arrows; no page-menu item (palette command "New
     whiteboard").
+
+54. **Encrypted vault export/import (not sync).** Live end-to-end
+    encrypted sync is future work. "Export encrypted vault…" writes the
+    graph to one `.notesec-vault` file; "Import encrypted vault…"
+    unpacks one into a new, empty folder, never the open graph and never
+    merged. Threat model, contents and format: `docs/ENCRYPTION.md`.
+    *Crypto:* Argon2id (64 MiB, 3 passes, 1 lane; stored in the header
+    and bounded on import as a DoS guard) derives the key.
+    XChaCha20-Poly1305 encrypts 1 MiB chunks, STREAM-style: nonce = base
+    ‖ counter ‖ last flag, and AAD = header ‖ last flag. That
+    authenticates the header and catches truncation, reordering and
+    appended chunks. Salt and nonce come from `OsRng` (the `aead`
+    re-export). *New crates:* `chacha20poly1305 0.10` and `argon2 0.5`
+    (10 packages added to Cargo.lock); no tar/zip crate. The archive is
+    hand-rolled (path, length, bytes), and paths are checked when packing
+    and when unpacking. No `zeroize`: secrets are overwritten by hand
+    (`vault::wipe`, best effort without unsafe). *Contents:* pages,
+    journals, assets, `config.toml`, and `state.toml` parsed with `toml`
+    with `ai_api_key`/`clipper_token` removed at any depth (dropped whole
+    if it can't be parsed). Not included: `.git/`, `.trash/`,
+    `.notesec/`, `exports/`, `published/`, hidden and `*.tmp` files,
+    symlinks. *Import:* decrypt, authenticate and check everything in
+    memory first, then write new files into a staging folder in the
+    destination and move them out; a failure writes nothing. There's no
+    graph switching, so the status line says to start NoteSec with
+    `NOTESEC_DIR`. *UI:* a modal dialog. The passphrase fields are
+    `EditorState`s on the app's input path (`active_editor`), drawn as
+    bullets, with a `canvas()` registering `handle_input`. Export asks
+    twice and needs 12+ characters; Esc closes and wipes. It's in
+    `overlay_open`, `text_input_open` and `vim_applies`. Crypto runs on
+    the background executor. *Backup (agreed with track 1):* `IGNORED`
+    gains `/state.toml`, and `prepare` runs `git rm --cached state.toml`
+    once when it's tracked, then commits just that removal from a
+    temporary index (the pathspec commit would re-add the file from
+    disk; anything the user staged stays out). Older commits keep it; ENCRYPTION.md explains
+    purging with git filter-repo and rotating the secrets. *Limits:*
+    whole vault in memory (2 GiB cap); no in-app graph switching; a
+    failure partway through moving files out of staging can leave some
+    files in the (new) folder; wiping can't reach copies made by
+    reallocation.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

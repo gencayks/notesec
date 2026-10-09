@@ -48,6 +48,7 @@ mod clipper_ui;
 mod embed_ui;
 mod import_ui;
 mod publish_ui;
+mod vault_ui;
 mod vim_ui;
 mod voice_ui;
 mod whiteboard_ui;
@@ -134,6 +135,8 @@ actions!(
         WhiteboardZoomReset,
         WhiteboardAddPage,
         ToggleWhiteboardOutline,
+        ExportVault,
+        ImportVault,
         // Delete / Backspace on a whiteboard canvas (no palette row).
         WhiteboardDelete,
     ]
@@ -792,6 +795,8 @@ pub struct NoteSec {
     voice: voice_ui::VoiceState,
     /// Whiteboard canvases (decision 53, `whiteboard_ui.rs`).
     whiteboard: whiteboard_ui::WhiteboardState,
+    /// Encrypted vault export/import (decision 54, `vault_ui.rs`).
+    vault: vault_ui::VaultState,
 }
 
 impl NoteSec {
@@ -942,6 +947,7 @@ impl NoteSec {
             clipper: Default::default(),
             voice: Default::default(),
             whiteboard: Default::default(),
+            vault: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -961,6 +967,9 @@ impl NoteSec {
     /// overlay is open, the rename field while renaming a page, otherwise
     /// the block editor.
     fn active_editor(&self) -> &EditorState {
+        if let Some(dialog) = &self.vault.dialog {
+            return dialog.field();
+        }
         match (&self.search, &self.page_menu) {
             (Some(s), _) => &s.query,
             (
@@ -975,6 +984,9 @@ impl NoteSec {
     }
 
     fn active_editor_mut(&mut self) -> &mut EditorState {
+        if self.vault.dialog.is_some() {
+            return self.vault.dialog.as_mut().expect("open").field_mut();
+        }
         match (&mut self.search, &mut self.page_menu) {
             (Some(s), _) => &mut s.query,
             (
@@ -1002,7 +1014,7 @@ impl NoteSec {
     /// The palette's query box or the rename field has the keyboard (not a
     /// block): typing there records no undo history.
     fn text_input_open(&self) -> bool {
-        self.search.is_some() || self.renaming()
+        self.search.is_some() || self.renaming() || self.vault_dialog_open()
     }
 
     // --- settings --------------------------------------------------------------
@@ -1515,6 +1527,9 @@ impl NoteSec {
     }
 
     fn toggle_search(&mut self, _: &ToggleSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_dialog_open() {
+            return;
+        }
         if self.search.is_some() {
             self.close_search(cx);
             return;
@@ -2519,6 +2534,7 @@ impl NoteSec {
             || self.shortcuts_open
             || self.trash_confirm.is_some()
             || self.import_dialog_open()
+            || self.vault_dialog_open()
     }
 
     /// Ctrl+W. Ignored while an overlay is open. In the focused right pane
@@ -3358,6 +3374,9 @@ impl NoteSec {
 
     /// Enter: split the block at the cursor; the right half becomes a new block.
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_dialog_open() {
+            return self.confirm_vault(cx);
+        }
         if self.renaming() {
             self.confirm_rename(cx);
             return;
@@ -3400,10 +3419,16 @@ impl NoteSec {
     }
 
     fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_dialog_open() {
+            return self.vault_next_field(cx);
+        }
         self.restructure(cx, |page, ix| page.indent(ix));
     }
 
     fn shift_tab(&mut self, _: &ShiftTab, _: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_dialog_open() {
+            return self.vault_next_field(cx);
+        }
         self.restructure(cx, |page, ix| page.outdent(ix));
     }
 
@@ -3927,7 +3952,9 @@ impl NoteSec {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.import_dialog_open() {
+        if self.vault_dialog_open() {
+            self.close_vault_dialog(cx);
+        } else if self.import_dialog_open() {
             self.answer_import_clash(None, cx);
         } else if self.trash_confirm.is_some() {
             self.close_trash_confirm(cx);
@@ -7983,6 +8010,8 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_cancel_recording))
             .on_action(cx.listener(Self::on_transcribe_voice_notes))
             .on_action(cx.listener(Self::on_new_whiteboard))
+            .on_action(cx.listener(Self::on_export_vault))
+            .on_action(cx.listener(Self::on_import_vault))
             .on_action(cx.listener(Self::on_whiteboard_fit))
             .on_action(cx.listener(Self::on_whiteboard_zoom_reset))
             .on_action(cx.listener(Self::on_whiteboard_add_page))
@@ -7998,6 +8027,7 @@ impl Render for NoteSec {
             .children(page_menu_overlay)
             .children(shortcuts_overlay)
             .children(self.render_import_dialog(cx))
+            .children(self.render_vault_dialog(cx))
             .children(trash_confirm_overlay)
     }
 }
@@ -16712,6 +16742,119 @@ printf '[00:00:00.000 --> 00:00:01.000]   Buy milk [[and]] eggs.\n[00:00:01.000 
         assert!(board && has(cx, "whiteboard"));
         let saved = std::fs::read_to_string(dir.join("pages/Whiteboard.md")).unwrap();
         assert!(saved.starts_with("- type:: whiteboard"), "{saved}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Encrypted vaults (decision 54) ----------------------------------------
+
+    fn vault_dialog(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(String, Option<String>, bool)> {
+        view.update(cx, |app, _| {
+            app.vault
+                .dialog
+                .as_ref()
+                .map(|d| (d.field().text.clone(), d.error.clone(), d.busy))
+        })
+    }
+
+    #[gpui::test]
+    fn vault_export_and_import_through_the_dialog(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "vault-ui", "- hello vault\n");
+        std::fs::write(dir.join("state.toml"), "clipper_token = \"tok-SECRET\"\n").unwrap();
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        let out = std::env::temp_dir().join(format!("notesec-vault-ui-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(out.join("dest")).unwrap();
+
+        cx.dispatch_action(ExportVault);
+        assert!(has(cx, "vault-dialog") && has(cx, "vault-pass") && has(cx, "vault-confirm"));
+        assert!(view.update(cx, |app, _| app.overlay_open() && !app.vim_applies()));
+        // Too short: Enter goes to the second field, then refuses.
+        cx.simulate_input("dd short");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("dd short");
+        cx.simulate_keystrokes("enter");
+        let (_, error, _) = vault_dialog(&view, cx).unwrap();
+        assert!(error.unwrap().contains("At least 12"));
+        assert_eq!(
+            file(&dir),
+            "- hello vault\n",
+            "typing went to the field, not vim"
+        );
+        // Esc closes the dialog and wipes the fields.
+        cx.simulate_keystrokes("escape");
+        assert!(vault_dialog(&view, cx).is_none() && !has(cx, "vault-dialog"));
+
+        cx.dispatch_action(ExportVault);
+        assert_eq!(vault_dialog(&view, cx).unwrap().0, "", "a fresh dialog");
+        cx.simulate_input("correct horse battery");
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input("correct horse battery?");
+        cx.simulate_keystrokes("enter");
+        assert!(vault_dialog(&view, cx)
+            .unwrap()
+            .1
+            .unwrap()
+            .contains("don't match"));
+        cx.simulate_keystrokes("backspace enter");
+        assert!(
+            vault_dialog(&view, cx).unwrap().2,
+            "busy: the save picker is open"
+        );
+        cx.simulate_new_path_selection(|_| Some(out.join("mine")));
+        cx.run_until_parked();
+        assert!(vault_dialog(&view, cx).is_none());
+        let file_path = out.join("mine.notesec-vault");
+        let bytes = std::fs::read(&file_path).unwrap();
+        assert!(bytes.starts_with(crate::vault::MAGIC));
+        let status = view.update(cx, |app, _| app.status.clone().unwrap().text);
+        assert!(status.contains("mine.notesec-vault"), "{status}");
+
+        // Import: the file, then a new empty folder, then the passphrase.
+        cx.dispatch_action(ImportVault);
+        cx.simulate_path_prompt_response(|o| o.files.then(|| vec![file_path.clone()]));
+        cx.run_until_parked();
+        let dest = out.join("dest");
+        cx.simulate_path_prompt_response(|o| o.directories.then(|| vec![dest.clone()]));
+        cx.run_until_parked();
+        assert!(has(cx, "vault-pass") && !has(cx, "vault-confirm"));
+        cx.simulate_input("not the passphrase");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let (text, error, busy) = vault_dialog(&view, cx).unwrap();
+        assert!(error.unwrap().contains("Wrong passphrase") && !busy && text.is_empty());
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            0,
+            "nothing written"
+        );
+        cx.simulate_input("correct horse battery");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(vault_dialog(&view, cx).is_none());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("pages/Test.md")).unwrap(),
+            "- hello vault\n"
+        );
+        assert!(!std::fs::read_to_string(dest.join("state.toml"))
+            .unwrap()
+            .contains("SECRET"));
+        let status = view.update(cx, |app, _| app.status.clone().unwrap().text);
+        assert!(status.contains("NOTESEC_DIR="), "{status}");
+
+        // The open notes' own folder is refused as a destination.
+        cx.dispatch_action(ImportVault);
+        cx.simulate_path_prompt_response(|o| o.files.then(|| vec![file_path.clone()]));
+        cx.run_until_parked();
+        let graph = dir.clone();
+        cx.simulate_path_prompt_response(move |_| Some(vec![graph]));
+        cx.run_until_parked();
+        assert!(vault_dialog(&view, cx).is_none());
+        let status = view.update(cx, |app, _| app.status.clone().unwrap());
+        assert!(status.error && status.text.contains("open notes"));
+        let _ = std::fs::remove_dir_all(out);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

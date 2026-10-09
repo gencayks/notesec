@@ -129,6 +129,8 @@ commands! {
     WhiteboardZoomReset => "Whiteboard: zoom 100%", ["actual size", "canvas", "board", "reset zoom"], Page;
     WhiteboardAddPage => "Whiteboard: add page or block card\u{2026}", ["canvas", "board", "card", "insert"], Page;
     ToggleWhiteboardOutline => "Whiteboard: open as outline / canvas", ["canvas", "board", "blocks", "text"], Page;
+    ExportVault => "Export encrypted vault\u{2026}", ["encrypt", "backup", "passphrase", "password", "secure", "usb", "cloud"], Nothing;
+    ImportVault => "Import encrypted vault\u{2026}", ["decrypt", "restore", "passphrase", "password", "secure"], Nothing;
     ToggleFavorite => "Toggle favorite", ["star", "unstar", "bookmark", "favourite"], Page;
     SortPagesAz => "Sort pages A-Z", ["alphabetical", "order"], Nothing;
     // Editing
