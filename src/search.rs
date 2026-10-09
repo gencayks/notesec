@@ -126,6 +126,9 @@ pub enum Target {
     /// A block: (page index, block index within that page).
     Block(usize, usize),
     Command(Command),
+    /// A plugin command, by index into the labels given to `search_with`
+    /// (decision 55).
+    Plugin(usize),
     /// A template, by index into the list given to `search_templates`.
     Template(usize),
     /// A global search match: the byte range `start..end` of the block's
@@ -140,7 +143,7 @@ pub enum Target {
 
 impl Target {
     pub fn is_command(&self) -> bool {
-        matches!(self, Target::Command(_))
+        matches!(self, Target::Command(_) | Target::Plugin(_))
     }
 }
 
@@ -171,7 +174,20 @@ const KEYWORD_PENALTY: i32 = 40;
 /// pages and blocks, and commands (the palette puts a header over each),
 /// best first within each group; the group holding the best hit comes
 /// first, so Enter still runs the top match.
+#[cfg(test)]
 pub fn search(pages: &[Page], commands: &[Command], query: &str, limit: usize) -> Vec<Hit> {
+    search_with(pages, commands, &[], query, limit)
+}
+
+/// `search`, with plugin commands (`plugins`: their labels) after the
+/// built-in ones.
+pub fn search_with(
+    pages: &[Page],
+    commands: &[Command],
+    plugins: &[String],
+    query: &str,
+    limit: usize,
+) -> Vec<Hit> {
     let query = query.trim();
     if query.is_empty() {
         let pages = (0..pages.len().min(limit)).map(|page| Hit {
@@ -182,10 +198,22 @@ pub fn search(pages: &[Page], commands: &[Command], query: &str, limit: usize) -
             target: Target::Command(command),
             score: 0,
         });
-        return pages.chain(commands).collect();
+        let plugins = (0..plugins.len()).map(|i| Hit {
+            target: Target::Plugin(i),
+            score: 0,
+        });
+        return pages.chain(commands).chain(plugins).collect();
+    }
+    let mut hits = Vec::new();
+    for (i, label) in plugins.iter().enumerate() {
+        if let Some(score) = fuzzy_score(query, label) {
+            hits.push(Hit {
+                target: Target::Plugin(i),
+                score: score + COMMAND_BONUS,
+            });
+        }
     }
 
-    let mut hits = Vec::new();
     for &command in commands {
         if let Some(score) = command.score(query) {
             hits.push(Hit {

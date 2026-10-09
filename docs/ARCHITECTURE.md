@@ -35,6 +35,8 @@ whiteboard/    — whiteboards: cards/edges from a page's blocks, edits, view ma
 app/whiteboard_ui.rs — the whiteboard canvas: drawing, mouse/zoom, card editing, commands (a submodule of app.rs)
 vault/         — encrypted vault export/import: archive, Argon2id + chunked XChaCha20-Poly1305 (no GPUI)
 app/vault_ui.rs — the vault commands, masked passphrase dialog, pickers (a submodule of app.rs)
+plugins/       — WASM plugins: manifests, wasmi sandbox (fuel, memory cap), TOML in/out (no GPUI)
+app/plugins_ui.rs — Settings > Plugins, palette entries, applying actions, render-hook boxes (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1895,6 +1897,38 @@ that mutate, and data races are essentially impossible.
     failure partway through moving files out of staging can leave some
     files in the (new) folder; wiping can't reach copies made by
     reallocation.
+
+55. **WASM plugins, sandboxed with wasmi.** `plugins/<id>/plugin.toml` +
+    `plugin.wasm` in the graph; see docs/PLUGINS.md. *Runtime:* wasmi
+    2.0 (a pure-Rust interpreter; no wasmtime, no WASI), built with
+    `default-features = false` and `portable-dispatch`, because the
+    default tail-call dispatch overflowed the stack in debug builds. The
+    only import allowed is `env.host_log` (stderr, 20 lines per call).
+    Every call gets a fresh store and instance, with fuel (50M for
+    commands, 5M for render hooks), a 32 MiB memory cap via
+    `StoreLimits` (growth traps), 256 KiB input and 64 KiB output, and
+    bounds-checked pointers. *Formats:* TOML both ways. The input is
+    written by hand with `block` first, so a tiny WAT plugin can find
+    it. The output is parsed with `deny_unknown_fields` and checked
+    (≤16 actions, sizes, no control characters), and the actions are
+    applied by the app: insert/replace block (one undo step each,
+    saved like edits, refused if the page or block changed while it
+    ran), set status, open an existing page. Render output is plain
+    lines with `**bold**` / `*italic*`, drawn as GPUI text and never
+    HTML. *Trust:* plugins start disabled. `config.toml [plugins]` maps
+    id to a hash of the wasm (argon2 with fixed tiny parameters, reused
+    so there's no new crate), so a changed binary is off until enabled
+    again. Three failures in a row turn a plugin off (a failure while
+    drawing is queued and applied at the next render). *Threads:*
+    commands run on the background executor; render hooks run while
+    drawing, bounded by their fuel and cached per (hash, args, block
+    text), capped at 256 entries. *Palette:* `Target::Plugin(i)`
+    through `search::search_with`. Export, publish and vault don't run
+    hooks: macros stay as text. *Tests:* the example's committed wasm
+    must equal `wat` of its source (`wat` is a dev-dependency only).
+    *Limits:* no plugin state between calls; one command at a time;
+    render hooks on the UI thread; log lines only on stderr; no access
+    to other blocks than the current one.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

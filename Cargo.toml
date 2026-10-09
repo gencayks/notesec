@@ -22,6 +22,7 @@ toml = "0.9"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "portable-dispatch"] }
 
 # Zed's workspace patches a few crates; patches only apply at the *root* manifest,
 # so we must repeat the ones GPUI needs here.
@@ -36,3 +37,4 @@ async-process = { git = "https://github.com/zed-industries/async-process.git", r
 gpui = { path = "/home/kazo/gpui-playground/crates/gpui", features = ["test-support"] }
 gpui_platform = { path = "/home/kazo/gpui-playground/crates/gpui_platform", features = ["test-support"] }
 gpui_wgpu = { path = "/home/kazo/gpui-playground/crates/gpui_wgpu" }
+wat = "1.261.0"

@@ -20,7 +20,8 @@ use crate::model::{
     resolve_page, tag_counts, tag_query, BlockKind, Page, TaskState,
 };
 use crate::search::{
-    search, search_blocks, search_link_pages, search_templates, search_text, snippet, Hit, Target,
+    search_blocks, search_link_pages, search_templates, search_text, search_with, snippet, Hit,
+    Target,
 };
 use crate::state::UiState;
 use crate::storage::{today_title, validate_title, Storage, Template, TrashEntry};
@@ -47,6 +48,7 @@ use uuid::Uuid;
 mod clipper_ui;
 mod embed_ui;
 mod import_ui;
+mod plugins_ui;
 mod publish_ui;
 mod vault_ui;
 mod vim_ui;
@@ -480,6 +482,8 @@ enum SettingsSection {
     Clipper,
     /// Voice notes: recorder and transcription (decision 52, `voice_ui`).
     Voice,
+    /// WASM plugins: enable / disable (decision 55, `plugins_ui`).
+    Plugins,
 }
 
 /// A line under the Shortcuts list.
@@ -797,6 +801,8 @@ pub struct NoteSec {
     whiteboard: whiteboard_ui::WhiteboardState,
     /// Encrypted vault export/import (decision 54, `vault_ui.rs`).
     vault: vault_ui::VaultState,
+    /// WASM plugins (decision 55, `plugins_ui.rs`).
+    plugins: plugins_ui::PluginsState,
 }
 
 impl NoteSec {
@@ -948,9 +954,11 @@ impl NoteSec {
             voice: Default::default(),
             whiteboard: Default::default(),
             vault: Default::default(),
+            plugins: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
+        app.reload_plugins();
         if app.config.git_backup {
             // Commits what changed while the app was closed, too.
             app.start_backup(false, cx);
@@ -1500,9 +1508,14 @@ impl NoteSec {
                 search_templates(&names, &query.text, MAX_RESULTS)
             }
             Some(s) if s.global => search_text(&self.pages, &s.query.text, MAX_TEXT_RESULTS),
-            Some(s) => search(
+            Some(s) => search_with(
                 &self.pages,
                 &self.available_commands(),
+                &self
+                    .plugin_commands()
+                    .into_iter()
+                    .map(|(_, _, label)| label)
+                    .collect::<Vec<_>>(),
                 &s.query.text,
                 MAX_RESULTS,
             ),
@@ -1816,6 +1829,17 @@ impl NoteSec {
                     self.editor.clamp();
                 }
                 window.dispatch_action(command.action(), cx)
+            }
+            Target::Plugin(entry) => {
+                // Opened while editing: back to that block, as it was.
+                if let (Some(ix), Some(editor)) = (insert_after, resume) {
+                    if ix < self.pages[self.selected].blocks.len() {
+                        self.start_edit(ix, window, cx);
+                        self.editor = editor;
+                        self.editor.clamp();
+                    }
+                }
+                self.run_plugin_command(entry, cx);
             }
             Target::Template(ix) => {
                 if let Some(template) = templates.as_ref().and_then(|t| t.get(ix)) {
@@ -5046,6 +5070,7 @@ impl NoteSec {
         let tabs = div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .gap_2()
             .child(
                 button(
@@ -5086,12 +5111,23 @@ impl NoteSec {
                 .on_click(cx.listener(|this, _e, _window, cx| {
                     this.show_settings_section(SettingsSection::Voice, cx)
                 })),
+            )
+            .child(
+                button(
+                    "settings-tab-plugins",
+                    "Plugins".into(),
+                    section == SettingsSection::Plugins,
+                )
+                .on_click(cx.listener(|this, _e, _window, cx| {
+                    this.show_settings_section(SettingsSection::Plugins, cx)
+                })),
             );
         let body = match section {
             SettingsSection::General => general.into_any_element(),
             SettingsSection::Shortcuts => self.render_hotkeys(state, cx),
             SettingsSection::Clipper => self.render_clipper_settings(cx),
             SettingsSection::Voice => self.render_voice_settings(cx),
+            SettingsSection::Plugins => self.render_plugin_settings(cx),
         };
 
         div()
@@ -6361,10 +6397,15 @@ impl NoteSec {
                 if let Some(embeds) = &embeds {
                     embed_lines.extend(embeds.lines.iter().cloned());
                 }
+                // Plugin render hooks: `{{macro}}` boxes (decision 55).
+                let plugin_boxes = display
+                    .as_ref()
+                    .and_then(|_| self.render_plugin_boxes(source));
                 let extras: Vec<AnyElement> = query_list
                     .map(IntoElement::into_any_element)
                     .into_iter()
                     .chain(embeds.map(|e| e.element))
+                    .chain(plugin_boxes)
                     .collect();
                 let content = if extras.is_empty() {
                     content
@@ -6745,6 +6786,8 @@ impl NoteSec {
 
 impl Render for NoteSec {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Plugins found failing while drawing the last frame are turned off.
+        self.apply_plugin_disables(cx);
         // A drag released outside the sidebar just ends (GPUI drops it), so
         // forget where it would have landed.
         if !cx.has_active_drag() {
@@ -7328,6 +7371,11 @@ impl Render for NoteSec {
         // --- Search overlay (Ctrl-K) -----------------------------------------
         let overlay = self.search.as_ref().map(|state| {
             let hits = self.search_results();
+            let plugin_labels: Vec<String> = self
+                .plugin_commands()
+                .into_iter()
+                .map(|(_, _, l)| l)
+                .collect();
             let selected = state.selected;
             let templates = state.templates.as_deref();
             let headers: Vec<Option<&'static str>> =
@@ -7372,6 +7420,23 @@ impl Render for NoteSec {
                                         .flex_shrink_0()
                                         .text_color(theme.muted)
                                         .child(hint(c.action().as_ref())),
+                                ),
+                            Target::Plugin(i) => div()
+                                .debug_selector(move || format!("plugin-command-{i}"))
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_color(theme.text)
+                                        .child(plugin_labels.get(i).cloned().unwrap_or_default()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(theme.muted)
+                                        .child("plugin"),
                                 ),
                             Target::Template(t) => row(
                                 div().text_color(theme.accent).child(
@@ -16855,6 +16920,220 @@ printf '[00:00:00.000 --> 00:00:01.000]   Buy milk [[and]] eggs.\n[00:00:01.000 
         let status = view.update(cx, |app, _| app.status.clone().unwrap());
         assert!(status.error && status.text.contains("open notes"));
         let _ = std::fs::remove_dir_all(out);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Plugins (decision 55) ------------------------------------------------
+
+    const WORD_COUNT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/plugins/word-count");
+
+    /// Put a plugin in `<dir>/plugins/<id>/` and reload the plugins.
+    fn install_plugin(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        dir: &std::path::Path,
+        id: &str,
+        manifest: &str,
+        wasm: &[u8],
+    ) {
+        let folder = dir.join("plugins").join(id);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(folder.join("plugin.wasm"), wasm).unwrap();
+        view.update(cx, |app, cx| {
+            app.reload_plugins();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn install_word_count(
+        view: &Entity<NoteSec>,
+        cx: &mut VisualTestContext,
+        dir: &std::path::Path,
+    ) {
+        let manifest = std::fs::read_to_string(format!("{WORD_COUNT}/plugin.toml")).unwrap();
+        let wasm = std::fs::read(format!("{WORD_COUNT}/plugin.wasm")).unwrap();
+        install_plugin(view, cx, dir, "word-count", &manifest, &wasm);
+    }
+
+    /// A plugin `id` with one command "Go" whose `run_command` body is
+    /// `body`; its memory holds `output` at offset 100.
+    fn test_plugin(output: &str, body: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(module
+                 (memory (export "memory") 1)
+                 (data (i32.const 100) "{output}")
+                 (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+                 (func (export "run_command") (param i32 i32) (result i64) {body}))"#
+        ))
+        .unwrap()
+    }
+
+    fn test_manifest(id: &str) -> String {
+        format!(
+            "id = \"{id}\"\nname = \"{id}\"\nversion = \"1\"\napi_version = 1\n\
+             [[commands]]\nid = \"go\"\nlabel = \"Go {id}\"\n"
+        )
+    }
+
+    fn plugin_hits(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> usize {
+        view.update(cx, |app, _| {
+            app.search_results()
+                .iter()
+                .filter(|h| matches!(h.target, Target::Plugin(_)))
+                .count()
+        })
+    }
+
+    fn run_palette(cx: &mut VisualTestContext, query: &str) {
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input(query);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn word_count_plugin_is_off_until_enabled_then_counts_and_renders(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(
+            cx,
+            "plugin-word-count",
+            "- one two three\n- {{word-count}} here\n",
+        );
+        install_word_count(&view, cx, &dir);
+        // Found, but disabled: no palette entry, no render box.
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("count words");
+        assert_eq!(plugin_hits(&view, cx), 0);
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "plugin-render-word-count"));
+        assert!(saved_config(&dir).plugins.is_empty());
+
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-plugins");
+        assert!(has(cx, "plugins-reload"));
+        click_on(cx, "plugin-toggle-word-count");
+        let hash = view.update(cx, |app, _| app.plugins.found[0].hash.clone());
+        assert_eq!(saved_config(&dir).plugins.get("word-count"), Some(&hash));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // The render hook draws under the block with the macro.
+        assert!(has(cx, "plugin-render-word-count"));
+        view.update(cx, |app, _| {
+            assert_eq!(app.plugin_render_texts(), ["2 words"])
+        });
+
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-k");
+        cx.simulate_input("count words");
+        assert_eq!(plugin_hits(&view, cx), 1);
+        view.update(cx, |app, _| {
+            assert_eq!(app.search_results()[0].target, Target::Plugin(0))
+        });
+        assert!(has(cx, "plugin-command-0"));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            status_text(&view, cx).as_deref(),
+            Some("Word count: Words: 3")
+        );
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+        assert_eq!(file(&dir), "- one two three\n- {{word-count}} here\n");
+
+        // Turning it off again is saved too.
+        cx.simulate_keystrokes("escape ctrl-,");
+        click_on(cx, "settings-tab-plugins");
+        click_on(cx, "plugin-toggle-word-count");
+        assert!(saved_config(&dir).plugins.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_changed_plugin_binary_must_be_enabled_again(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "plugin-changed", "- a\n");
+        install_word_count(&view, cx, &dir);
+        view.update(cx, |app, cx| app.set_plugin_enabled("word-count", true, cx));
+        assert_eq!(view.update(cx, |app, _| app.plugin_commands().len()), 1);
+        let manifest = std::fs::read_to_string(format!("{WORD_COUNT}/plugin.toml")).unwrap();
+        let other = test_plugin("", "(i64.const 0)");
+        install_plugin(&view, cx, &dir, "word-count", &manifest, &other);
+        view.update(cx, |app, _| {
+            assert!(app.plugin_commands().is_empty());
+            assert!(!app.plugin_enabled(&app.plugins.found[0]));
+        });
+        cx.simulate_keystrokes("ctrl-,");
+        click_on(cx, "settings-tab-plugins");
+        click_on(cx, "plugin-toggle-word-count");
+        assert_eq!(view.update(cx, |app, _| app.plugin_commands().len()), 1);
+        assert_eq!(
+            saved_config(&dir).plugins.get("word-count"),
+            Some(&crate::plugins::wasm_hash(&other))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_plugin_failing_three_times_is_turned_off(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "plugin-failing", "- a\n");
+        install_plugin(
+            &view,
+            cx,
+            &dir,
+            "crash",
+            &test_manifest("crash"),
+            &test_plugin("", "unreachable"),
+        );
+        view.update(cx, |app, cx| app.set_plugin_enabled("crash", true, cx));
+        for n in 1..=2 {
+            run_palette(cx, "go crash");
+            let status = status_text(&view, cx).unwrap();
+            assert!(
+                status.contains("crash failed") && status.contains("crashed"),
+                "{status}"
+            );
+            view.update(cx, |app, _| assert_eq!(app.plugin_failures("crash"), n));
+        }
+        run_palette(cx, "go crash");
+        assert!(status_text(&view, cx).unwrap().contains("turned off"));
+        view.update(cx, |app, _| assert!(app.plugin_commands().is_empty()));
+        assert!(saved_config(&dir).plugins.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn plugin_edits_are_saved_and_each_is_one_undo_step(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "plugin-edits", "- old\n- other\n");
+        let output = r#"[[actions]]\0atype = \"replace_block\"\0atext = \"REPLACED\"\0a[[actions]]\0atype = \"insert_block\"\0atext = \"NEW\"\0a"#;
+        let len = output.replace("\\0a", "\n").replace("\\\"", "\"").len();
+        let body = format!("(i64.or (i64.shl (i64.const 100) (i64.const 32)) (i64.const {len}))");
+        install_plugin(
+            &view,
+            cx,
+            &dir,
+            "edit",
+            &test_manifest("edit"),
+            &test_plugin(output, &body),
+        );
+        view.update(cx, |app, cx| app.set_plugin_enabled("edit", true, cx));
+        click_block(cx, 0);
+        run_palette(cx, "go edit");
+        assert_eq!(file(&dir), "- REPLACED\n- NEW\n- other\n");
+        cx.simulate_keystrokes("escape ctrl-z");
+        assert_eq!(file(&dir), "- REPLACED\n- other\n");
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(file(&dir), "- old\n- other\n");
+
+        // With no block being edited, replace_block is refused; the insert
+        // goes after the last top-level block.
+        view.update(cx, |app, cx| {
+            app.commit();
+            app.editing = None;
+            app.run_plugin_command(0, cx);
+        });
+        cx.run_until_parked();
+        assert!(status_text(&view, cx).unwrap().contains("needs a block"));
+        assert_eq!(file(&dir), "- old\n- other\n- NEW\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

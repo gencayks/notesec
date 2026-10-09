@@ -78,6 +78,10 @@ pub struct Config {
     pub whisper_language: String,
     /// Transcribe each new voice note when it's recorded.
     pub voice_auto_transcribe: bool,
+    /// Enabled plugins: id -> hash of the `plugin.wasm` that was enabled
+    /// (decision 55). Plugins not listed, or whose binary changed, are off.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plugins: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -95,6 +99,7 @@ impl Default for Config {
             whisper_model: String::new(),
             whisper_language: "auto".into(),
             voice_auto_transcribe: false,
+            plugins: Default::default(),
         }
     }
 }
@@ -217,6 +222,7 @@ mod tests {
             whisper_model: "/m/ggml-base.bin".into(),
             whisper_language: "de".into(),
             voice_auto_transcribe: true,
+            plugins: [("word-count".to_string(), "ab12".to_string())].into(),
         };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), config);

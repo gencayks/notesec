@@ -15,6 +15,7 @@ mod graph_view;
 mod hotkeys;
 mod import;
 mod model;
+mod plugins;
 mod publish;
 mod search;
 mod state;
