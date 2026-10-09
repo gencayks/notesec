@@ -21,6 +21,8 @@ backup.rs      — git auto-backup: runs the `git` program (NO ui code here)
 hotkeys.rs     — custom keys: overrides on top of the default keymap (NO ui code)
 embed.rs       — live embeds: parse ![[page]] / block embeds, resolve (NO ui code)
 app/embed_ui.rs — the reading view's embed boxes (a submodule of app.rs)
+vim.rs         — vim mode's pure state machine: modes, motions, operators, counts, register, `:` line (NO ui code)
+app/vim_ui.rs  — vim keys into the editor, block-level effects, mode pill, Settings row (a submodule of app.rs)
 ui.rs          — theme colours + tiny stateless view helpers
 config.rs      — config.toml: theme, font size/family
 ```
@@ -1380,6 +1382,56 @@ that mutate, and data races are essentially impossible.
     read only the pages' own text, so embedded content is found (and a
     task listed) once, on its source page. Block references to blocks
     shown inside an embed resolve as always (by id).
+
+48. **Vim mode: normal/insert/visual editing behind a Settings toggle.**
+    Off by default (`vim_mode` in `config.toml`); Settings > General >
+    Editor > "Vim keybindings" (Off / On), or the palette's "Toggle vim
+    mode" (`ToggleVimMode`, no default key, rebindable in Shortcuts like
+    every command). With it off nothing below runs. *Split:* `vim.rs` is
+    a pure state machine over the editor's `EditorState` (text, cursor,
+    selection): it moves and edits within the block itself and returns an
+    `Effect` for what needs the outline or the app (other blocks, undo,
+    save, stop). `app/vim_ui.rs` feeds it keys and applies the effects;
+    `app.rs` has one-line hooks. *How keys arrive:* through the keystroke
+    interceptor, like hotkey capture (decision 41), because it runs before
+    the keymap AND before text input; a handled key calls
+    `stop_propagation`, so it neither fires a binding nor types. In Normal
+    and Visual mode the text-input handler also drops text (an IME commit
+    can arrive without a key-down), and the `[[` picker doesn't open.
+    *Which keys vim takes:* only while a block is being edited, and never
+    while the rename field, search, the palette, Settings (incl. key
+    capture), the Shortcuts sheet, a page menu or a trash confirmation is
+    open (and any later text input that sets `text_input_open`). In Insert
+    mode only Esc, and not while the slash menu, the `[[` picker or IME
+    composition is open (Esc closes those first, as without vim). Ctrl /
+    Alt / Super keys pass through to the app's shortcuts (Ctrl+K opens
+    the palette from Normal mode), except Ctrl-R (redo); arrows and Tab
+    pass too (Tab indents). Vim's own keys are fixed, not rebindable: a
+    modal grammar of operators, counts and motions doesn't fit a
+    one-key-per-command table (`d2w`, `3dd`). *Modes:* clicking a block (or any start of
+    editing) begins in Normal mode, as vim opens a file; a mouse
+    selection becomes Visual. `i a I A o O`, `c…`, `s` enter Insert; Esc
+    goes back (cursor one left, as vim); Esc in Normal clears a pending
+    command, else stops editing. j/k keep the current mode; Enter and
+    Up/Down in Insert stay in Insert (the app's own keys).
+    *The block is the line* for linewise commands: `dd`/`yy` take the
+    block with its children (a count takes that many sibling subtrees,
+    never climbing to a parent); `p` pastes them after the block's
+    subtree (replacing an empty childless block, like paste), `P` before
+    it; `o`/`O` open a block below/above; `>>`/`<<` indent/outdent; `cc`
+    clears the text. Deleting the last block leaves one empty block. j/k
+    move over the block's own lines (not wrapped rows), then into the
+    previous/next visible block keeping the column; gg/G go to the
+    first/last visible block. Within a block: h l w b e 0 ^ $, x X dw d$
+    D cw C s S, yw y$, r, ~, counts, v (characterwise, inclusive) and V
+    (the block). Graphemes are never split. *Register:* one internal
+    register, text or blocks; not the system clipboard (Ctrl+C/V still
+    are). *Undo:* each Normal-mode change is one step of the app's undo;
+    `u`/Ctrl-R are its undo/redo. *`:` line:* `:w` saves now and says
+    "Saved “Title”", `:q` stops editing, `:wq`/`:x` both, anything else
+    "Not an editor command: …" as an error status. *Indicator:* a pill at
+    the bottom left shows the mode and pending keys (`NORMAL  2d`) or the
+    `:` line being typed. Split panes share the one editor, so one vim.
 
 *Next to learn, in order:* ownership/borrowing -> `Option`/`Result` -> traits ->
 iterators -> lifetimes (you'll meet them in GPUI signatures). Each one maps to

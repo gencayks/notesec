@@ -44,6 +44,7 @@ use std::rc::Rc;
 use uuid::Uuid;
 
 mod embed_ui;
+mod vim_ui;
 
 // Actions are named, typed commands that key bindings map onto. The macro
 // declares one unit struct per name inside the `notesec` namespace. Palette
@@ -112,6 +113,7 @@ actions!(
         ToggleGraphJournals,
         ShowShortcuts,
         CustomizeShortcuts,
+        ToggleVimMode,
     ]
 );
 
@@ -746,6 +748,9 @@ pub struct NoteSec {
     _backup_subscriptions: Vec<Subscription>,
     /// The keystroke interceptor behind Settings > Shortcuts' key capture.
     _key_capture: Subscription,
+    /// Vim mode's state (decision 48, `vim.rs`): used while
+    /// `config.vim_mode` is on and a block is being edited.
+    vim: crate::vim::Vim,
 }
 
 impl NoteSec {
@@ -819,9 +824,12 @@ impl NoteSec {
         // captured key never also runs its old command.
         register_keys(cx, &state.shortcuts);
         let weak = cx.weak_entity();
-        let key_capture = cx.intercept_keystrokes(move |event, _window, cx| {
+        let key_capture = cx.intercept_keystrokes(move |event, window, cx| {
             let taken = weak
-                .update(cx, |app, cx| app.capture_keystroke(&event.keystroke, cx))
+                .update(cx, |app, cx| {
+                    app.capture_keystroke(&event.keystroke, cx)
+                        || app.vim_keystroke(&event.keystroke, window, cx)
+                })
                 .unwrap_or(false);
             if taken {
                 cx.stop_propagation();
@@ -887,6 +895,7 @@ impl NoteSec {
             backup_seen,
             _backup_subscriptions: backup_subscriptions,
             _key_capture: key_capture,
+            vim: Default::default(),
         };
         // The startup page counts as opened.
         app.record_recent();
@@ -2062,7 +2071,11 @@ impl NoteSec {
     /// inside a `[[`, say), the one typed last wins.
     fn ref_query(&self) -> Option<(Range<usize>, RefKind)> {
         self.editing?;
-        if self.search.is_some() || self.slash.is_some() || self.settings.is_some() {
+        if self.search.is_some()
+            || self.slash.is_some()
+            || self.settings.is_some()
+            || self.vim_takes_keys()
+        {
             return None;
         }
         let block = self.editor.block_ref_query().map(|r| (r, RefKind::Block));
@@ -3248,11 +3261,13 @@ impl NoteSec {
         self.commit();
         self.text_history_active = false;
         self.load_editor(ix, false);
+        self.vim.reset();
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
     fn stop_edit(&mut self, cx: &mut Context<Self>) {
+        self.vim.reset();
         self.commit();
         self.text_history_active = false;
         self.editing = None;
@@ -4278,6 +4293,9 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_takes_keys() {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.active_editor().range_from_utf16(r))
@@ -4338,6 +4356,9 @@ impl EntityInputHandler for NoteSec {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_takes_keys() {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.active_editor().range_from_utf16(r))
@@ -4900,7 +4921,8 @@ impl NoteSec {
                         "Local git commits {} s after changes. Never pushes.",
                         backup::BACKUP_AFTER.as_secs()
                     )),
-            );
+            )
+            .child(self.render_vim_settings(cx));
 
         let section = state.section;
         let tabs = div()
@@ -7797,9 +7819,11 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::on_fit_graph))
             .on_action(cx.listener(Self::on_toggle_graph_journals))
             .on_action(cx.listener(Self::on_show_shortcuts))
+            .on_action(cx.listener(Self::on_toggle_vim_mode))
             .child(sidebar)
             .child(content)
             .children(status_toast)
+            .children(self.render_vim_pill())
             .children(overlay)
             .children(settings_overlay)
             .children(page_menu_overlay)
@@ -14769,6 +14793,284 @@ mod tests {
         assert_eq!(file(&dir), "- ![[JavaScript]]\n- {{embed [[js]]}}\n");
         assert_eq!(embed_lines(&view, cx), lines(&[js, js].concat()));
         view.update(cx, |app, _| assert_eq!(app.pages.len(), pages_before));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- vim mode (decision 48) ----------------------------------------------
+
+    /// Like `setup`, with vim mode on.
+    fn setup_vim<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        markdown: &str,
+    ) -> (Entity<NoteSec>, &'a mut VisualTestContext, PathBuf) {
+        let (view, cx, dir) = setup(cx, name, markdown);
+        view.update(cx, |app, cx| {
+            app.config.vim_mode = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (view, cx, dir)
+    }
+
+    fn vim_label(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Option<String> {
+        view.update(cx, |app, _| app.vim_label())
+    }
+
+    fn block_texts(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> Vec<String> {
+        view.update(cx, |app, _| {
+            app.pages[app.selected]
+                .blocks
+                .iter()
+                .map(|b| b.content.clone())
+                .collect()
+        })
+    }
+
+    fn editing_text(view: &Entity<NoteSec>, cx: &mut VisualTestContext) -> (Option<usize>, String) {
+        view.update(cx, |app, _| (app.editing, app.editor.text.clone()))
+    }
+
+    #[gpui::test]
+    fn vim_is_off_by_default_and_editing_is_unchanged(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "vim-off", "- one\n");
+        view.update(cx, |app, _| assert!(!app.config.vim_mode));
+        click_block(cx, 0);
+        cx.simulate_keystrokes("end");
+        cx.simulate_input(" ijk:wq");
+        assert_eq!(editing_text(&view, cx), (Some(0), "one ijk:wq".into()));
+        assert!(!has(cx, "vim-mode"));
+        assert_eq!(vim_label(&view, cx), None);
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), "- one ijk:wq\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_settings_row_and_the_command_turn_vim_on_and_off(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "vim-settings", "- one\n");
+        cx.simulate_keystrokes("ctrl-,");
+        assert!(has(cx, "settings-editor") && has(cx, "vim-mode-off"));
+        click_on(cx, "vim-mode-on");
+        view.update(cx, |app, _| assert!(app.config.vim_mode));
+        assert!(saved_config(&dir).vim_mode);
+        click_on(cx, "vim-mode-off");
+        assert!(!saved_config(&dir).vim_mode);
+        cx.simulate_keystrokes("escape");
+
+        // The palette command, which Settings > Shortcuts lists too.
+        run_in_palette(cx, "Toggle vim mode");
+        assert!(saved_config(&dir).vim_mode);
+        assert_eq!(status_text(&view, cx).as_deref(), Some("Vim mode is on"));
+        view.update(cx, |app, _| {
+            assert!(app
+                .key_table()
+                .iter()
+                .all(|s| s.description != "Toggle vim mode"));
+            assert!(Command::ALL.contains(&Command::ToggleVimMode));
+        });
+        run_in_palette(cx, "Toggle vim mode");
+        assert!(!saved_config(&dir).vim_mode);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn normal_mode_keys_never_type_and_i_and_esc_switch_modes(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-modes", "- hello world\n");
+        // A click starts editing in Normal mode, shown at the bottom.
+        click_block(cx, 0);
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("NORMAL"));
+        assert!(has(cx, "vim-mode"));
+        cx.simulate_input("qzQZ");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello world".into()));
+        // Motions, then insert.
+        cx.simulate_input("0w");
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 6));
+        cx.simulate_input("2d");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("NORMAL  2d"));
+        cx.simulate_keystrokes("escape");
+        cx.simulate_input("i");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("INSERT"));
+        cx.simulate_input("big ");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello big world".into()));
+        // Esc: Normal, still editing. Esc again: stop, saved.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("NORMAL"));
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 9));
+        // Visual: select the word under the cursor and delete it.
+        cx.simulate_input("bve");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("VISUAL"));
+        cx.simulate_input("d");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello  world".into()));
+        cx.simulate_input("x");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello world".into()));
+        // Each change is one undo step.
+        cx.simulate_input("u");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello  world".into()));
+        cx.simulate_keystrokes("ctrl-r");
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello world".into()));
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert!(!has(cx, "vim-mode"));
+        assert_eq!(file(&dir), "- hello world\n");
+        // An input method's text is ignored in Normal mode too.
+        click_block(cx, 0);
+        view.update_in(cx, |app, window, cx| {
+            app.replace_text_in_range(None, "zz", window, cx);
+            app.replace_and_mark_text_in_range(None, "zz", None, window, cx);
+        });
+        assert_eq!(editing_text(&view, cx), (Some(0), "hello world".into()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn dd_yy_and_p_work_on_whole_blocks(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-blocks", "- one\n  - child\n- two\n- three\n");
+        click_block(cx, 0);
+        // `dd` takes the block with its child.
+        cx.simulate_input("dd");
+        assert_eq!(block_texts(&view, cx), ["two", "three"]);
+        assert_eq!(editing_text(&view, cx), (Some(0), "two".into()));
+        assert_eq!(file(&dir), "- two\n- three\n");
+        // `p`: below, as it was.
+        cx.simulate_input("p");
+        assert_eq!(block_texts(&view, cx), ["two", "one", "child", "three"]);
+        assert_eq!(editing_text(&view, cx), (Some(1), "one".into()));
+        assert_eq!(file(&dir), "- two\n- one\n  - child\n- three\n");
+        // `yy` + `P`: a copy above.
+        cx.simulate_input("GyyggP");
+        assert_eq!(
+            block_texts(&view, cx),
+            ["three", "two", "one", "child", "three"]
+        );
+        assert_eq!(editing_text(&view, cx), (Some(0), "three".into()));
+        // `u` undoes the paste, then the earlier paste.
+        cx.simulate_input("u");
+        assert_eq!(block_texts(&view, cx), ["two", "one", "child", "three"]);
+        cx.simulate_input("2dd");
+        assert_eq!(block_texts(&view, cx), ["three"]);
+        // The last block: it is emptied, the page keeps one block.
+        cx.simulate_input("dd");
+        assert_eq!(block_texts(&view, cx), [""]);
+        assert_eq!(editing_text(&view, cx), (Some(0), "".into()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn o_and_capital_o_open_blocks_and_esc_closes_the_slash_menu_first(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-open", "- one\n- two\n");
+        click_block(cx, 0);
+        cx.simulate_input("o");
+        assert_eq!(block_texts(&view, cx), ["one", "", "two"]);
+        assert_eq!(editing_text(&view, cx), (Some(1), "".into()));
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("INSERT"));
+        cx.simulate_input("new");
+        // Enter in Insert mode splits as always and stays in Insert.
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("next");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("INSERT"));
+        cx.simulate_keystrokes("escape");
+        cx.simulate_input("O");
+        cx.simulate_input("/");
+        assert!(has(cx, "slash-menu"));
+        cx.simulate_keystrokes("escape");
+        assert!(!has(cx, "slash-menu"));
+        assert_eq!(vim_label(&view, cx).as_deref(), Some("INSERT"));
+        cx.simulate_keystrokes("escape escape");
+        // Esc on the menu took the "/" back, as without vim.
+        assert_eq!(file(&dir), "- one\n- new\n- \n- next\n- two\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn j_k_gg_g_and_indent_move_through_the_outline(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-moves", "- one\n- two\n  second line\n- three\n");
+        click_block(cx, 0);
+        cx.simulate_input("0j");
+        assert_eq!(editing_text(&view, cx).0, Some(1));
+        // `j` inside a multi-line block, then on to the next block.
+        cx.simulate_input("j");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, 4);
+        });
+        cx.simulate_input("j");
+        assert_eq!(editing_text(&view, cx).0, Some(2));
+        cx.simulate_input("k");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editing, Some(1));
+            assert_eq!(app.editor.cursor, 4, "on its last line");
+        });
+        cx.simulate_input("gg");
+        assert_eq!(editing_text(&view, cx).0, Some(0));
+        cx.simulate_input("G");
+        assert_eq!(editing_text(&view, cx).0, Some(2));
+        cx.simulate_input(">>");
+        assert_eq!(file(&dir), "- one\n- two\n  second line\n  - three\n");
+        cx.simulate_input("<<");
+        assert_eq!(file(&dir), "- one\n- two\n  second line\n- three\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn colon_commands_save_stop_and_complain(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_vim(cx, "vim-colon", "- one\n");
+        click_block(cx, 0);
+        cx.simulate_input("0x:w");
+        assert_eq!(vim_label(&view, cx).as_deref(), Some(":w"));
+        // The page isn't written before `:w` (only on leaving the block).
+        assert_eq!(file(&dir), "- one\n");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(file(&dir), "- ne\n");
+        assert_eq!(
+            status_text(&view, cx).as_deref(),
+            Some("Saved \u{201c}Test\u{201d}")
+        );
+        assert_eq!(editing_text(&view, cx), (Some(0), "ne".into()));
+        cx.simulate_input(":bogus");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            status_text(&view, cx).as_deref(),
+            Some("Not an editor command: bogus")
+        );
+        view.update(cx, |app, _| assert!(app.status.as_ref().unwrap().error));
+        cx.simulate_input("x:q");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        assert_eq!(file(&dir), "- e\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn shortcuts_the_palette_and_the_rename_field_are_not_vim(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup_pages(cx, "vim-other-inputs", &tab_pages(), "Test");
+        view.update(cx, |app, _| app.config.vim_mode = true);
+        click_block(cx, 0);
+        // Ctrl+K opens the palette from Normal mode, and it takes typing.
+        cx.simulate_keystrokes("ctrl-k");
+        view.update(cx, |app, _| assert!(app.search.is_some()));
+        cx.simulate_input("dd");
+        view.update(cx, |app, _| {
+            assert_eq!(app.search.as_ref().unwrap().query.text, "dd");
+            assert_eq!(app.vim_label(), None);
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(block_texts(&view, cx), ["see [[Alpha]]"]);
+
+        // The rename field types plain text.
+        click_block(cx, 0);
+        right_click_page(&view, cx, "Alpha");
+        click_on(cx, "page-menu-rename");
+        cx.simulate_input("Gamma");
+        cx.simulate_keystrokes("enter");
+        assert!(page_file(&dir, "Gamma").exists());
+
+        // Ctrl+G still toggles the graph from Normal mode.
+        click_sidebar_page(&view, cx, "Test");
+        click_block(cx, 0);
+        cx.simulate_keystrokes("ctrl-g");
+        view.update(cx, |app, _| assert_eq!(app.mode, Mode::Graph));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

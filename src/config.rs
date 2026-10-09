@@ -5,6 +5,7 @@
 //! font_size = 16.0
 //! font_family = "Inter"   # optional; omit to use the system UI font
 //! git_backup = false      # commit the graph folder to local git (decision 39)
+//! vim_mode = false        # vim keybindings in the block editor (decision 48)
 //! ```
 //!
 //! The file is read once at startup. The app rewrites it when you change the
@@ -50,6 +51,9 @@ pub struct Config {
     /// Git auto-backup (`backup.rs`): commit the graph folder to a local
     /// git repository after changes. Off unless the user turns it on.
     pub git_backup: bool,
+    /// Vim keybindings in the block editor (`vim.rs`, decision 48). Off
+    /// unless the user turns it on.
+    pub vim_mode: bool,
 }
 
 impl Default for Config {
@@ -59,6 +63,7 @@ impl Default for Config {
             font_size: DEFAULT_FONT_SIZE,
             font_family: None,
             git_backup: false,
+            vim_mode: false,
         }
     }
 }
@@ -144,6 +149,17 @@ mod tests {
     }
 
     #[test]
+    fn vim_mode_is_off_unless_the_file_says_so() {
+        assert!(!Config::default().vim_mode);
+        let dir = temp_dir("vim");
+        fs::write(Config::path(&dir), "theme = \"light\"\n").unwrap();
+        assert!(!Config::load(&dir).vim_mode);
+        fs::write(Config::path(&dir), "vim_mode = true\n").unwrap();
+        assert!(Config::load(&dir).vim_mode);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn missing_file_gives_defaults() {
         let dir = temp_dir("missing");
         assert_eq!(Config::load(&dir), Config::default());
@@ -158,6 +174,7 @@ mod tests {
             font_size: 20.0,
             font_family: Some("Inter".into()),
             git_backup: true,
+            vim_mode: true,
         };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), config);
