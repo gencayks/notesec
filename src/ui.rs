@@ -184,20 +184,31 @@ pub fn fold_badge(theme: &Theme, font_size: f32, count: usize) -> Div {
         .child(count.to_string())
 }
 
+/// The chrome `block_row` lays out around a block's text: `fold` is the
+/// fold arrow of a block with children (see [`fold_arrow`]), `handle` the
+/// drag handle laid over the bullet (see [`drag_handle`]), and `bullet`
+/// names the bullet dot's debug selector (`{prefix}bullet-{ix}`). Plain
+/// `Text` paragraphs render no dot, so that selector is absent for them and
+/// tests can assert on that.
+pub struct RowChrome {
+    pub fold: Option<AnyElement>,
+    pub handle: AnyElement,
+    pub bullet: String,
+}
+
 /// One block row: indent + bullet + `content`. The content is either static
 /// text (display mode) or the live text-editing element (edit mode).
 /// `font_size` (in px) is the configured size; `kind` scales it for headings
 /// and styles quotes, in both modes, so editing a block doesn't make it jump.
-/// `fold` is the fold arrow of a block with children (see [`fold_arrow`]).
-/// `handle` is the drag handle laid over the bullet (see [`drag_handle`]).
+/// Paragraphs (plain `Text`) get roomier vertical padding than outline rows
+/// so consecutive `Text` blocks read with comfortable spacing.
 pub fn block_row(
     theme: &Theme,
     depth: usize,
     font_size: f32,
     kind: BlockKind,
     content: impl IntoElement,
-    fold: Option<AnyElement>,
-    handle: AnyElement,
+    chrome: RowChrome,
 ) -> Div {
     let size = font_size * kind_scale(kind);
     let line_height = size * LINE_HEIGHT_RATIO;
@@ -221,16 +232,36 @@ pub fn block_row(
                 .italic()
         })
         .child(content);
+    // Plain `Text` blocks are freeform paragraphs without the outline
+    // bullet dot; headings, quotes and task rows keep it.
+    let is_para = matches!(kind, BlockKind::Text);
+    let RowChrome {
+        fold,
+        handle,
+        bullet,
+    } = chrome;
     div()
         .flex()
         .flex_row()
         .items_start()
         .gap_2()
+        .when(is_para, |d| d.gap_0())
         // 24px of indent per nesting level.
         .pl(px(24.0 * depth as f32))
         .py_1()
+        .when(is_para, |d| d.py_2())
         .min_h(px(line_height + 8.0)) // text line + py_1 padding
-        .child(
+        .when(is_para, |d| d.min_h(px(line_height + 16.0)))
+        .child(if is_para {
+            // Plain paragraph: no bullet dot. A zero-width anchor keeps the
+            // fold arrow and the drag handle working without moving the text.
+            div()
+                .relative()
+                .flex_shrink_0()
+                .w_0()
+                .children(fold)
+                .child(handle)
+        } else {
             // The bullet dot, vertically centred on the first text line.
             div()
                 .relative()
@@ -239,9 +270,10 @@ pub fn block_row(
                 .flex_shrink_0()
                 .rounded_full()
                 .bg(theme.muted)
+                .debug_selector(move || bullet.clone())
                 .children(fold)
-                .child(handle),
-        )
+                .child(handle)
+        })
         .child(body)
 }
 

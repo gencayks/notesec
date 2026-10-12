@@ -29,7 +29,7 @@ use crate::table::{parse_table, Align};
 use crate::tabs::{TabTarget, Tabs};
 use crate::ui::{
     block_row, drag_handle, drop_line, favorite_star, fold_arrow, fold_badge, task_checkbox,
-    BlockDragPreview, Theme,
+    BlockDragPreview, RowChrome, Theme,
 };
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
@@ -91,6 +91,8 @@ actions!(
         SelectRight,
         SelectHome,
         SelectEnd,
+        SelectAll,
+        CopyBlocks,
         Paste,
         Bold,
         Italic,
@@ -263,6 +265,8 @@ pub fn shortcuts() -> Vec<Shortcut> {
         s("shift-right",    SelectRight,   ed,   Editing,    "Extend the selection"),
         s("shift-home",     SelectHome,    ed,   Editing,    "Extend the selection"),
         s("shift-end",      SelectEnd,     ed,   Editing,    "Extend the selection"),
+        s("ctrl-a",         SelectAll,     None, Editing,    "Select block text, then all blocks"),
+        s("ctrl-c",         CopyBlocks,    None, Editing,    "Copy selected blocks as markdown"),
         s("shift-enter",    NewLine,       ed,   Editing,    "Line break inside the block"),
         s("alt-up",         MoveBlockUp,   ed,   Editing,    "Move the block up / down"),
         s("alt-down",       MoveBlockDown, ed,   Editing,    "Move the block up / down"),
@@ -773,6 +777,11 @@ pub struct NoteSec {
     /// Ids of folded blocks (their descendants are hidden). UI-only: not
     /// saved, and most block ids are regenerated on load anyway.
     collapsed: HashSet<Uuid>,
+    /// Ids of the blocks with a page-level selection (Ctrl+A twice). Owned
+    /// by app state, not `EditorState`. UI-only like `collapsed`: Esc or
+    /// clicking a block clears it, and showing another page drops it.
+    /// Ctrl+C copies these blocks as markdown.
+    page_selection: HashSet<Uuid>,
     /// While a block is being dragged by its bullet: where it would land.
     /// Only meaningful while GPUI has an active drag.
     block_drop: Option<DropGap>,
@@ -990,6 +999,7 @@ impl NoteSec {
             page_drop: None,
             selecting: false,
             collapsed: HashSet::new(),
+            page_selection: HashSet::new(),
             block_drop: None,
             kanban_over: None,
             ref_selected: (0..0, 0),
@@ -1841,6 +1851,8 @@ impl NoteSec {
         self.editor = state.editor;
         self.slash = None;
         self.text_history_active = false;
+        // Undo replaces the pages, so selected ids may no longer exist.
+        self.page_selection.clear();
         if let Some(ix) = self.editing {
             self.editor.clamp();
             self.editor.marked = None;
@@ -2678,6 +2690,8 @@ impl NoteSec {
     fn enter_page(&mut self, ix: usize, cx: &mut Context<Self>) {
         // A trash confirmation belongs to the trash tab.
         self.trash_confirm = None;
+        // The selection belongs to the page being left.
+        self.page_selection.clear();
         self.selected = ix;
         self.mode = Mode::Notes;
         self.record_recent();
@@ -3623,6 +3637,9 @@ impl NoteSec {
         self.editor = EditorState::new(&content);
         self.slash = None;
         self.selecting = false;
+        // Focusing another block drops the page selection (clicking a block
+        // clears it and focuses that block).
+        self.page_selection.clear();
         // The last layout belongs to the previous block until the next paint;
         // without it, mouse positions fall back to the cursor.
         self.last_layout = None;
@@ -3991,6 +4008,54 @@ impl NoteSec {
         self.extend_selection(cx, EditorState::select_end);
     }
 
+    /// Ctrl+A: if a block is being edited and its text is not fully
+    /// selected, select the block's full text (standard); otherwise select
+    /// every block on the current page (a second Ctrl+A, or one with no
+    /// block focused). In the palette, the rename field or any other text
+    /// field this is the standard "select the field's text".
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.text_input_open() {
+            self.close_slash_as_typing();
+            self.active_editor_mut().select_all();
+            self.text_changed();
+            cx.notify();
+            return;
+        }
+        if self.current_page().is_none() {
+            return;
+        }
+        if self.editing.is_some() && !self.editor.is_fully_selected() {
+            self.close_slash_as_typing();
+            self.editor.select_all();
+            cx.notify();
+            return;
+        }
+        self.page_selection = self.pages[self.selected]
+            .blocks
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        cx.notify();
+    }
+
+    /// Ctrl+C: with a page-level selection, copy the selected blocks as
+    /// markdown (nesting as indentation, headings as `#`, quotes as `>`).
+    /// With text selected in the edited block or a text field, copy that
+    /// text instead. Otherwise nothing is copied.
+    fn copy_blocks(&mut self, _: &CopyBlocks, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.page_selection.is_empty() && self.current_page().is_some() {
+            let markdown = self.pages[self.selected].selection_markdown(&self.page_selection);
+            cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+            return;
+        }
+        if self.editing.is_some() || self.text_input_open() {
+            if let Some(range) = self.active_editor().selection() {
+                let text = self.active_editor().text[range].to_string();
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        }
+    }
+
     // --- mouse selection in the edited block -----------------------------------
     // Same approach as gpui's `examples/input.rs`: mouse-down places the
     // cursor (Shift extends instead), moves while the button is held select,
@@ -4327,6 +4392,11 @@ impl NoteSec {
             self.dismiss_slash(cx);
         } else if let (Some((range, _)), true) = (self.ref_query(), self.ref_menu_open()) {
             self.ref_dismissed = Some(range.start);
+            cx.notify();
+        } else if !self.page_selection.is_empty() {
+            // Esc clears the page selection first; a text selection, then
+            // edit mode itself, go on later presses.
+            self.page_selection.clear();
             cx.notify();
         } else if self.editor.selection().is_some() {
             // First Esc only drops the selection; the next one stops editing.
@@ -6813,8 +6883,22 @@ impl NoteSec {
                         this.set_block_drop(dragged, Some(gap), cx);
                     });
                 let drop_here = block_drop == Some(DropGap::Before(block_id));
-                let row = block_row(&theme, depth, font_size, kind, content, fold, handle)
+                let is_selected = self.page_selection.contains(&block.id);
+                let row =
+                    block_row(
+                        &theme,
+                        depth,
+                        font_size,
+                        kind,
+                        content,
+                        RowChrome {
+                            fold,
+                            handle,
+                            bullet: format!("{prefix}bullet-{ix}"),
+                        },
+                    )
                     .relative()
+                    .when(is_selected, |d| d.bg(theme.selected_bg))
                     .when(drop_here, |d| {
                         d.child(
                             drop_line(&theme, depth)
@@ -8342,6 +8426,8 @@ impl Render for NoteSec {
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::select_home))
             .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::copy_blocks))
             // Drag-selection keeps tracking when the mouse leaves the block,
             // so these live on the root rather than the block.
             .on_mouse_move(cx.listener(Self::on_text_mouse_move))
@@ -9893,8 +9979,10 @@ mod tests {
         };
         let (h1, h3, plain, quote) = (height(cx, 0), height(cx, 1), height(cx, 2), height(cx, 3));
         assert!(h1 > h3, "{h1:?} > {h3:?}");
-        assert!(h3 > plain, "{h3:?} > {plain:?}");
-        assert_eq!(quote, plain);
+        assert!(h3 > quote, "{h3:?} > {quote:?}");
+        // Plain text is a paragraph with roomier padding than the outline
+        // rows, so it stands taller than the same-size quote.
+        assert!(plain > quote, "{plain:?} > {quote:?}");
         // Rendering never rewrites the stored markdown.
         assert_eq!(file(&dir), "- # Big\n- ### Small\n- plain\n- > quoted\n");
         let _ = std::fs::remove_dir_all(dir);
@@ -10076,12 +10164,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A point just inside the start of block `ix`'s text (past the bullet).
+    /// A point just inside the start of block `ix`'s text: past the bullet
+    /// for outline rows, at the row's left edge for paragraphs (no bullet).
     fn row_text_start(cx: &mut VisualTestContext, ix: usize) -> Point<Pixels> {
         let selector: &'static str = Box::leak(format!("block-{ix}").into_boxed_str());
         let row = cx.debug_bounds(selector).expect("row rendered");
-        // The row is: bullet (6px) + gap (8px) + text.
-        point(row.left() + px(15.), row.center().y)
+        let bullet: &'static str = Box::leak(format!("bullet-{ix}").into_boxed_str());
+        // Outline rows are bullet (6px) + gap (8px) + text; paragraphs have
+        // neither, so their text starts at the row's edge.
+        let x = if cx.debug_bounds(bullet).is_some() {
+            15.
+        } else {
+            2.
+        };
+        point(row.left() + px(x), row.center().y)
     }
 
     #[gpui::test]
@@ -10520,6 +10616,75 @@ mod tests {
             assert_eq!(app.editor.cursor, "## TODO ".len());
         });
         assert!(!has(cx, "task-5-todo"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn text_blocks_render_as_paragraphs_without_bullets(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(
+            cx,
+            "para-bullets",
+            "- first para\n- # Head\n- > quote\n- second para\n",
+        );
+        // Plain text is paragraphs: no bullet dot. Headings and quotes
+        // keep the outline marker.
+        assert!(!has(cx, "bullet-0"), "text block has no bullet");
+        assert!(has(cx, "bullet-1"), "heading keeps its bullet");
+        assert!(has(cx, "bullet-2"), "quote keeps its bullet");
+        assert!(!has(cx, "bullet-3"), "text block has no bullet");
+        // Rendering only: the file keeps the `- ` bullet format.
+        assert_eq!(
+            file(&dir),
+            "- first para\n- # Head\n- > quote\n- second para\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn mixed_text_and_heading_page_snapshot(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(
+            cx,
+            "para-snapshot",
+            "- first\n- second\n- > quote\n- # Head\n",
+        );
+        // Kinds in order: two paragraphs, a quote, a heading.
+        view.update(cx, |app, _| {
+            let kinds: Vec<BlockKind> = app.pages[app.selected]
+                .blocks
+                .iter()
+                .map(|b| BlockKind::parse(&b.content).0)
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    BlockKind::Text,
+                    BlockKind::Text,
+                    BlockKind::Quote,
+                    BlockKind::Heading1
+                ]
+            );
+        });
+        // Only the quote and heading rows show a bullet.
+        assert!(!has(cx, "bullet-0"));
+        assert!(!has(cx, "bullet-1"));
+        assert!(has(cx, "bullet-2"), "quote keeps its bullet");
+        assert!(has(cx, "bullet-3"), "heading keeps its bullet");
+        // Paragraphs read with comfortable spacing: at the same font size
+        // (quote and text both scale 1.0) a paragraph row is taller than an
+        // outline row, and consecutive paragraphs match.
+        let para = bounds_of(cx, "block-0").size.height;
+        let outline = bounds_of(cx, "block-2").size.height;
+        assert!(
+            para > outline,
+            "paragraph row {para:?} is roomier than outline row {outline:?}"
+        );
+        assert_eq!(
+            bounds_of(cx, "block-1").size.height,
+            para,
+            "consecutive paragraphs match"
+        );
+        // No storage migration: paragraphs still save as `- ` bullets.
+        assert_eq!(file(&dir), "- first\n- second\n- > quote\n- # Head\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -17819,6 +17984,83 @@ printf '[00:00:00.000 --> 00:00:01.000]   Buy milk [[and]] eggs.\n[00:00:01.000 
         cx.run_until_parked();
         assert!(status_text(&view, cx).unwrap().contains("needs a block"));
         assert_eq!(file(&dir), "- old\n- other\n- NEW\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- page-level selection (Ctrl+A, Ctrl+C, Esc) --------------------------
+
+    #[gpui::test]
+    fn ctrl_a_selects_text_first_then_every_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "page-select", "- hello\n- world\n");
+        click_block(cx, 0);
+        view.update(cx, |app, _| assert_eq!(app.editing, Some(0)));
+
+        // The first Ctrl+A takes the edited block's text (standard).
+        cx.simulate_keystrokes("ctrl-a");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.selection(), Some(0.."hello".len()));
+            assert!(app.page_selection.is_empty());
+        });
+        // The second one selects every block on the page.
+        cx.simulate_keystrokes("ctrl-a");
+        view.update(cx, |app, _| {
+            let ids: Vec<_> = app.pages[app.selected]
+                .blocks
+                .iter()
+                .map(|b| b.id)
+                .collect();
+            assert_eq!(app.page_selection.len(), 2);
+            assert!(ids.iter().all(|id| app.page_selection.contains(id)));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn ctrl_a_with_no_block_focused_selects_every_block(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "page-select-unfocused", "- a\n  - b\n- c\n");
+        view.update(cx, |app, _| assert_eq!(app.editing, None));
+        cx.simulate_keystrokes("ctrl-a");
+        view.update(cx, |app, _| assert_eq!(app.page_selection.len(), 3));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn ctrl_c_copies_selected_blocks_as_markdown(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(
+            cx,
+            "page-copy",
+            "- # Title\n  - child\n- > quote\n- plain\n",
+        );
+        cx.simulate_keystrokes("ctrl-a");
+        cx.simulate_keystrokes("ctrl-c");
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("- # Title\n  - child\n- > quote\n- plain\n")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn esc_and_clicking_a_block_clear_the_page_selection(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(cx, "page-select-clear", "- a\n- b\n");
+        cx.simulate_keystrokes("ctrl-a");
+        view.update(cx, |app, _| assert_eq!(app.page_selection.len(), 2));
+        // Clicking a block clears the selection and focuses that block.
+        click_block(cx, 1);
+        view.update(cx, |app, _| {
+            assert!(app.page_selection.is_empty());
+            assert_eq!(app.editing, Some(1));
+        });
+        // Select again (text, then the page); Esc clears it, editing goes on.
+        cx.simulate_keystrokes("ctrl-a ctrl-a");
+        view.update(cx, |app, _| assert_eq!(app.page_selection.len(), 2));
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |app, _| {
+            assert!(app.page_selection.is_empty());
+            assert_eq!(app.editing, Some(1));
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 }

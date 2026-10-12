@@ -152,6 +152,22 @@ impl EditorState {
         self.select_to(self.text.len());
     }
 
+    /// True when the whole text is selected, so Ctrl+A escalates to selecting
+    /// the page's blocks. An empty block counts as fully selected (there is
+    /// nothing its own Ctrl+A could select).
+    pub fn is_fully_selected(&self) -> bool {
+        self.text.is_empty()
+            || self
+                .selection()
+                .is_some_and(|r| r.start == 0 && r.end == self.text.len())
+    }
+
+    /// Select the whole text, cursor at the end (the first Ctrl+A).
+    pub fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.text.len();
+    }
+
     /// Keep the cursor and anchor inside the text (after undo swaps the
     /// text underneath them).
     pub fn clamp(&mut self) {
@@ -881,5 +897,33 @@ mod tests {
         let mut e = EditorState::new("[[abc");
         e.anchor = Some(2);
         assert_eq!(e.link_query(), None, "selection");
+    }
+
+    #[test]
+    fn ctrl_a_escalation_selects_text_first_then_the_page() {
+        // Nothing selected: not fully selected, so the first Ctrl+A takes
+        // the block's text.
+        let mut e = EditorState::new("hello");
+        e.cursor = 2;
+        assert!(!e.is_fully_selected());
+        e.select_all();
+        assert_eq!(e.selection(), Some(0..5));
+        assert!(e.is_fully_selected());
+        // A partial selection is not full either, even a reversed one.
+        // (Reversed ranges are selection data here, never iterated.)
+        #[allow(clippy::reversed_empty_ranges)]
+        let mut e = selected("hello", 4..1);
+        assert!(!e.is_fully_selected());
+        e.select_all();
+        assert_eq!((e.anchor, e.cursor), (Some(0), 5));
+        assert!(e.is_fully_selected());
+        // Selecting home (0..cursor) is partial unless the cursor was at the end.
+        let mut e = EditorState::new("hello");
+        e.cursor = 2;
+        e.select_home();
+        assert_eq!(e.selection(), Some(0..2));
+        assert!(!e.is_fully_selected());
+        // An empty block has nothing its own Ctrl+A could take.
+        assert!(EditorState::new("").is_fully_selected());
     }
 }

@@ -139,6 +139,8 @@ commands! {
     // Editing
     Undo => "Undo", [], Nothing;
     Redo => "Redo", [], Nothing;
+    SelectAll => "Select all", ["select", "all blocks"], Page;
+    CopyBlocks => "Copy selected blocks", ["copy", "clipboard", "markdown"], Page;
     InsertTemplate => "Insert template", ["snippet"], Page;
     CycleTask => "Cycle task state", ["todo", "doing", "done", "checkbox"], Editing;
     MoveBlockUp => "Move block up", ["reorder", "swap"], Editing;

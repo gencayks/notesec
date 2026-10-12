@@ -1170,26 +1170,68 @@ impl Page {
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
         for (i, block) in self.blocks.iter().enumerate() {
-            let indent = "  ".repeat(self.depth_of(i));
-            let mut lines = block.content.split('\n');
-            out.push_str(&indent);
-            out.push_str("- ");
-            out.push_str(lines.next().unwrap_or(""));
-            out.push('\n');
             // A referenced block's id goes right under its first line, as
             // a Logseq property.
-            if self.saved_ids.contains(&block.id) {
-                out.push_str(&indent);
-                out.push_str("  id:: ");
-                out.push_str(&block.id.to_string());
-                out.push('\n');
-            }
-            // Continuation lines are indented to line up under the bullet text.
-            for extra in lines {
-                out.push_str(&indent);
-                out.push_str("  ");
-                out.push_str(extra);
-                out.push('\n');
+            let id_line = self.saved_ids.contains(&block.id).then_some(block.id);
+            Self::push_block_markdown(&mut out, &block.content, self.depth_of(i), id_line);
+        }
+        out
+    }
+
+    /// One block as Logseq-style markdown at `depth`: a `- ` bullet, the
+    /// type prefix (`# `, `> `) carried inside the text, continuation lines
+    /// lined up under the bullet text. When the block's id is saved (see
+    /// `saved_ids`), its `id::` line goes right under the first line, as a
+    /// Logseq property.
+    fn push_block_markdown(out: &mut String, content: &str, depth: usize, id_line: Option<Uuid>) {
+        let indent = "  ".repeat(depth);
+        let mut lines = content.split('\n');
+        out.push_str(&indent);
+        out.push_str("- ");
+        out.push_str(lines.next().unwrap_or(""));
+        out.push('\n');
+        if let Some(id) = id_line {
+            out.push_str(&indent);
+            out.push_str("  id:: ");
+            out.push_str(&id.to_string());
+            out.push('\n');
+        }
+        // Continuation lines are indented to line up under the bullet text.
+        for extra in lines {
+            out.push_str(&indent);
+            out.push_str("  ");
+            out.push_str(extra);
+            out.push('\n');
+        }
+    }
+
+    /// The blocks whose ids are in `selected`, in document order, as
+    /// Logseq-style markdown for the clipboard (Ctrl+C with a page-level
+    /// selection): `- ` bullets, nesting as 2-space indentation, headings
+    /// as `#` and quotes as `>` (both are prefixes inside the text, so they
+    /// come along as written). Indentation is relative to the shallowest
+    /// selected block, so copying a subtree keeps its shape and copying one
+    /// block gives a top-level bullet. Unselected blocks are skipped, but
+    /// their depth still counts: a selected child of an unselected parent
+    /// keeps its extra indent, showing it was nested.
+    pub fn selection_markdown(&self, selected: &HashSet<Uuid>) -> String {
+        let min_depth = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| selected.contains(&b.id))
+            .map(|(i, _)| self.depth_of(i))
+            .min()
+            .unwrap_or(0);
+        let mut out = String::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if selected.contains(&block.id) {
+                Self::push_block_markdown(
+                    &mut out,
+                    &block.content,
+                    self.depth_of(i) - min_depth,
+                    None,
+                );
             }
         }
         out
@@ -2013,5 +2055,49 @@ mod tests {
         let n = page.blocks.len();
         page.remove_blocks(0..n);
         assert_eq!(texts(&page), [""]);
+    }
+
+    fn selected(page: &Page, indices: &[usize]) -> HashSet<Uuid> {
+        indices.iter().map(|&i| page.blocks[i].id).collect()
+    }
+
+    #[test]
+    fn selection_markdown_keeps_nesting_headings_and_quotes() {
+        let page = Page::from_markdown(
+            "P",
+            false,
+            "- # Title\n  - ## Sub\n    - deep\n- > a quote\n- plain\n",
+        );
+        // Everything selected reads exactly like the file (indentation is
+        // relative to the shallowest selected block, here top level).
+        assert_eq!(
+            page.selection_markdown(&selected(&page, &[0, 1, 2, 3, 4])),
+            "- # Title\n  - ## Sub\n    - deep\n- > a quote\n- plain\n"
+        );
+        // A subtree keeps its shape, re-rooted at the top level.
+        assert_eq!(
+            page.selection_markdown(&selected(&page, &[1, 2])),
+            "- ## Sub\n  - deep\n"
+        );
+        // One nested block alone is a top-level bullet.
+        assert_eq!(page.selection_markdown(&selected(&page, &[2])), "- deep\n");
+        // A selected child of an unselected parent keeps its extra indent,
+        // showing it was nested.
+        assert_eq!(
+            page.selection_markdown(&selected(&page, &[0, 2])),
+            "- # Title\n    - deep\n"
+        );
+        // Nothing selected: empty text for the clipboard.
+        assert_eq!(page.selection_markdown(&HashSet::new()), "");
+    }
+
+    #[test]
+    fn selection_markdown_keeps_continuation_lines() {
+        let page = Page::from_markdown("P", false, "- first\n  second\n- other\n");
+        assert_eq!(page.blocks[0].content, "first\nsecond");
+        assert_eq!(
+            page.selection_markdown(&selected(&page, &[0])),
+            "- first\n  second\n"
+        );
     }
 }
