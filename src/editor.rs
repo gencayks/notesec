@@ -910,6 +910,8 @@ mod tests {
         assert_eq!(e.selection(), Some(0..5));
         assert!(e.is_fully_selected());
         // A partial selection is not full either, even a reversed one.
+        // (Reversed ranges are selection data here, never iterated.)
+        #[allow(clippy::reversed_empty_ranges)]
         let mut e = selected("hello", 4..1);
         assert!(!e.is_fully_selected());
         e.select_all();
