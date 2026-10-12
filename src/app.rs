@@ -29,7 +29,7 @@ use crate::table::{parse_table, Align};
 use crate::tabs::{TabTarget, Tabs};
 use crate::ui::{
     block_row, drag_handle, drop_line, favorite_star, fold_arrow, fold_badge, task_checkbox,
-    BlockDragPreview, Theme,
+    BlockDragPreview, RowChrome, Theme,
 };
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
@@ -6884,7 +6884,19 @@ impl NoteSec {
                     });
                 let drop_here = block_drop == Some(DropGap::Before(block_id));
                 let is_selected = self.page_selection.contains(&block.id);
-                let row = block_row(&theme, depth, font_size, kind, content, fold, handle)
+                let row =
+                    block_row(
+                        &theme,
+                        depth,
+                        font_size,
+                        kind,
+                        content,
+                        RowChrome {
+                            fold,
+                            handle,
+                            bullet: format!("{prefix}bullet-{ix}"),
+                        },
+                    )
                     .relative()
                     .when(is_selected, |d| d.bg(theme.selected_bg))
                     .when(drop_here, |d| {
@@ -9967,8 +9979,10 @@ mod tests {
         };
         let (h1, h3, plain, quote) = (height(cx, 0), height(cx, 1), height(cx, 2), height(cx, 3));
         assert!(h1 > h3, "{h1:?} > {h3:?}");
-        assert!(h3 > plain, "{h3:?} > {plain:?}");
-        assert_eq!(quote, plain);
+        assert!(h3 > quote, "{h3:?} > {quote:?}");
+        // Plain text is a paragraph with roomier padding than the outline
+        // rows, so it stands taller than the same-size quote.
+        assert!(plain > quote, "{plain:?} > {quote:?}");
         // Rendering never rewrites the stored markdown.
         assert_eq!(file(&dir), "- # Big\n- ### Small\n- plain\n- > quoted\n");
         let _ = std::fs::remove_dir_all(dir);
@@ -10150,12 +10164,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A point just inside the start of block `ix`'s text (past the bullet).
+    /// A point just inside the start of block `ix`'s text: past the bullet
+    /// for outline rows, at the row's left edge for paragraphs (no bullet).
     fn row_text_start(cx: &mut VisualTestContext, ix: usize) -> Point<Pixels> {
         let selector: &'static str = Box::leak(format!("block-{ix}").into_boxed_str());
         let row = cx.debug_bounds(selector).expect("row rendered");
-        // The row is: bullet (6px) + gap (8px) + text.
-        point(row.left() + px(15.), row.center().y)
+        let bullet: &'static str = Box::leak(format!("bullet-{ix}").into_boxed_str());
+        // Outline rows are bullet (6px) + gap (8px) + text; paragraphs have
+        // neither, so their text starts at the row's edge.
+        let x = if cx.debug_bounds(bullet).is_some() {
+            15.
+        } else {
+            2.
+        };
+        point(row.left() + px(x), row.center().y)
     }
 
     #[gpui::test]
@@ -10594,6 +10616,75 @@ mod tests {
             assert_eq!(app.editor.cursor, "## TODO ".len());
         });
         assert!(!has(cx, "task-5-todo"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn text_blocks_render_as_paragraphs_without_bullets(cx: &mut TestAppContext) {
+        let (_view, cx, dir) = setup(
+            cx,
+            "para-bullets",
+            "- first para\n- # Head\n- > quote\n- second para\n",
+        );
+        // Plain text is paragraphs: no bullet dot. Headings and quotes
+        // keep the outline marker.
+        assert!(!has(cx, "bullet-0"), "text block has no bullet");
+        assert!(has(cx, "bullet-1"), "heading keeps its bullet");
+        assert!(has(cx, "bullet-2"), "quote keeps its bullet");
+        assert!(!has(cx, "bullet-3"), "text block has no bullet");
+        // Rendering only: the file keeps the `- ` bullet format.
+        assert_eq!(
+            file(&dir),
+            "- first para\n- # Head\n- > quote\n- second para\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn mixed_text_and_heading_page_snapshot(cx: &mut TestAppContext) {
+        let (view, cx, dir) = setup(
+            cx,
+            "para-snapshot",
+            "- first\n- second\n- > quote\n- # Head\n",
+        );
+        // Kinds in order: two paragraphs, a quote, a heading.
+        view.update(cx, |app, _| {
+            let kinds: Vec<BlockKind> = app.pages[app.selected]
+                .blocks
+                .iter()
+                .map(|b| BlockKind::parse(&b.content).0)
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    BlockKind::Text,
+                    BlockKind::Text,
+                    BlockKind::Quote,
+                    BlockKind::Heading1
+                ]
+            );
+        });
+        // Only the quote and heading rows show a bullet.
+        assert!(!has(cx, "bullet-0"));
+        assert!(!has(cx, "bullet-1"));
+        assert!(has(cx, "bullet-2"), "quote keeps its bullet");
+        assert!(has(cx, "bullet-3"), "heading keeps its bullet");
+        // Paragraphs read with comfortable spacing: at the same font size
+        // (quote and text both scale 1.0) a paragraph row is taller than an
+        // outline row, and consecutive paragraphs match.
+        let para = bounds_of(cx, "block-0").size.height;
+        let outline = bounds_of(cx, "block-2").size.height;
+        assert!(
+            para > outline,
+            "paragraph row {para:?} is roomier than outline row {outline:?}"
+        );
+        assert_eq!(
+            bounds_of(cx, "block-1").size.height,
+            para,
+            "consecutive paragraphs match"
+        );
+        // No storage migration: paragraphs still save as `- ` bullets.
+        assert_eq!(file(&dir), "- first\n- second\n- > quote\n- # Head\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 
